@@ -423,10 +423,21 @@ export function buildWebToolHint(config = {}) {
         available.push('get_weather', 'convert_currency');
     }
 
+    // >>> proactive-search patch (managed by patch_web_hint.py) >>>
     const lines = [
         '【功能：联网检索】',
-        `可用组件：${available.join('、')}。`
+        `可用组件：${available.join('、')}。`,
+        '【主动检索要求（重要）】',
+        '- 默认先查证再回答：「帮我搜一下 / 查一下 / 查证一下」只是最低要求，不要等用户开口才动手。',
+        '- 出现下列任一情形，直接调用 web_search，不需要用户提出：',
+        '  · 答案具有时效性：新闻、价格、股价、政策、赛事、排名、天气、汇率、版本号、更新日志、产品发布、人物近况；',
+        '  · 涉及你无法确证的具体事实：精确数字、日期、职务、作品或剧集信息、事件经过、官方链接与出处；',
+        '  · 你对答案没有把握，或该信息可能在过去几个月内发生过变化。',
+        '- 自检口径：只要「可能已过期」或「我不太确定」，就是必须检索的信号；宁可多查一次，也不要凭印象作答。',
+        '- 不必检索的情形：纯闲聊与情绪回应、角色扮演台词与互动、对前文的追问、稳定不变的常识、用户明确表示不需要联网。',
+        '- 检索是内部动作：用角色一贯的语气把结论自然说出来，不要提「搜索 / 联网 / 查资料」，不要罗列链接列表，除非用户就是要来源。'
     ];
+    // <<< proactive-search patch <<<
     if (webSearchConfig.fetch.enabled || webSearchConfig.spice.enabled) {
         lines.push(`必须调用、不得凭记忆或猜测作答的情形：用户明确要求 搜/查/查证/给链接/给来源/给出处/最新情况/是不是真的；涉及新闻、价格、政策、版本、赛事、天气、汇率、人物动态等实时或可能变化的信息；需要外部事实核验（链接、项目、库、资料、图片来源）。`);
     }
@@ -627,11 +638,27 @@ export function buildToolPhaseResultMessage(transcript = [], options = {}) {
         return '';
     }
 
+    // >>> result-honesty patch (managed by patch_result_honesty.py) >>>
+    // 原实现无条件写「以它们为准」：检索全挂时它等于在催模型硬答，结果跑题时它
+    // 等于在授权模型拿不相关内容编答案。改为按工具状态分支，并加一条相关性自检。
     const maxChars = clampInteger(options.maxChars, 200, 50000, 4000);
-    const lines = [
-        '【本轮工具执行结果】',
-        '这些是刚刚真实执行工具得到的最新结果，回复时以它们为准；不要编造工具没有返回的信息。'
-    ];
+    const okEntries = entries.filter((entry) => entry.ok !== false).length;
+    const lines = ['【本轮工具执行结果】'];
+    if (okEntries === 0) {
+        lines.push(
+            '本次工具调用全部失败，没有取到任何可用数据。',
+            '不要凭记忆编造答案，也不要假装检索成功、不要声称“网上就是这么说的”：'
+            + '如实说明这次没能查到、没能取到内容。'
+        );
+    } else {
+        lines.push(
+            '这些是刚刚真实执行工具得到的最新结果，回复时优先采用；不要编造工具没有返回的信息。',
+            '采用前先自行核对相关性：若这些结果与用户的问题无关、答非所问，或只是关键词'
+            + '相同却回答不了问题，就不要使用它们，并如实说明没有查到可靠信息。',
+            '宁可说没查到，也不要用不相关的内容硬答，也不要仅凭这些内容推断。'
+        );
+    }
+    // <<< result-honesty patch <<<
     entries.forEach((entry, index) => {
         const status = entry.ok === false ? '失败' : '完成';
         lines.push(`${index + 1}. ${sanitizeText(entry.name)}｜参数: ${summarizeToolArguments(entry.arguments)}｜状态: ${status}`);

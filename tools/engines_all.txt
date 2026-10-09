@@ -1,0 +1,475 @@
+total=352
+360search|360search|true|None|360so
+360search videos|360search_videos|true|None|360sov
+500px|500px|None|None|"500"
+9gag|9gag|true|None|9g
+abcnyheter|xpath|true|general|abc
+acfun|acfun|true|None|acf
+astrophysics data system|astrophysics_data_system|None|None|ads
+alpine linux packages|alpinelinux|true|None|alp
+annas archive|annas_archive|true|None|aa
+ansa|ansa|true|None|ans
+apk mirror|apkmirror|true|None|apkm
+apple app store|apple_app_store|true|None|aps
+ahmia|ahmia|None|onions|ah
+anaconda|xpath|true|it|conda
+arch linux wiki|archlinux|None|None|al
+nixos wiki|mediawiki|true|[it, software wikis]|nixw
+artic|artic|true|None|arc
+artstation|artstation|true|images|as
+arxiv|arxiv|None|None|arx
+avalw|json_engine|true|general|av
+ayo|xpath|true|general|ayo
+azure|azure|None|[it, cloud]|az
+bandcamp|bandcamp|None|music|bc
+baidu|baidu|true|[general]|bd
+baidu images|baidu|true|[images]|bdi
+baidu kaifa|baidu|true|[it]|bdk
+wikipedia|wikipedia|None|[general]|wp
+bilibili|bilibili|true|None|bil
+bing|bing|true|None|bi
+bing images|bing_images|None|None|bii
+bing news|bing_news|None|None|bin
+bing videos|bing_videos|None|None|biv
+bitchute|bitchute|true|None|bit
+bitbucket|xpath|true|[it, repos]|bb
+boardreader|boardreader|true|None|boa
+bpb|bpb|true|None|bpb
+btdigg|btdigg|true|None|bt
+openverse|openverse|true|images|opv
+media.ccc.de|ccc_media|true|None|c3tv
+cachy os packages|cachy_os|true|None|cos
+chefkoch|chefkoch|None|None|chef
+chinaso news|chinaso|true|[news]|chinaso
+cl0q|json_engine|true|general|cl
+cloudflareai|cloudflareai|None|None|cfai
+core.ac.uk|core|None|None|cor
+crossref|crossref|true|None|cr
+crowdview|json_engine|true|general|cv
+yep|yep|true|general|yep
+currency|currency_convert|None|None|cc
+deezer|deezer|true|None|dz
+destatis|destatis|true|None|destat
+deviantart|deviantart|None|None|da
+devicons|devicons|true|None|di
+ddg definitions|duckduckgo_definitions|true|None|ddd
+docker hub|docker_hub|None|[it, packages]|dh
+encyclosearch|json_engine|true|general|es
+europepmc|europepmc|None|None|epmc
+erowid|xpath|true|[]|ew
+elasticsearch|elasticsearch|None|None|els
+wikidata|wikidata|None|[general]|wd
+dogpile|dogpile|None|general|dog
+dogpile images|dogpile|None|images|dogi
+dogpile videos|dogpile|None|videos|dogv
+dogpile news|dogpile|None|news|dogn
+duckduckgo|duckduckgo|None|None|ddg
+duckduckgo web|duckduckgo_web|true|None|ddgw
+duckduckgo images|duckduckgo_extra|None|[images]|ddi
+duckduckgo videos|duckduckgo_extra|None|[videos]|ddv
+duckduckgo news|duckduckgo_extra|None|[news]|ddn
+duckduckgo weather|duckduckgo_weather|true|None|ddw
+apple maps|apple_maps|true|None|apm
+emojipedia|emojipedia|true|None|em
+tineye|tineye|true|None|tin
+etymonline|xpath|None|[dictionaries]|et
+ebay|ebay|None|None|eb
+1x|www1x|None|None|1x
+fastbot|xpath|true|general|fa
+fdroid|fdroid|true|None|fd
+findborg|findborg|None|general|fi
+findborg images|findborg|None|images|fii
+findborg videos|findborg|None|videos|fiv
+findborg news|findborg|None|news|fin
+findfiles|findfiles|true|files|fif
+findfiles images|findfiles|true|images|fifi
+findfiles videos|findfiles|true|videos|fifv
+findfiles music|findfiles|true|music|fifm
+findthatmeme|findthatmeme|true|None|ftm
+fireball|fireball|true|general|fire
+fireball news|fireball|true|news|firen
+fireball videos|fireball|true|videos|firev
+flaticon|flaticon|true|None|fli
+flickr|flickr_noapi|true|None|fl
+flickr_api|flickr|None|images|fla
+free software directory|mediawiki|true|[it, software wikis]|fsd
+freesound|freesound|None|None|fnd
+frinkiac|frinkiac|true|None|frk
+fynd|xpath|true|general|fynd
+fyyd|fyyd|true|None|fy
+gabanza|xpath|true|general|gab
+geizhals|geizhals|true|None|geiz
+genius|genius|None|None|gen
+gentoo|mediawiki|None|["it", "software wikis"]|ge
+giphy|giphy|true|None|gif
+gitlab|gitlab|true|None|gl
+github|github|None|None|gh
+github code|github_code|None|None|ghc
+codeberg|gitea|true|None|cb
+gitea.com|gitea|true|None|gitea
+gmx|gmx|true|None|gmx
+goodreads|goodreads|true|None|good
+google|google|true|None|go
+google images|google_images|true|None|goi
+google news|google_news|None|None|gon
+google videos|google_videos|None|None|gov
+google cse|google_cse|None|None|goc
+google cse images|google_cse|None|[images, web]|goci
+google scholar|google_scholar|None|None|gos
+google play apps|google_play|true|[it, apps]|gpa
+google play movies|google_play|true|videos|gpm
+grokipedia|grokipedia|true|None|gp
+material icons|material_icons|true|None|mi
+habrahabr|xpath|true|it|habr
+hackernews|hackernews|true|None|hn
+hex|hex|true|None|hex
+crates.io|crates|true|None|crates
+hoogle|xpath|None|[it, packages]|ho
+iconify|iconify|true|None|ico
+iseek|iseek|true|None|isk
+il post|il_post|true|None|pst
+huggingface|huggingface|true|None|hf
+huggingface datasets|huggingface|true|None|hfd
+huggingface spaces|huggingface|true|None|hfs
+imdb|imdb|true|None|imdb
+imgur|imgur|true|None|img
+ina|ina|true|None|in
+ipernity|ipernity|true|None|ip
+iqiyi|iqiyi|true|None|iq
+jina|jina|None|None|ji
+kavunka demo|xpath|true|general|kav
+keenable|keenable|true|None|keen
+kozmonavt|xpath|true|None|koz
+jisho|jisho|true|None|js
+kickass|kickass|None|None|kc
+kukei|xpath|true|[general, blogs]|kuk
+lemmy communities|lemmy|None|None|leco
+lemmy users|lemmy|None|None|leus
+lemmy posts|lemmy|None|None|lepo
+lemmy comments|lemmy|None|None|lecom
+library genesis|xpath|true|files|lg
+z-library|zlibrary|true|None|zlib
+libretranslate|libretranslate|None|None|lt
+littlelayer|json_engine|true|[general, blogs]|ll
+lingva|lingva|None|None|lv
+lobste.rs|xpath|true|it|lo
+lucide|lucide|true|None|luc
+luxxle|luxxle|true|general|lux
+luxxle images|luxxle|true|images|luxi
+luxxle videos|luxxle|true|videos|luxv
+luxxle news|luxxle|true|news|luxn
+magnific|magnific|true|None|mag
+marginalia|marginalia|true|None|mar
+mastodon users|mastodon|None|None|mau
+mastodon hashtags|mastodon|None|None|mah
+mdn|json_engine|None|[it]|mdn
+metacpan|metacpan|true|None|cpan
+microsoft learn|microsoft_learn|true|None|msl
+mixcloud|mixcloud|None|None|mc
+mozhi|mozhi|true|None|mz
+mwmbl|mwmbl|true|None|mwm
+neocities|neocities|true|None|nc
+niconico|niconico|true|None|nico
+npm|npm|true|None|npm
+nyaa|nyaa|true|None|nt
+mankier|json_engine|None|it|man
+odysee|odysee|true|None|od
+ollama|ollama|true|None|ollama
+openairedatasets|json_engine|None|"science"|oad
+openairepublications|json_engine|None|science|oap
+openalex|openalex|true|None|oa
+openclipart|openclipart|true|None|ocl
+openlibrary|openlibrary|true|None|ol
+openmeteo|open_meteo|true|None|om
+openstreetmap|openstreetmap|None|None|osm
+openrepos|xpath|true|files|or
+packagist|json_engine|true|[it, packages]|pack
+pdbe|pdbe|None|None|pdb
+pexels|pexels|None|None|pe
+photon|photon|None|None|ph
+picjumbo|picjumbo|None|None|pj
+pinterest|pinterest|None|None|pin
+piped|piped|None|videos|ppd
+piped.music|piped|None|music|ppdm
+piratebay|piratebay|None|None|tpb
+pixabay images|pixabay|true|stock images|pixi
+pixabay videos|pixabay|true|videos|pixv
+pixiv|pixiv|true|None|pv
+podchaser|podchaser|true|None|poc
+pub.dev|xpath|true|[packages, it]|pd
+public domain image archive|public_domain_image_archive|true|None|pdia
+pubmed|pubmed|None|None|pub
+pypi|pypi|None|None|pypi
+quark|quark|true|[general]|qk
+quark images|quark|true|[images]|qki
+qwant|qwant|true|[general, web]|qw
+qwant news|qwant|true|news|qwn
+qwant images|qwant|true|[images, web]|qwi
+qwant videos|qwant|true|[videos, web]|qwv
+radio browser|radio_browser|None|None|rb
+rawweb|json_engine|true|[general, blogs]|rw
+reuters|reuters|None|None|reu
+rottentomatoes|rottentomatoes|true|None|rt
+searchmysite|xpath|true|[general, blogs]|sms
+searchrockit|searchrockit|true|general|sr
+searchrockit images|searchrockit|true|images|sri
+searchrockit news|searchrockit|true|news|srn
+selfhst icons|selfhst|true|None|si
+sepiasearch|sepiasearch|None|None|sep
+shopify stock|shopify_stock|None|None|shs
+sogou|sogou|true|None|sogou
+sogou images|sogou_images|true|None|sogoui
+sogou videos|sogou_videos|true|None|sogouv
+sogou wechat|sogou_wechat|true|None|sogouw
+soundcloud|soundcloud|None|None|sc
+stackoverflow|stackexchange|None|[it, q&a]|st
+stocksnap|stocksnap|None|None|sto
+askubuntu|stackexchange|None|[it, q&a]|ubuntu
+superuser|stackexchange|None|[it, q&a]|su
+discuss.python|discourse|true|[it, q&a]|dpy
+caddy.community|discourse|true|[it, q&a]|caddy
+pi-hole.community|discourse|true|[it, q&a]|pi
+privacywall|privacywall|true|general|pw
+privacywall images|privacywall|true|images|pwi
+privacywall videos|privacywall|true|videos|pwv
+seekninja|seekninja|true|None|sen
+semantic scholar|semantic_scholar|None|None|se
+springer nature|springer|None|None|springer
+startpage|startpage|None|[general, web]|sp
+startpage news|startpage|None|[news, web]|spn
+startpage images|startpage|None|[images, web]|spi
+steam|steam|true|None|stm
+tokyotoshokan|tokyotoshokan|true|None|tt
+solidtorrents|solidtorrents|None|None|solid
+tagesschau|tagesschau|true|None|ts
+tiger|tiger|true|general|tig
+tiger news|tiger|true|news|tign
+tmdb|xpath|true|movies|tm
+tonline|tonline|true|None|tol
+tonline images|tonline|true|images|toli
+tonline videos|tonline|true|videos|tolv
+tonline news|tonline|true|news|toln
+torch|xpath|None|onions|tch
+Torznab EZTV|torznab|None|None|eztv
+tusksearch|tusksearch|true|general|tu
+tusksearch images|tusksearch|true|images|tui
+tusksearch videos|tusksearch|true|videos|tuv
+tusksearch news|tusksearch|true|news|tun
+unsplash|unsplash|None|None|us
+unobtanium|xpath|true|[general, blogs]|uno
+yandex|yandex|true|general|yd
+yandex images|yandex|true|images|ydi
+yandex api|yandex_api|None|[general, web]|yda
+yandex music|yandex_music|true|None|ydm
+yahoo|yahoo|true|None|yh
+yahoo news|yahoo_news|None|None|yhn
+youtube|youtube_noapi|None|None|yt
+youtube_api|youtube_api|None|None|yta
+dailymotion|dailymotion|None|None|dm
+vimeo|vimeo|None|None|vm
+wiby|json_engine|true|[general, blogs]|wib
+wikibooks|mediawiki|true|[general, wikimedia]|wb
+wikinews|mediawiki|None|[news, wikimedia]|wn
+wikiquote|mediawiki|true|[general, wikimedia]|wq
+wikisource|mediawiki|true|[general, wikimedia]|ws
+wikispecies|mediawiki|true|[general, science, wikimedia]|wsp
+wiktionary|mediawiki|None|[dictionaries, wikimedia]|wt
+wikiversity|mediawiki|true|[general, wikimedia]|wv
+wikivoyage|mediawiki|true|[general, wikimedia]|wy
+wikicommons.images|wikicommons|None|images|wci
+wikicommons.videos|wikicommons|None|videos|wcv
+wikicommons.audio|wikicommons|None|music|wca
+wikicommons.files|wikicommons|None|files|wcf
+wolframalpha|wolframalpha_noapi|true|general|wa
+wolframalpha_api|wolframalpha_api|None|general|waa
+dictzone|dictzone|None|None|dc
+mymemory translated|translated|None|None|tl
+1337x|1337x|true|None|1337x
+duden|duden|true|None|du
+seznam|seznam|true|None|szn
+deepl|deepl|None|None|dpl
+mojeek|mojeek|None|[general, web]|mjk
+mojeek images|mojeek|None|[images, web]|mjkimg
+mojeek news|mojeek|None|[news, web]|mjknews
+moviepilot|moviepilot|true|None|mp
+national vulnerability database|nvd|true|None|nvd
+naver|naver|true|[general, web]|nvr
+naver images|naver|true|[images]|nvri
+naver news|naver|true|[news]|nvrn
+naver videos|naver|true|[videos]|nvrv
+neosearch|neosearch|true|None|neo
+rubygems|xpath|true|[it, packages]|rbg
+peertube|peertube|true|videos|ptb
+mediathekviewweb|mediathekviewweb|true|None|mvw
+yacy|yacy|true|general|ya
+yacy images|yacy|true|images|yai
+rumble|rumble|true|videos|ru
+reloado|xpath|true|general|rel
+repology|repology|true|None|rep
+resulthunter|resulthunter|true|general|reh
+resulthunter images|resulthunter|true|images|rehi
+searchch|xpath|true|None|sch
+searchzee|searchzee|true|general|sz
+searchzee news|searchzee|true|news|sznw
+startpagina|startpagina|true|general|spnl
+startpagina images|startpagina|true|images|spnli
+startpagina videos|startpagina|true|videos|spnlv
+startpagina news|startpagina|true|news|spnln
+swisscows|swisscows|true|general|sw
+swisscows images|swisscows|true|images|swi
+swisscows videos|swisscows|true|videos|swv
+swisscows news|swisscows_news|true|None|swn
+wordnik|wordnik|None|None|wnik
+woxikon.de synonyme|xpath|true|[dictionaries]|woxi
+tootfinder|tootfinder|None|None|toot
+uxwing|uxwing|true|None|ux
+voidlinux|voidlinux|true|None|void
+vuhuv|vuhuv|true|general|vu
+vuhuv images|vuhuv|true|images|vui
+vuhuv videos|vuhuv|true|videos|vuv
+wallhaven|wallhaven|None|None|wh
+wikimini|xpath|true|general|wkmn
+wttr.in|wttr|None|None|wttr
+xonaly|xpath|true|general|xo
+xprivo|xprivo|true|None|xpr
+xprivo news|xprivo|true|news|xprn
+xprivo videos|xprivo|true|videos|xprv
+zapmeta|xpath|true|general|zpm
+braveapi|braveapi|None|None|None
+brave|brave|None|[general, web]|br
+brave.images|brave|None|[images, web]|brimg
+brave.videos|brave|None|[videos, web]|brvid
+brave.news|brave|None|news|brnews
+exaapi|exaapi|None|None|exa
+lib.rs|lib_rs|true|None|lrs
+sourcehut|sourcehut|true|None|srht
+bt4g|bt4g|None|None|bt4g
+pkg.go.dev|pkg_go_dev|true|None|pgo
+senscritique|senscritique|true|None|scr
+minecraft wiki|mediawiki|true|["software wikis"]|mcw
+sina|json_engine|true|news|sina
+metacrawler|s1search|true|None|mec
+zoo search|s1search|true|None|zoo
+s1search|s1search_rampjs|true|None|s1
+--- enabled(not disabled) ---
+500px|500px|None|"500"
+astrophysics data system|astrophysics_data_system|None|ads
+ahmia|ahmia|onions|ah
+arch linux wiki|archlinux|None|al
+arxiv|arxiv|None|arx
+azure|azure|[it, cloud]|az
+bandcamp|bandcamp|music|bc
+wikipedia|wikipedia|[general]|wp
+bing images|bing_images|None|bii
+bing news|bing_news|None|bin
+bing videos|bing_videos|None|biv
+chefkoch|chefkoch|None|chef
+cloudflareai|cloudflareai|None|cfai
+core.ac.uk|core|None|cor
+currency|currency_convert|None|cc
+deviantart|deviantart|None|da
+docker hub|docker_hub|[it, packages]|dh
+europepmc|europepmc|None|epmc
+elasticsearch|elasticsearch|None|els
+wikidata|wikidata|[general]|wd
+dogpile|dogpile|general|dog
+dogpile images|dogpile|images|dogi
+dogpile videos|dogpile|videos|dogv
+dogpile news|dogpile|news|dogn
+duckduckgo|duckduckgo|None|ddg
+duckduckgo images|duckduckgo_extra|[images]|ddi
+duckduckgo videos|duckduckgo_extra|[videos]|ddv
+duckduckgo news|duckduckgo_extra|[news]|ddn
+etymonline|xpath|[dictionaries]|et
+ebay|ebay|None|eb
+1x|www1x|None|1x
+findborg|findborg|general|fi
+findborg images|findborg|images|fii
+findborg videos|findborg|videos|fiv
+findborg news|findborg|news|fin
+flickr_api|flickr|images|fla
+freesound|freesound|None|fnd
+genius|genius|None|gen
+gentoo|mediawiki|["it", "software wikis"]|ge
+github|github|None|gh
+github code|github_code|None|ghc
+google news|google_news|None|gon
+google videos|google_videos|None|gov
+google cse|google_cse|None|goc
+google cse images|google_cse|[images, web]|goci
+google scholar|google_scholar|None|gos
+hoogle|xpath|[it, packages]|ho
+jina|jina|None|ji
+kickass|kickass|None|kc
+lemmy communities|lemmy|None|leco
+lemmy users|lemmy|None|leus
+lemmy posts|lemmy|None|lepo
+lemmy comments|lemmy|None|lecom
+libretranslate|libretranslate|None|lt
+lingva|lingva|None|lv
+mastodon users|mastodon|None|mau
+mastodon hashtags|mastodon|None|mah
+mdn|json_engine|[it]|mdn
+mixcloud|mixcloud|None|mc
+mankier|json_engine|it|man
+openairedatasets|json_engine|"science"|oad
+openairepublications|json_engine|science|oap
+openstreetmap|openstreetmap|None|osm
+pdbe|pdbe|None|pdb
+pexels|pexels|None|pe
+photon|photon|None|ph
+picjumbo|picjumbo|None|pj
+pinterest|pinterest|None|pin
+piped|piped|videos|ppd
+piped.music|piped|music|ppdm
+piratebay|piratebay|None|tpb
+pubmed|pubmed|None|pub
+pypi|pypi|None|pypi
+radio browser|radio_browser|None|rb
+reuters|reuters|None|reu
+sepiasearch|sepiasearch|None|sep
+shopify stock|shopify_stock|None|shs
+soundcloud|soundcloud|None|sc
+stackoverflow|stackexchange|[it, q&a]|st
+stocksnap|stocksnap|None|sto
+askubuntu|stackexchange|[it, q&a]|ubuntu
+superuser|stackexchange|[it, q&a]|su
+semantic scholar|semantic_scholar|None|se
+springer nature|springer|None|springer
+startpage|startpage|[general, web]|sp
+startpage news|startpage|[news, web]|spn
+startpage images|startpage|[images, web]|spi
+solidtorrents|solidtorrents|None|solid
+torch|xpath|onions|tch
+Torznab EZTV|torznab|None|eztv
+unsplash|unsplash|None|us
+yandex api|yandex_api|[general, web]|yda
+yahoo news|yahoo_news|None|yhn
+youtube|youtube_noapi|None|yt
+youtube_api|youtube_api|None|yta
+dailymotion|dailymotion|None|dm
+vimeo|vimeo|None|vm
+wikinews|mediawiki|[news, wikimedia]|wn
+wiktionary|mediawiki|[dictionaries, wikimedia]|wt
+wikicommons.images|wikicommons|images|wci
+wikicommons.videos|wikicommons|videos|wcv
+wikicommons.audio|wikicommons|music|wca
+wikicommons.files|wikicommons|files|wcf
+wolframalpha_api|wolframalpha_api|general|waa
+dictzone|dictzone|None|dc
+mymemory translated|translated|None|tl
+deepl|deepl|None|dpl
+mojeek|mojeek|[general, web]|mjk
+mojeek images|mojeek|[images, web]|mjkimg
+mojeek news|mojeek|[news, web]|mjknews
+wordnik|wordnik|None|wnik
+tootfinder|tootfinder|None|toot
+wallhaven|wallhaven|None|wh
+wttr.in|wttr|None|wttr
+braveapi|braveapi|None|None
+brave|brave|[general, web]|br
+brave.images|brave|[images, web]|brimg
+brave.videos|brave|[videos, web]|brvid
+brave.news|brave|news|brnews
+exaapi|exaapi|None|exa
+bt4g|bt4g|None|bt4g

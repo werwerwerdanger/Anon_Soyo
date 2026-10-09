@@ -1,0 +1,66 @@
+=== REACHABLE (tcp 443 ok) : 28 ===
+bing                   bing                 www.bing.com                       202.89.233.100
+sogou                  sogou                www.sogou.com                      58.144.164.187
+sogou wechat           sogou_wechat         weixin.sogou.com                   58.246.163.96
+360search              360search            www.so.com                         27.115.124.192
+chinaso news           chinaso              www.chinaso.com                    116.169.180.149
+bilibili               bilibili             api.bilibili.com                   112.83.140.13
+acfun                  acfun                www.acfun.cn                       61.242.191.52
+metacrawler            s1search             search.metacrawler.com             104.18.36.224
+privacywall            privacywall          www.privacywall.org                150.171.110.107
+xprivo                 xprivo               www.xprivo.com                     143.244.56.49
+vuhuv                  vuhuv                vuhuv.com                          194.9.191.11
+luxxle                 luxxle               luxxle.com                         172.66.158.238
+searchzee              searchzee            searchzee.com                      64.29.17.65
+mojeek                 mojeek               www.mojeek.com                     5.102.173.68
+marginalia             marginalia           api2.marginalia-search.com         193.183.0.162
+neosearch              neosearch            neosearch.org                      104.21.72.54
+resulthunter           resulthunter         resulthunter.com                   172.67.204.140
+zoo search             s1search             search.zoo.com                     104.18.36.224
+s1search               s1search_rampjs      search.answers.com                 65.8.180.14
+searchrockit           searchrockit         searchrockit.com                   104.26.15.203
+findborg               findborg             www.findborg.com                   104.16.82.94
+iseek                  iseek                api.iseek.com                      18.226.118.63
+yep                    yep                  api.yep.com                        104.18.41.17
+boardreader            boardreader          boardreader.com                    208.92.218.68
+naver                  naver                search.naver.com                   110.93.154.71
+seznam                 seznam               search.seznam.cz                   77.75.76.39
+swisscows              swisscows            api.swisscows.com                  146.185.79.121
+exaapi                 exaapi               api.exa.ai                         172.66.43.165
+
+=== UNREACHABLE : 35 ===
+baidu                  baidu                -                                  n/a            -
+baidu kaifa            baidu                -                                  n/a            -
+quark                  quark                -                                  n/a            -
+sina                   json_engine          -                                  n/a            -
+dogpile                dogpile              www.dogpile.com                    tcp:ConnectionRefusedError 128.121.146.109
+zapmeta                xpath                -                                  n/a            -
+fireball               fireball             fireball.com                       tcp:TimeoutError 108.160.167.167
+tusksearch             tusksearch           -                                  n/a            -
+startpagina            startpagina          -                                  n/a            -
+wiby                   json_engine          -                                  n/a            -
+yacy                   yacy                 -                                  n/a            -
+mwmbl                  mwmbl                -                                  n/a            -
+right dao              -                    -                                  n/a            -
+stract                 -                    -                                  n/a            -
+seekr                  -                    -                                  n/a            -
+gabanza                xpath                -                                  n/a            -
+cl0q                   json_engine          -                                  n/a            -
+artic                  artic                -                                  n/a            -
+kukei                  xpath                -                                  n/a            -
+littlelayer            json_engine          -                                  n/a            -
+seekninja              seekninja            seek.ninja                         tcp:TimeoutError 135.26.168.28
+unobtanium             xpath                -                                  n/a            -
+searchmysite           xpath                -                                  n/a            -
+rawweb                 json_engine          -                                  n/a            -
+mozhi                  mozhi                mozhi.aryak.me                     tcp:TimeoutError 128.242.245.212
+crowdview              json_engine          -                                  n/a            -
+encyclosearch          json_engine          -                                  n/a            -
+xonaly                 xpath                -                                  n/a            -
+duckduckgo             duckduckgo           -                                  n/a            -
+google                 google               -                                  n/a            -
+startpage              startpage            www.startpage.com                  tcp:TimeoutError 199.59.149.204
+brave                  brave                search.brave.com                   tcp:TimeoutError 65.49.26.98
+qwant                  qwant                www.qwant.com                      tcp:TimeoutError 88.191.249.182
+yandex                 yandex               -                                  n/a            -
+yahoo                  yahoo                -                                  n/a            -

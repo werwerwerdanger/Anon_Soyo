@@ -63,10 +63,19 @@ export const searxngProvider = {
         if (timeRange) {
             params.set('time_range', timeRange);
         }
-        const engines = String(ctx.searxngEngines || '').trim();
-        if (engines) {
-            params.set('engines', engines);
+        // >>> lang-engines patch (managed by patch_lang_engines.py) >>>
+        // Do NOT set an 'engines' URL parameter here. SearXNG ignores it:
+        // seven different values of it were tried against this instance and
+        // every one returned a byte-identical result set. Engine selection is
+        // read out of the query text by searx/query.py's BangParser, which
+        // also restores '-' / '_' to spaces, so '!sogou_wechat' selects the
+        // engine named "sogou wechat". Setting a bang also sets specific=true,
+        // which is what makes the choice exclusive rather than additive.
+        const engineList = pickEngines(query, ctx);
+        if (engineList) {
+            params.set('q', applyEngineBangs(engineList, query));
         }
+        // <<< lang-engines patch <<<
 
         let response;
         try {
@@ -107,3 +116,42 @@ export const searxngProvider = {
         return { source: 'searxng', results };
     }
 };
+
+
+// >>> lang-engines patch (managed by patch_lang_engines.py) >>>
+// CJK ideographs, kana and halfwidth katakana. A query containing any of these
+// is treated as Chinese/Japanese and routed to the Chinese engine list; the
+// presence of Latin letters does not matter, because "成都理工大学 2026 年招生
+// 简章" is a Chinese query that happens to contain digits.
+const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]/;
+
+/**
+ * Turn a comma-separated engine list into '!bang' tokens and put them in front
+ * of the query. Bangs lead so that what the engines actually search for is
+ * unchanged.
+ */
+function applyEngineBangs(engineList, query) {
+    const bangs = String(engineList)
+        .split(',')
+        .map((name) => name.trim().replace(/\s+/g, '_'))
+        .filter(Boolean)
+        .map((name) => `!${name}`)
+        .join(' ');
+    return bangs ? `${bangs} ${query}` : query;
+}
+
+/**
+ * Pick the engine list from the query's script, falling back to the original
+ * searxngEngines value. Returns '' when nothing is configured, which leaves
+ * upstream behaviour untouched.
+ */
+function pickEngines(query, ctx) {
+    const cjk = String(ctx.searxngEnginesCjk || '').trim();
+    const latin = String(ctx.searxngEnginesLatin || '').trim();
+    const fallback = String(ctx.searxngEngines || '').trim();
+    if (CJK_RE.test(String(query || ''))) {
+        return cjk || fallback;
+    }
+    return latin || fallback;
+}
+// <<< lang-engines patch <<<

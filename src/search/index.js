@@ -11,8 +11,11 @@ import { searxngProvider, normalizeSearxngBaseUrl } from './providers/searxng.js
 import { tavilyProvider } from './providers/tavily.js';
 import { braveProvider } from './providers/brave.js';
 import { serpapiProvider } from './providers/serpapi.js';
+// >>> bocha patch (managed by patch_bocha.py) >>>
+import { bochaProvider } from './providers/bocha.js';
+// <<< bocha patch <<<
 
-export const SEARCH_PROVIDERS = [duckduckgoProvider, searxngProvider, tavilyProvider, braveProvider, serpapiProvider];
+export const SEARCH_PROVIDERS = [duckduckgoProvider, searxngProvider, tavilyProvider, braveProvider, serpapiProvider, bochaProvider];
 const PROVIDER_MAP = new Map(SEARCH_PROVIDERS.map((provider) => [provider.id, provider]));
 
 /** 旧版 provider 迁移映射（google/bing 手写抓取已移除） */
@@ -25,9 +28,17 @@ export const WEB_SEARCH_DEFAULTS = Object.freeze({
     enabled: false,
     provider: 'duckduckgo',
     fallbackProviders: [],
-    apiKeys: { tavily: '', brave: '', serpapi: '' },
+    apiKeys: { tavily: '', brave: '', serpapi: '', bocha: '' },
     searxngBaseUrl: '',
     searxngEngines: '',
+    searxngEngines: '',
+    // >>> lang-engines patch (managed by patch_lang_engines.py) >>>
+    // Engines for Chinese queries and for everything else. Actual engine names
+    // from SearXNG's own settings.yml -- see patch_lang_engines.py for the
+    // measurements behind the two lists.
+    searxngEnginesCjk: '',
+    searxngEnginesLatin: '',
+    // <<< lang-engines patch <<<
     region: 'cn-zh',
     locale: 'zh-cn',
     safeSearch: 'moderate',
@@ -114,6 +125,11 @@ export function normalizeWebSearchConfig(raw = {}) {
         apiKeys,
         searxngBaseUrl: normalizeSearxngBaseUrl(source.searxngBaseUrl),
         searxngEngines: normalizeString(source.searxngEngines),
+        searxngEngines: normalizeString(source.searxngEngines),
+        // >>> lang-engines patch (managed by patch_lang_engines.py) >>>
+        searxngEnginesCjk: normalizeString(source.searxngEnginesCjk),
+        searxngEnginesLatin: normalizeString(source.searxngEnginesLatin),
+        // <<< lang-engines patch <<<
         region: normalizeString(source.region) || WEB_SEARCH_DEFAULTS.region,
         locale: normalizeString(source.locale) || WEB_SEARCH_DEFAULTS.locale,
         safeSearch: SAFE_SEARCH_VALUES.has(safeSearch) ? safeSearch : WEB_SEARCH_DEFAULTS.safeSearch,
@@ -321,6 +337,11 @@ export async function runSearch({ config = {}, query, limit = null, topic = 'web
                 safeSearch: searchConfig.safeSearch,
                 searxngBaseUrl: searchConfig.searxngBaseUrl,
                 searxngEngines: searchConfig.searxngEngines,
+                searxngEngines: searchConfig.searxngEngines,
+                // >>> lang-engines patch (managed by patch_lang_engines.py) >>>
+                searxngEnginesCjk: searchConfig.searxngEnginesCjk,
+                searxngEnginesLatin: searchConfig.searxngEnginesLatin,
+                // <<< lang-engines patch <<<
                 apiKey,
                 timeoutMs: searchConfig.timeoutMs,
                 maxSnippetLength: searchConfig.maxSnippetLength,

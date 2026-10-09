@@ -1,3 +1,46 @@
+# Anon_Soyo — MyGO!!!!! 双角色 QQ 机器人
+
+本仓库是 [MimirLink](https://github.com/Xeltra233/MimirLink)（作者 **Xeltra233**）的一个本地部署实例：在 QQ 上跑 **千早爱音（Anon Chihaya）** 与 **长崎素世（Soyo Nagasaki）** 两个角色，接 NapCat / OneBot 与自建 SearXNG 搜索。
+
+上游代码版权归原作者，本仓库保留其提交历史以示署名；本仓库叠加的是部署配置与若干搜索行为补丁。
+
+## 目录结构
+
+| 路径 | 说明 |
+|---|---|
+| `src/` `internal/` `public/` `cmd/` | MimirLink 本体 |
+| `configs/anon.json` | 爱音实例配置（密钥已清空） |
+| `configs/soyo.json` | 素世实例配置（密钥已清空） |
+| `tools/` | 排查与补丁脚本：引擎探测、限速验证、补丁应用器 |
+| `searxng/` | 自建 SearXNG 的 compose 与 settings 配置 |
+| `characters/` | 两个角色的 Tavern v2 角色卡（png + json） |
+
+> 两个实例的**代码字节级完全相同**，差异只在 `config.json` 与 `data/`。所以这里只放一份代码 + 两套配置，而不是两份源码。
+
+## 相对上游的改动
+
+1. **`src/search/providers/bocha.js`（新增）** — 博查搜索 provider，作为 SearXNG 失败时的兜底。
+2. **`src/search/providers/searxng.js`** — 按查询语言分流引擎。中文走 `360search,sogou,sogou wechat,quark,baidu`，英文走 `yandex,360search,bing`。实现上用 `!bang` 前置而非 `engines=` 参数 —— 后者被 SearXNG 完全忽略（实测 7 种取值返回字节级相同结果）；真正生效的是 `searx/query.py` 的 `BangParser`。
+3. **`src/search/index.js`** — 注册 bocha、接通回退链、新增 `searxngEnginesCjk` / `searxngEnginesLatin` 配置项。
+4. **`src/tools.js`** — 工具结果的诚实性。原文案无条件写「以它们为准」，改为按本轮工具成败分支，并显式要求模型自行核对相关性、宁可说没查到也不要硬答。
+
+## 配置与密钥
+
+真实的 `config.json` 从未入库（见 `.gitignore`）。仓库里的 `configs/*.json` 是把真实配置中 **7 处密钥全部清空**后的副本：
+
+`auth.password`、`auth.sessionSecret`、`onebot.accessToken`、`ai.apiKey`、`ai.providers[].apiKey`、`ai.tools.webSearch.apiKeys.bocha`、`tts.apiKey`
+
+使用前请把占位符换成自己的值。`searxng/` 下的 `secret_key` 同样已清空。
+
+## 快速开始
+
+```bash
+cp configs/anon.json config.json      # 填好自己的 key
+docker compose up -d
+```
+
+---
+
 # MimirLink
 
 QQ / OneBot 场景的 Tavern 运行时。兼容 SillyTavern 角色卡，提供长期记忆、Web 面板、变量桥接和 MCP 接口。

@@ -1,0 +1,41 @@
+# Minimal SearXNG settings, tuned to be called as a JSON API by a bot.
+#
+# use_default_settings loads everything else from the image's own settings.yml,
+# so only the differences are listed here. __SECRET__ is replaced by deploy.sh.
+use_default_settings: true
+
+server:
+  secret_key: "__SECRET__"
+  # The bot calls this API directly. The bot-detection limiter would throttle
+  # or block those calls, so it is off. Only safe because the port is firewalled.
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  # MimirLink needs JSON. Without this the endpoint answers HTTP 403 and the
+  # bot reports "this instance refuses JSON output".
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true
+
+# Engines that cannot be reached from a mainland-China network. Leaving them
+# enabled only adds a timeout to every single query.
+# If the self check reports 0 results, comment this whole block out first:
+# a bare `engines:` list can replace the default list instead of patching it,
+# depending on the SearXNG version.
+engines:
+  - name: google
+    disabled: true
+  - name: duckduckgo
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: qwant
+    disabled: true

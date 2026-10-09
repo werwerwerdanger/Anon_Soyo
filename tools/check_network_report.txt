@@ -1,0 +1,61 @@
+﻿
+==========================================================================
+  0. ENVIRONMENT
+==========================================================================
+  no proxy env vars -- results reflect your real network path
+  PowerShell: 5.1.26100.9444
+
+==========================================================================
+  1. DNS SANITY (poisoning detection)
+==========================================================================
+  HOST                       A                AAAA                                       FLAG
+  www.baidu.com              39.156.70.46,39.156.70.239 2409:8c00:6c21:11eb:0:ff:b0bf:59ca,2409:8c00:6c21:118b:0:ff:b0e8:f003 clean
+  searx.be                   69.197.153.180   2001::68f4:2bf8                            POISONED: v6-teredo-fake
+  priv.au                    199.59.149.235   2a03:2880:f127:283:face:b00c:0:25de        POISONED: v6-facebook-block
+  opnxng.com                 31.13.86.21      2a03:2880:f10a:83:face:b00c:0:25de         POISONED: v6-facebook-block
+  searx.space                108.160.169.181  2a03:2880:f117:83:face:b00c:0:25de         POISONED: v6-facebook-block
+  registry-1.docker.io       192.133.77.145   2a03:2880:f134:83:face:b00c:0:25de         POISONED: v6-facebook-block
+  docker.m.daocloud.io       47.117.168.252,101.132.143.33,47.100.39.122,139.196.198.243,47.100.115.205,47.100.46.249,47.100.254.175,101.132.188.159,139.224.10.160 -                                          clean
+
+==========================================================================
+  2. HTTPS REACHABILITY
+==========================================================================
+  TARGET                   CODE   MS       NOTE
+  baidu (baseline)         200    413      reachable
+  aliyun-ecs (yours)       200    89       reachable
+  dockerhub upstream       0      6066     TIMEOUT (blocked / blackholed)
+  mirror daocloud          401    468      HTTP 401 -- reachable, app-level response
+  mirror 1ms.run           401    274      HTTP 401 -- reachable, app-level response
+  mirror rat.dev           401    547      HTTP 401 -- reachable, app-level response
+  github (control)         0      6024     TIMEOUT (blocked / blackholed)
+
+==========================================================================
+  3. PUBLIC SEARXNG INSTANCES (json api)
+==========================================================================
+  An HTTP 200 is NOT enough: many instances disable json and return
+  an HTML page, or serve an anti-bot interstitial, both with 200.
+
+  INSTANCE                         CODE   MS       RESULT
+  searx.be                         0      6026     TIMEOUT
+  priv.au                          0      6027     TIMEOUT
+  opnxng.com                       0      6028     TIMEOUT
+  search.inetol.net                0      6020     TIMEOUT
+  searxng.site                     0      6024     TIMEOUT
+  paulgo.io                        0      6032     TIMEOUT
+  searx.tiekoetter.com             0      6030     TIMEOUT
+  baresearch.org                   0      6028     TIMEOUT
+
+==========================================================================
+  VERDICT
+==========================================================================
+
+  DNS poisoning detected on: searx.be, priv.au, opnxng.com, searx.space, registry-1.docker.io
+  -> those hosts are unreachable no matter which tool you use.
+  No usable public SearXNG instance.
+  -> the free route must be SELF-HOSTED (docker locally, or aliyun ecs).
+
+  Docker Hub: NOT reachable, but a MIRROR is.
+  -> registry-mirrors IS required. Fix with:
+       python fix_docker_mirror.py --apply   (then restart Docker Desktop)
+
+  Aliyun ECS: reachable -> hosting SearXNG there is viable.

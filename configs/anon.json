@@ -1,0 +1,275 @@
+{
+  "auth": {
+    "enabled": true,
+    "username": "admin",
+    "password": "your-password-here",
+    "sessionSecret": "your-random-secret-key-change-this",
+    "sessionDays": 30,
+    "shortSessionHours": 12,
+    "sessionStorePath": "./data/sessions",
+    "cookieSecure": false
+  },
+  "server": {
+    "port": 8001,
+    "host": "127.0.0.1",
+    "healthLogIntervalMs": 60000,
+    "logRetentionDays": 14,
+    "logCleanupIntervalMs": 3600000,
+    "trustProxy": true
+  },
+  "mcp": {
+    "enabled": true,
+    "path": "/mcp",
+    "client": {
+      "enabled": false,
+      "maxResultChars": 4000,
+      "servers": []
+    },
+    "token": ""
+  },
+  "onebot": {
+    "url": "ws://127.0.0.1:2424",
+    "accessToken": "",
+    "tokenMode": "header"
+  },
+  "ai": {
+    "provider": "openai-compatible",
+    "baseUrl": "https://api.deepseek.com",
+    "apiKey": "your-api-key-here",
+    "model": "deepseek-flash",
+    "maxTokens": 4096,
+    "temperature": 1,
+    "timeout": 60000,
+    "activeProviderId": "default",
+    "providers": [
+      {
+        "id": "default",
+        "name": "DeepSeek",
+        "provider": "openai-compatible",
+        "baseUrl": "https://api.deepseek.com",
+        "apiKey": "your-api-key-here",
+        "model": "deepseek-flash",
+        "models": [
+          {
+            "id": "deepseek-flash",
+            "name": "deepseek-flash",
+            "enabled": true
+          },
+          {
+            "id": "deepseek-v4-pro",
+            "name": "deepseek-v4-pro",
+            "enabled": false
+          },
+          {
+            "id": "deepseek-chat",
+            "name": "deepseek-chat",
+            "enabled": false
+          }
+        ]
+      }
+    ],
+    "tools": {
+      "webSearch": {
+        "enabled": true,
+        "provider": "searxng",
+        "fallbackProviders": [
+          "bocha"
+        ],
+        "apiKeys": {
+          "tavily": "",
+          "brave": "",
+          "serpapi": "",
+          "bocha": ""
+        },
+        "searxngBaseUrl": "http://127.0.0.1:8888",
+        "searxngEngines": "",
+        "region": "cn-zh",
+        "locale": "zh-cn",
+        "safeSearch": "moderate",
+        "timeRange": "all",
+        "maxResults": 5,
+        "timeoutMs": 10000,
+        "maxSnippetLength": 800,
+        "allowedDomains": [],
+        "blockedDomains": [],
+        "fetch": {
+          "enabled": true,
+          "timeoutMs": 15000,
+          "maxChars": 8000
+        },
+        "spice": {
+          "enabled": true,
+          "weatherDays": 3
+        },
+        "searxngEnginesCjk": "360search,sogou,sogou wechat,quark,baidu",
+        "searxngEnginesLatin": "yandex,360search,bing"
+      },
+      "sendMention": {
+        "enabled": false
+      }
+    }
+  },
+  "runtime": {
+    "llmEnabled": true
+  },
+  "chat": {
+    "sessionMode": "scoped",
+    "modelProviderId": "default",
+    "model": "deepseek-flash",
+    "varparseModel": "",
+    "varparseModelProviderId": "",
+    "imageCaptionModel": "",
+    "imageCaptionModelProviderId": "",
+    "imageCaptionPrompt": "",
+    "imageFetchMode": "auto",
+    "imageTrustedHosts": "",
+    "imageCaptionSkipWhenModelSupportsImage": true,
+    "imageCaptionFailContinue": false,
+    "triggerMode": "auto",
+    "requireAtInGroup": true,
+    "triggerPrefix": "",
+    "triggerKeywords": [],
+    "historyLimit": 100,
+    "maxGlobalMessages": 2000,
+    "allowedGroups": [],
+    "blockedGroups": [],
+    "allowedUsers": [],
+    "blockedUsers": [],
+    "emojiReaction": false,
+    "emojiReactionId": "289",
+    "pokeReaction": true,
+    "bufferWindowMs": 1200,
+    "replyDelayMs": 800,
+    "segmentDelayMs": 300,
+    "proactiveMessageIntervalMs": 1500,
+    "dedupeWindowMs": 10000,
+    "maxConcurrentSessions": 2,
+    "quoteReplyEnabled": true,
+    "mentionSenderOnReply": true,
+    "attachMetadata": true,
+    "humanChatControlEnabled": true,
+    "sendReasoningToQQ": false,
+    "splitMessage": true,
+    "groupRepeat": {
+      "enabled": false,
+      "triggerCount": 2,
+      "cooldownMs": 180000
+    },
+    "defaultCharacter": "Anon_Chihaya",
+    "commands": {
+      "adminMention": {
+        "enabled": true,
+        "command": "/at"
+      },
+      "adminPoke": {
+        "enabled": true,
+        "command": "/戳一戳",
+        "repeatCount": 5
+      },
+      "participantProfileManual": {
+        "enabled": true,
+        "command": "/人物档案"
+      }
+    },
+    "music": {
+      "enabled": false,
+      "command": "/music",
+      "exitCommand": "/music-exit",
+      "baseUrl": "http://127.0.0.1:8787",
+      "apiKey": "",
+      "limit": 10,
+      "minScore": 0.35,
+      "searchTimeoutMs": 20000,
+      "downloadTimeoutMs": 300000,
+      "sessionTtlMs": 1800000,
+      "maxDurationSeconds": 900,
+      "maxFilesizeMB": 30,
+      "format": "mp3",
+      "voiceSegmentSeconds": 120
+    }
+  },
+  "memory": {
+    "storage": {
+      "type": "sqlite",
+      "path": "./data/chats/memory-store.sqlite"
+    },
+    "participantProfile": {
+      "enabled": false,
+      "injectEnabled": true,
+      "blacklistParticipantIds": [],
+      "manualCommand": "/人物档案",
+      "triggerMessages": 8,
+      "idleMs": 120000,
+      "intervalMs": 300000,
+      "maxSourceMessages": 50,
+      "triggerMode": "idle",
+      "analysisMode": "profile_plus_messages",
+      "providerId": "default",
+      "model": "deepseek-chat"
+    },
+    "summary": {
+      "enabled": true,
+      "triggerMessages": 80,
+      "keepRecent": 30,
+      "maxSummaries": 8,
+      "useAI": true,
+      "maxSourceMessages": 50,
+      "modelProviderId": "default",
+      "model": "deepseek-chat"
+    }
+  },
+  "preset": {
+    "enabled": false,
+    "name": "Default Preset",
+    "prompts": [
+      {
+        "identifier": "main",
+        "name": "Main Prompt",
+        "role": "system",
+        "content": "",
+        "enabled": true,
+        "injection_position": 0,
+        "injection_depth": 0,
+        "forbid_overrides": false,
+        "marker": false,
+        "system_prompt": true
+      }
+    ],
+    "regexRules": []
+  },
+  "bindings": {
+    "global": {
+      "worldbook": null,
+      "preset": null,
+      "regexRules": null
+    },
+    "characters": {}
+  },
+  "context": {
+    "enabled": true,
+    "includeSessionFacts": true,
+    "includeParticipants": true,
+    "includeReplyReference": true,
+    "includeRecentUserIntent": true
+  },
+  "security": {
+    "inputGuardrailEnabled": false
+  },
+  "regex": {
+    "enabled": true,
+    "usePresetRules": true,
+    "rules": []
+  },
+  "tts": {
+    "enabled": false,
+    "provider": "doubao",
+    "baseUrl": "",
+    "apiKey": "your-api-key-here",
+    "modelId": "",
+    "voiceId": "zh_female_wanwanxiaohe_moon_bigtts",
+    "speed": 1,
+    "volume": 1,
+    "pitch": 1,
+    "appId": "your-doubao-app-id"
+  }
+}

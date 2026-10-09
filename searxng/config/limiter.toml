@@ -1,0 +1,50 @@
+# limiter.toml for the local SearXNG instance.
+#
+# WHY THIS FILE EXISTS: the container mounts ./config over /etc/searxng, which
+# SHADOWS the image's own /etc/searxng/limiter.toml. Without a replacement,
+# SearXNG logs this on every boot:
+#     WARNING:searx.botdetection.config: missing config file: /etc/searxng/limiter.toml
+#
+# This is a verbatim copy of the default shipped in the image at
+# /usr/local/searxng/searx/limiter.toml (SearXNG 2026.10.7), so it is exactly
+# what the image would have used anyway.
+#
+# Note that bot detection itself is turned OFF in settings.local.yml
+# (server.limiter: false), which is safe because the port is bound to 127.0.0.1
+# only. This file is here purely to silence the warning.
+
+[botdetection]
+
+# The prefix defines the number of leading bits in an address that are compared
+# to determine whether or not an address is part of a (client) network.
+
+ipv4_prefix = 32
+ipv6_prefix = 48
+
+# If the request IP is in trusted_proxies list, the client IP address is
+# extracted from the X-Forwarded-For and X-Real-IP headers. This should be
+# used if SearXNG is behind a reverse proxy or load balancer.
+
+trusted_proxies = [
+  '127.0.0.0/8',
+  '::1',
+]
+
+[botdetection.ip_limit]
+
+# To get unlimited access in a local network, by default link-local addresses
+# (networks) are not monitored by the ip_limit
+filter_link_local = false
+
+# activate link_token method in the ip_limit method
+link_token = false
+
+[botdetection.ip_lists]
+
+block_ip = []
+
+pass_ip = []
+
+# Activate passlist of (hardcoded) IPs from the SearXNG organization,
+# e.g. `check.searx.space`.
+pass_searxng_org = true

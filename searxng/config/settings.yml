@@ -1,0 +1,288 @@
+# SearXNG settings for a LOCAL (Windows + Docker Desktop) instance that
+# MimirLink calls at http://127.0.0.1:8888.
+#
+# use_default_settings loads the image's own settings.yml and merges these
+# overrides on top, so only the differences are listed. The secret placeholder
+# below is substituted by run-local.ps1.
+use_default_settings:
+  engines:
+    keep_only:
+      - baidu
+      - bing
+      - sogou
+      - sogou wechat
+      - quark
+      - 360search
+      - yandex
+
+# ---------------------------------------------------------------------------
+# THE BLOCK BELOW IS MANDATORY.
+#
+# In the image's own settings.yml, 242 of 363 engines ship with
+# 'disabled: true' -- including baidu, bing AND every engine added below.
+# keep_only only KEEPS an engine; it does NOT enable it. If this block is
+# dropped, every query returns HTTP 200 with zero results in about 20 ms and an
+# empty "unresponsive_engines" field. Listing an engine here merges these
+# overrides on top of its default definition, which is what actually turns it on.
+#
+# keep_only and this list MUST be edited together. A 'name:' entry here whose
+# name is absent from keep_only makes SearXNG log this on every boot and refuse
+# to register the engine:
+#     ERROR:searx.engines: The "engine" field is missing for the engine
+#     named "sogou"
+# ---------------------------------------------------------------------------
+engines:
+  # --- measurement method, because counts alone are worthless here -----------
+  #
+  # Engines were ranked by running ONE query three times and reading the top
+  # result TITLES, not the result count. Counting is actively misleading: the
+  # 'artic' engine returned 20 results for "成都理工大学 2026 年招生简章" --
+  # more than any other engine -- and every single one was a Chicago Art
+  # Institute painting (David Hockney, Yayoi Kusama). It looks like the best
+  # engine on the board and is in fact pure noise.
+  #
+  # Query used: 成都理工大学 2026 年招生简章, x3, identical each time.
+  # A second query (English) was used as a sanity check; the Chinese one is the
+  # real workload and is what these rankings reflect.
+
+  # NOTE: this list had duplicate 'sogou' and 'quark' entries for a while.
+  # They were introduced by a block replacement whose anchor started at
+  # 'sogou wechat' while the original sogou/quark blocks sat above it, so the
+  # new text added a second copy. SearXNG merges duplicate names silently
+  # rather than failing, which is why nothing complained -- the only clue was
+  # that the file contained more '- name:' lines than engines in keep_only.
+  # Worth remembering: keep_only and this list should always have the same
+  # number of entries.
+
+  - name: sogou wechat
+    disabled: false
+    # weight decides which results survive MimirLink's top-5 cut, and it
+    # is the only defence against bing: bing returns a steady 10 results
+    # for every query, so at equal weight its 10 noisy entries crowd the
+    # on-topic ones out of the five the bot actually reads. Weighted this
+    # way the Chinese engines rank first and bing acts as a backstop.
+    weight: 1.3
+    # WITHOUT this line the engine is registered but never runs. Its own
+    # default category is 'news', and a plain query only searches 'general'.
+    # Measured both ways: with the category left alone it returned 0 results on
+    # every run while /config happily reported it as registered and enabled;
+    # forced into 'general' it returned 10/10/10 on topic. A registered,
+    # enabled, silently-unselected engine is invisible from logs, so this is
+    # pinned deliberately.
+    categories: [general]
+    timeout: 10.0
+    # 10/10/10 results, three identical runs -- and a source nothing else here
+    # reaches: WeChat public-account articles.
+    # Titles: "成都理工大学2026年招收数字纪检监察方向博士研究生",
+    #         "成都理工大学2026年博士研究生招生章程",
+    #         "双一流重磅!成都理工大学2026年同等学力申硕开启!"
+    # Kept because WeChat is where a large share of Chinese institutional
+    # announcements live first.
+
+  - name: 360search
+    disabled: false
+    # weight decides which results survive MimirLink's top-5 cut, and it
+    # is the only defence against bing: bing returns a steady 10 results
+    # for every query, so at equal weight its 10 noisy entries crowd the
+    # on-topic ones out of the five the bot actually reads. Weighted this
+    # way the Chinese engines rank first and bing acts as a backstop.
+    weight: 1.2
+    timeout: 10.0
+    # The most reliable Chinese engine measured: 12 consecutive runs across
+    # three sessions, 5 results every single time, all on topic.
+    # Titles: "成都理工大学2026年招生简章!附招生计划、选科要求-高考100",
+    #         "2026年成都理工大学招生章程_大学生必备网"
+    # The result count never varies, which is unusual here and makes it the
+    # safest engine to build on.
+    #
+    # CORRECTION: an earlier round concluded this engine "returns results
+    # exactly once after the container starts, then zero for the next hour",
+    # blaming COOKIE_CACHE_EXPIRATION_SECONDS = 3600 in
+    # searx/engines/360search.py. That is NOT reproducible and the note was
+    # wrong. It is in fact the steadiest engine in the set.
+
+  - name: sogou
+    disabled: false
+    # weight decides which results survive MimirLink's top-5 cut, and it
+    # is the only defence against bing: bing returns a steady 10 results
+    # for every query, so at equal weight its 10 noisy entries crowd the
+    # on-topic ones out of the five the bot actually reads. Weighted this
+    # way the Chinese engines rank first and bing acts as a backstop.
+    weight: 2.0
+    timeout: 10.0
+    # Best Chinese relevance of anything tested, but it rate-limits.
+    # Measured over one session: 9 9 9 9 0 0. The first four identical queries
+    # returned 9 on-topic results each; the fifth and sixth returned ZERO with
+    # no entry in "unresponsive_engines" -- the silent-failure mode, so it
+    # cannot be detected from logs or HTTP status, only from the result count.
+    # The results themselves are the best available:
+    # Titles: "成都理工大学2026年招生简章!附招生计划、选科要求-高考100",
+    #         "2026年成都理工大学招生章程_大学生必备网",
+    #         "成都理工大学本科招生信息网"
+    # Kept for its quality, but treat a query that gets nothing from sogou as
+    # normal rather than as an outage.
+    #
+    # Recovery: NOT quick. After the quota ran out, six further identical
+    # queries AND three more after a 150 s pause all returned zero. So this is
+    # not a per-second throttle that clears on its own in a couple of minutes;
+    # plan on the engine being gone for the rest of the session once it stops.
+    # That also means it contributes nothing to sustained traffic -- the load
+    # has to be carried by 360search, sogou wechat and yandex, which were
+    # unaffected while sogou and quark were both dead in the same session.
+    #
+    # CORRECTION: an earlier round recorded this engine as crashing on every
+    # request with 'and resp.next_request is not None' -> AttributeError
+    # (searx/engines/sogou.py:56). That is NOT reproducible on the current
+    # image (2026.10.7-6671d89be) -- it answers fine, then stops. The old note
+    # described the wrong failure entirely.
+
+  - name: quark
+    disabled: false
+    # weight decides which results survive MimirLink's top-5 cut, and it
+    # is the only defence against bing: bing returns a steady 10 results
+    # for every query, so at equal weight its 10 noisy entries crowd the
+    # on-topic ones out of the five the bot actually reads. Weighted this
+    # way the Chinese engines rank first and bing acts as a backstop.
+    weight: 1.8
+    timeout: 10.0
+    # Same silent rate-limiting as sogou, and it trips sooner: in one session it
+    # returned 7/7/7, and minutes later, after a container recreate, 0 on every
+    # run. Server-side per-IP quota, which a container restart does not reset.
+    # When it does answer it is excellent and covers sources the others miss:
+    # Titles: "成都理工大学2026年本科招生章程-今日头条",
+    #         "成都理工大学2026招生简章发布：分数优先，色弱色盲专业不能录取！-搜狐",
+    #         "成都理工大学2026年硕士研究生招生章程-研究生院"
+    # (Toutiao and Sohu are not in any other engine's results.)
+    #
+    # CORRECTION: earlier notes dismissed this as "unexpected crash" plus spam.
+    # Its real failure mode is silent zero-results, not a crash.
+
+  - name: yandex
+    disabled: false
+    # weight decides which results survive MimirLink's top-5 cut, and it
+    # is the only defence against bing: bing returns a steady 10 results
+    # for every query, so at equal weight its 10 noisy entries crowd the
+    # on-topic ones out of the five the bot actually reads. Weighted this
+    # way the Chinese engines rank first and bing acts as a backstop.
+    weight: 2.0
+    timeout: 10.0
+    # 15/15/15 results, and stable across every run in every session.
+    # Chinese relevance is only loose -- for a 成都理工大学 query the titles were
+    # about Nanjing and Dalian universities -- but it is a real independent
+    # index and it is genuinely good for English queries (asked "what is the
+    # capital of peru" and got Britannica and National Geographic).
+    # Its Chinese results are filler; its English results are not.
+
+  - name: bing
+    disabled: false
+    # weight decides which results survive MimirLink's top-5 cut, and it
+    # is the only defence against bing: bing returns a steady 10 results
+    # for every query, so at equal weight its 10 noisy entries crowd the
+    # on-topic ones out of the five the bot actually reads. Weighted this
+    # way the Chinese engines rank first and bing acts as a backstop.
+    weight: 0.3
+    # bing's default base_url is www.bing.com, which is slow/unreliable from
+    # mainland China. The image's own settings.yml carries this exact hint.
+    base_url: https://cn.bing.com
+    timeout: 10.0
+    # Stable at 10 results every run, and the best English index here -- but be
+    # aware of this: for "成都理工大学 2026 年招生简章" the titles were
+    # "鉴赏丨日本大漆金莳绘漆器", "百家号" and "漆器推荐书目 - 故宫博物院" --
+    # Japanese lacquerware, for a query about a Chinese university's
+    # admissions. And for "what is the capital of peru" it returned
+    # "capital（英语单词）_百度百科" and a Cambridge Dictionary entry. Of every
+    # engine tested, bing has the WORST relevance on both languages; it is here
+    # for coverage, not quality.
+    # Note www.bing.com and cn.bing.com resolve to the same IP
+    # (202.89.233.100), so changing the hostname does not fix this.
+
+  - name: baidu
+    disabled: false
+    # weight decides which results survive MimirLink's top-5 cut, and it
+    # is the only defence against bing: bing returns a steady 10 results
+    # for every query, so at equal weight its 10 noisy entries crowd the
+    # on-topic ones out of the five the bot actually reads. Weighted this
+    # way the Chinese engines rank first and bing acts as a backstop.
+    weight: 1.2
+    timeout: 10.0
+    # MEASURED on this network: baidu always answers with a CAPTCHA, so SearXNG
+    # suspends it for 3600s and the JSON response carries
+    #     ["baidu", "Suspended: CAPTCHA"]
+    # A suspended engine is skipped without an HTTP request, so it costs
+    # nothing to leave it enabled -- and it may start working from a different
+    # network (e.g. if this is ever moved to the aliyun ECS). Baidu would be the
+    # single best Chinese source if it ever lets the request through, which is
+    # the one thing a real headless browser might unlock -- see the note at the
+    # bottom of this file.
+
+  # --- measured and rejected, do NOT re-add without re-measuring ------------
+  #
+  # artic            20/20/20 results and 100% noise. It is the Art Institute
+  #                  of Chicago collection API: every "result" was a painting
+  #                  (David Hockney, Yayoi Kusama). The highest result count of
+  #                  any engine tested and worth exactly nothing. This is the
+  #                  reason to read titles.
+  # bilibili         20/20/20 and highly relevant (成都理工招生宣讲会), but its
+  #                  category is 'videos', so a plain query never selects it --
+  #                  and forcing it into 'general' would add 20 video titles to
+  #                  every single query including ones about Peru. Dropped as
+  #                  noise. To bring it back, add it to keep_only AND this list
+  #                  with 'categories: [general]'.
+  # naver            10/10/10 but pulled Tianjin and Korean results for a
+  #                  Chengdu query. A Korean portal with a weak Chinese index.
+  # iqiyi            25/25/25 of unrelated university videos (Henan, Shenzhen).
+  # acfun            Selected but returns 0 results with NO error reported --
+  #                  the silent-failure mode, so it can never be diagnosed from
+  #                  logs, only from an empty result set.
+  # baidu kaifa       10/10/10, essentially a CSDN blog dump.
+  # dogpile          TCP connection refused from this network.
+  # mojeek, marginalia, mwmbl, wiby, yacy, boardreader, crowdview, findborg,
+  # iseek, neosearch, searchrockit, swisscows, luxxle, xprivo, vuhuv,
+  # searchzee, startpagina, xonaly, encyclosearch, littlelayer, kukei, cl0q,
+  # unobtanium, seekninja, rawweb, resulthunter, tusksearch, zapmeta
+  #                  selected but silent (0 results, no error).
+  # google, duckduckgo, brave, qwant, startpage, yahoo, seznam, fireball,
+  # searchmysite, privacywall, yep, gabanza
+  #                  timeout / access denied / SSL failure. These are the
+  #                  DNS-poisoned or geo-blocked ones, as expected.
+  #
+  # Full raw output of the sweep: mimir-tools/reach.txt, engines_all.txt,
+  # baseurls.txt, and the reports from mimir-tools/test_engines.py,
+  # test_engines2.py and validate_engines.py.
+
+server:
+  secret_key: ""
+  # MimirLink calls this API directly. The bot-detection limiter would throttle
+  # those calls, so it is off. Safe here because the port is loopback-only.
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  # MimirLink needs JSON. Without this the endpoint answers HTTP 403 and the bot
+  # reports "this instance refuses JSON output".
+  formats:
+    - html
+    - json
+  max_page: 1
+
+ui:
+  static_use_hash: true
+
+outgoing:
+  # Eight engines now run in parallel per query. The whole sweep finished in
+  # about 6 s wall clock, so 10 s per engine is headroom, not a bottleneck.
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+
+# ---------------------------------------------------------------------------
+# WHERE A REAL BROWSER WOULD GO, IF IT IS EVER ADDED
+#
+# A headless browser does not belong in this file. If it is added at all it
+# should be a separate provider inside MimirLink, not a SearXNG engine, because
+# the only thing it would buy is baidu -- the single engine here that is blocked
+# by an anti-bot CAPTCHA rather than by the network. Everything else that is
+# worth having (sogou, quark, 360search, sogou wechat) already answers over
+# plain HTTPS, so paying ~400 MB of resident Chromium and a few seconds of cold
+# start to scrape pages those engines already serve would be a bad trade.

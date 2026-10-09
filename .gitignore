@@ -69,3 +69,9 @@ tmp-bracket-check.py
 tmp-part.js
 tmp_prompt_range_*.txt
 tmp-*.py
+
+# Local backup files produced while patching (never publish)
+*.bak-*
+*.bak_*
+*.orig
+*.rej

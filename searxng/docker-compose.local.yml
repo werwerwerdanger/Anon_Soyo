@@ -1,0 +1,30 @@
+services:
+  searxng:
+    # SEARXNG_IMAGE lets run-local.ps1 point straight at a Chinese registry
+    # mirror (e.g. docker.m.daocloud.io/searxng/searxng:latest) when
+    # daemon.json registry-mirrors is not in effect yet. This matters because
+    # registry-1.docker.io / auth.docker.io / production.cloudflare.docker.com
+    # are all DNS-poisoned on this network.
+    image: ${SEARXNG_IMAGE:-searxng/searxng:latest}
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      # Bound to loopback on purpose: only this machine can reach it, which is
+      # exactly what MimirLink needs. Nothing is exposed to the LAN or the
+      # internet, so no firewall or auth layer is required.
+      - "127.0.0.1:${SEARXNG_PORT:-8888}:8080"
+    volumes:
+      - ./config:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://127.0.0.1:${SEARXNG_PORT:-8888}/
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

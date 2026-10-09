@@ -1,0 +1,3 @@
+total loaded = 2
+baidu                        -                                                    general
+bing                         https://cn.bing.com                                  general,web
