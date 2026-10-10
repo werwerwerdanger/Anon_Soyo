@@ -29,6 +29,9 @@ export class PromptBuilder {
         const contextConfig = config.context || {};
         const securityConfig = config.security || {};
         const chatConfig = config.chat || {};
+        // >>> history-assistant-trim patch <<<
+        this.chatConfig = chatConfig;
+        // <<< history-assistant-trim patch <<<
         this.presetConfig = presetConfig;
         this.contextConfig = {
             enabled: contextConfig.enabled !== false,
@@ -47,6 +50,31 @@ export class PromptBuilder {
                 : ''
         };
     }
+
+    // >>> example-dialogue patch (managed by patch_example_dialogue.py) >>>
+    /**
+     * 解析 SillyTavern 的示例对话（mes_example）。
+     * 约定：`<START>` 分块；块内每行以 `{{user}}:` 或 `{{char}}:` 开头。
+     * @returns {Array<{role:'user'|'assistant', content:string}>}
+     */
+    static parseExampleDialogue(text) {
+        const raw = typeof text === 'string' ? text : '';
+        if (!raw.trim()) return [];
+        const turns = [];
+        for (const block of raw.split(/<START>/i)) {
+            for (const line of block.split(/\r?\n/)) {
+                const s = line.trim();
+                if (!s) continue;
+                const m = s.match(/^\{\{\s*(user|char)\s*\}\}\s*[:：]?\s*(.+)$/i);
+                if (!m) continue;
+                const content = m[2].trim();
+                if (!content) continue;
+                turns.push({ role: m[1].toLowerCase() === 'user' ? 'user' : 'assistant', content });
+            }
+        }
+        return turns;
+    }
+    // <<< example-dialogue patch <<<
 
     static normalizePromptBoolean(value, fallback = false) {
         if (value === undefined || value === null || value === '') {
@@ -824,9 +852,88 @@ export class PromptBuilder {
             }))
         );
 
+        // >>> history-assistant-trim patch (managed by patch_history_trim.py) >>>
+        // 模型会照着上下文里「它自己过去的回复」的长度继续写。实测：私聊历史里
+        // 17 条 assistant 消息中位 45 字 ⇒ 生成结果中位 62 字。把这 17 条压成
+        // 各自的第一条分段（本来就是短句）之后，生成结果明显变短。
+        // 只改喂给模型的文本，不动 sqlite 里存的内容，用户说的话一个字不改。
+        const trimChatCfg = this.chatConfig || {};
+        const trimOn = trimChatCfg.historyAssistantTrim !== false;
+        const trimMax = Math.max(0, Number(trimChatCfg.historyAssistantMaxChars) || 24);
+        // >>> hallucination-fix patch >>>
+        // 🔴 原实现「只留首行 + 切到 24 字」把她的历史压成了**重复碎片**：
+        //      没有那种东西 / 去吃饭        → 没有那种东西
+        //      没有那种东西 / 食堂就在楼下   → 没有那种东西
+        //      谁跟你说的 / 小爱音才不会…    → 谁跟你说的
+        //    ⇒ 她看到的自己是一串一模一样的短语，**只能靠编来补上下文**。
+        //    （reasoning 里实测出现过「不要重复'没有那种东西'」——她在跟碎片搏斗。）
+        // 长度改由「注意:」行的长度锚点 + chat.humanShapeHint 管（最高杠杆位置），
+        // 历史只需要**保住"她在说什么"**。⇒ 留前 N 行、总长 ≤ M 字。
+        const trimLinesRaw = Number(trimChatCfg?.historyAssistantMaxLines);
+        const trimLinesMax = Number.isFinite(trimLinesRaw) && trimLinesRaw > 0
+            ? Math.floor(trimLinesRaw) : 2;
+        const shortenHistoryAssistant = (content) => {
+            const raw = String(content === undefined || content === null ? '' : content);
+            if (!trimOn) return raw;
+            const lines = raw.split(/\r?\n/).map((part) => part.trim()).filter(Boolean);
+            if (!lines.length) return raw.trim();
+            let out = '';
+            for (const line of lines.slice(0, trimLinesMax)) {
+                const next = out ? (out + '\n' + line) : line;
+                if (next.length > trimMax) break;
+                out = next;
+            }
+            if (!out) out = lines[0].slice(0, trimMax);
+            return out;
+        };
+        // <<< hallucination-fix patch <<<
+        // <<< history-assistant-trim patch <<<
+// >>> compact-history-user patch >>>
+// 把用户消息的结构化头 [私聊|QQ|昵称|…|messageSegments:[…]] 压成 [昵称 时:分:秒]。
+// 头里的 messageSegments 是 JSON，把正文重复一遍；群号/群名在私聊是 N/A；
+// eventType/isAtBot 对历史轮次无意义。但**昵称要留**（群聊靠它区分发言人）。
+const compactHistoryUser = (content) => {
+    const src = String(content === undefined || content === null ? '' : content);
+    let out = src;
+    for (let guard = 0; guard < 24; guard += 1) {
+        const start = out.search(/\[(?:群聊|私聊)\|/);
+        if (start < 0) break;
+        // 括号配对找头的结尾：messageSegments:[{…}] 内部含 ']'
+        let depth = 0;
+        let end = -1;
+        for (let i = start; i < out.length; i += 1) {
+            const ch = out[i];
+            if (ch === '[') depth += 1;
+            else if (ch === ']') {
+                depth -= 1;
+                if (depth === 0) { end = i; break; }
+            }
+        }
+        if (end < 0) break;                       // 配不上就原样留着，别吃正文
+        const head = out.slice(start, end + 1);
+        const name = (head.match(/昵称:([^|\]]*)/) || [])[1] || '';
+        // QQ 号必须留：昵称会改，QQ 不变 —— 它是**跨群聊/跨会话识别同一个人**的唯一凭据。
+        // 格式沿用 MimirLink 自己的 buildParticipants()：`昵称(QQ)`。
+        const qq = (head.match(/QQ:([^|\]]*)/) || [])[1] || '';
+        const time = (head.match(/时间:([^|\]]*)/) || [])[1] || '';
+        let tag = '';
+        if (name || qq || time) {
+            const who = name && qq ? `${name}(${qq})` : (name || qq);
+            const hm = time ? time.slice(-8) : '';
+            tag = `[${who}${hm ? ' ' + hm : ''}] `;
+        }
+        out = out.slice(0, start) + tag + out.slice(end + 1);
+    }
+    // 引用前缀 [回复上文|…] 在历史轮次里也只是噪音
+    out = out.replace(/\[回复上文\|[^\]]*\]\s*/g, '');
+    return out.replace(/[ \t]{2,}/g, ' ').replace(/\n{2,}/g, '\n').trim();
+};
+// <<< compact-history-user patch <<<
         const historyMessages = normalizedContext.recentMessages.map((message, index) => ({
             role: message.role,
-            content: message.content,
+            content: message.role === 'assistant'
+                ? shortenHistoryAssistant(message.content)
+                : compactHistoryUser(message.content),
             meta: {
                 source: 'history',
                 sourceId: `history-${index}`
@@ -888,6 +995,14 @@ export class PromptBuilder {
         const currentMessageFocusText = formatCurrentMessageFocus(buildCurrentMessageFocus({
             ...runtimeContext,
             currentUserMessage: userMessage
+        }, {
+            // >>> style-anchor-config patch <<<
+            // 范句随角色走：anon 和 soyo 的语气是反的，不能共用一句
+            styleAnchor: (this.chatConfig || {}).styleAnchor,
+            // >>> human-shape patch >>>
+            humanShapeHint: (this.chatConfig || {}).humanShapeHint
+            // <<< human-shape patch <<<
+            // <<< style-anchor-config patch <<<
         }));
         const currentMessageFocusSegment = PromptBuilder.createRuntimeSegment({
             id: 'current-message-focus',
@@ -1063,6 +1178,24 @@ export class PromptBuilder {
         };
 
         appendHistoryInjectionSegments(0);
+
+        // >>> example-dialogue patch (managed by patch_example_dialogue.py) >>>
+        // 示例对话按 ST 的标准位置放在历史之前：让模型在上下文里"看到"角色怎么说话。
+        // 指令永远打不过示例，这是 SillyTavern 官方文档的原话。
+        const exampleTurns = ((this.chatConfig || {}).exampleDialogue === false)
+            ? []
+            : PromptBuilder.parseExampleDialogue(character.mes_example);
+        if (exampleTurns.length > 0) {
+            this.logger?.debug?.(`[提示词] 注入示例对话 ${exampleTurns.length} 轮`);
+            for (const turn of exampleTurns) {
+                messages.push({
+                    role: turn.role,
+                    content: turn.content,
+                    meta: { source: 'example_dialogue' }
+                });
+            }
+        }
+        // <<< example-dialogue patch <<<
 
         for (let index = 0; index < composition.historyMessages.length; index += 1) {
             const message = composition.historyMessages[index];

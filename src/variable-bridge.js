@@ -83,7 +83,18 @@ export function stripInternalTags(text) {
     }
 
     // 4. 去掉所有残留 HTML 标签
+    // >>> code-safety patch (managed by patch_code_safety.py) >>>
+    // 一刀切删掉「像标签的东西」会连 C++ 模板一起删：<bits/stdc++.h>、vector<int>、
+    // map<int,int> 全没了（2026-10-09 群里的代码题就是这样糊掉的）。
+    // 先把围栏代码块和行内代码挪走，只清洗正文，再放回来。
+    const codeSpans = [];
+    result = result.replace(/```[\s\S]*?```|`[^`\n]*`/g, (match) => {
+        codeSpans.push(match);
+        return `\u0000CODE${codeSpans.length - 1}\u0000`;
+    });
     result = result.replace(/<[^>]+>/g, '');
+    result = result.replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeSpans[Number(i)] || '');
+    // <<< code-safety patch <<<
 
     // 5. 还原 UpdateVariable
     result = result.replace(/___UV_(\d+)___/g, (_, i) => uvBlocks[parseInt(i)] || '');

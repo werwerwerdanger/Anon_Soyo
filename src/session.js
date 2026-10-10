@@ -1606,6 +1606,74 @@ export class SessionManager {
         this.clearSession(sessionId);
     }
 
+    // >>> recall-delete patch (managed by patch_recall.py) >>>
+    /**
+     * 撤回的消息从历史里清掉。
+     * messages.metadata_json 里存了 inboundMessageIds / standardEvents[].messageId，
+     * 用 messageId 精确定位；命中多条的合并行只摘撤回那条的正文，不误伤同批其他消息。
+     * @returns {{removed:number, stripped:number, error?:string}}
+     */
+    deleteRecalledMessage(sessionId, inboundMessageId) {
+        const target = String(inboundMessageId === undefined || inboundMessageId === null
+            ? '' : inboundMessageId).trim();
+        if (!sessionId || !target) return { removed: 0, stripped: 0 };
+        let rows = [];
+        try {
+            rows = this.db.prepare(
+                'SELECT id, content, metadata_json FROM messages '
+                + 'WHERE session_id = ? AND metadata_json LIKE ?'
+            ).all(sessionId, '%' + target + '%');
+        } catch (error) {
+            this.logger?.warn?.(`[撤回] 查询历史失败: ${error.message}`);
+            return { removed: 0, stripped: 0, error: error.message };
+        }
+        const updateStmt = this.db.prepare(
+            'UPDATE messages SET content = ?, metadata_json = ? WHERE session_id = ? AND id = ?'
+        );
+        let removed = 0;
+        let stripped = 0;
+        for (const row of rows) {
+            let meta = null;
+            try {
+                meta = JSON.parse(row.metadata_json || '{}');
+            } catch {
+                meta = null;
+            }
+            if (!meta || typeof meta !== 'object') continue;
+            const ids = Array.isArray(meta.inboundMessageIds)
+                ? meta.inboundMessageIds.map((v) => String(v)) : [];
+            const events = Array.isArray(meta.standardEvents) ? meta.standardEvents : [];
+            const evIds = events.map((e) => String(e && e.messageId ? e.messageId : '')).filter(Boolean);
+            if (!ids.includes(target) && !evIds.includes(target)) continue;
+
+            if (ids.length <= 1) {
+                this.statements.deleteMessagesByIds.run(sessionId, row.id);
+                removed += 1;
+                continue;
+            }
+
+            const recalledTexts = events
+                .filter((e) => String(e && e.messageId ? e.messageId : '') === target)
+                .map((e) => String((e && (e.rawText || e.contentText)) || '').trim())
+                .filter(Boolean);
+            let content = String(row.content || '');
+            for (const t of recalledTexts) {
+                content = content.split(t).join('');
+            }
+            const leftIds = ids.filter((x) => x !== target);
+            const leftEvents = events.filter((e) => String(e && e.messageId ? e.messageId : '') !== target);
+            updateStmt.run(
+                content.trim(),
+                JSON.stringify({ ...meta, inboundMessageIds: leftIds, standardEvents: leftEvents, mergedCount: leftIds.length }),
+                sessionId,
+                row.id
+            );
+            stripped += 1;
+        }
+        return { removed, stripped };
+    }
+    // <<< recall-delete patch <<<
+
     listSessions() {
         return this.statements.listSessions.all().map((row) => ({
             id: row.id,
@@ -2443,11 +2511,86 @@ export class SessionManager {
         });
     }
 
+// >>> keyword-recall patch (managed by patch_keyword_recall.py) >>>
+    /** 剥掉结构化消息头 / JSON 段，只留用户真正打的字。
+     *  头里嵌了 `messageSegments:[{...}]`，所以要**反复**剥最内层，不能一次正则搞定。 */
+    stripStructuredHeaders(text = '') {
+        let s = String(text || '');
+        let prev = null;
+        let rounds = 0;
+        while (prev !== s && rounds < 20) {
+            prev = s;
+            s = s.replace(/\[[^\[\]]*\]/g, ' ').replace(/\{[^{}]*\}/g, ' ');
+            rounds += 1;
+        }
+        return s.replace(/\s+/g, ' ').trim();
+    }
+
+    /** 召回关键词：剥头 -> 中文串(>8字补 2-gram) + 英文词(>=3字) -> 去数字/停用词。 */
+    buildRecallKeywords(text = '', limit = 16) {
+        const STOP = new Set([
+            '私聊', '群聊', '昵称', '群号', '群名', '时间', '什么', '怎么', '为什么',
+            '这个', '那个', '可以', '但是', '因为', '所以', '然后', '还是', '就是',
+            '没有', '不是', '一个', '现在', '时候', '感觉', '觉得', '知道', '我们',
+            '你们', '他们', '自己', '已经', '应该', '可能', '真的', '有点', '而且'
+        ]);
+        const cleaned = this.stripStructuredHeaders(text).toLowerCase();
+        const out = [];
+        const push = (word) => {
+            const w = String(word || '').trim();
+            if (!w || out.length >= limit || out.includes(w) || STOP.has(w)) return;
+            out.push(w);
+        };
+        for (const run of (cleaned.match(/[\u4e00-\u9fa5]{2,}/g) || [])) {
+            if (run.length <= 8) push(run);
+            if (run.length > 4) {
+                for (let i = 0; i + 2 <= run.length; i += 1) push(run.slice(i, i + 2));
+            }
+        }
+        for (const word of (cleaned.match(/[a-z][a-z0-9]{2,}/g) || [])) push(word);
+        return out;
+    }
+
+    /** 逐关键词检索后按命中数合并（OR 语义），替代「整段原文当 LIKE 模式」。 */
+    searchMemoryEntriesByKeywords(namespaceOptions, keywords, limit = 4) {
+        const list = Array.isArray(keywords) ? keywords : [];
+        if (list.length === 0) return [];
+        const merged = new Map();
+        for (const keyword of list) {
+            let rows = [];
+            try {
+                rows = this.searchMemoryEntries(namespaceOptions, keyword, Math.max(limit * 3, 8));
+            } catch (error) {
+                this.logger?.warn?.('[记忆] 关键词召回失败', { keyword, error: error.message });
+                continue;
+            }
+            for (const entry of rows) {
+                const hit = merged.get(entry.id);
+                if (hit) hit.hits += 1;
+                else merged.set(entry.id, { entry, hits: 1 });
+            }
+        }
+        return Array.from(merged.values())
+            .sort((a, b) => (b.hits - a.hits) || ((b.entry.createdAt || 0) - (a.entry.createdAt || 0)))
+            .slice(0, limit)
+            .map((item) => item.entry);
+    }
+// <<< keyword-recall patch <<<
+
     recallMemory(namespaceOptions, query, options = {}) {
         const recentLimit = options.recentLimit || 4;
         const searchLimit = options.searchLimit || 4;
         const recentEntries = this.listRecentMemoryEntries(namespaceOptions, recentLimit);
-        const matchedEntries = query ? this.searchMemoryEntries(namespaceOptions, query, searchLimit) : [];
+        // >>> keyword-recall patch (managed by patch_keyword_recall.py) >>>
+        // 原来是把整段带结构化头的原文当 LIKE 模式 ⇒ 永远 0 命中（实测）。
+        // 改成先剥头抽词，再逐关键词 OR 检索。
+        const recallKeywords = this.buildRecallKeywords(query, 16);
+        const matchedEntries = query
+            ? (recallKeywords.length > 0
+                ? this.searchMemoryEntriesByKeywords(namespaceOptions, recallKeywords, searchLimit)
+                : this.searchMemoryEntries(namespaceOptions, query, searchLimit))
+            : [];
+        // <<< keyword-recall patch <<<
         const summaryEntries = this.listRecentSummaryIndexEntries(namespaceOptions, options.summaryLimit || 3);
         const fixedKnowledgeEntries = this.listKnowledgeEntries({
             scopeType: namespaceOptions?.scopeType,
@@ -2457,7 +2600,10 @@ export class SessionManager {
             knowledgeType: 'fixed',
             limit: options.fixedLimit || 6
         });
-        const queryKeywords = this.buildKeywordsFromText(query, 8);
+        // keyword-recall patch: 打分也用剥头后的关键词，否则全是「私聊/qq/昵称/时间」
+        const queryKeywords = recallKeywords.length > 0
+            ? recallKeywords
+            : this.buildKeywordsFromText(query, 8);
         const participantProfileConfig = getParticipantProfileConfig(this.config);
         const blacklist = new Set(participantProfileConfig.blacklistParticipantIds);
         const currentParticipantId = options.currentParticipantId ? String(options.currentParticipantId) : '';

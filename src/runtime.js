@@ -3,6 +3,10 @@
  * 提供去重、缓冲聚合、每会话串行化与全局并发限制。
  */
 
+// >>> silence-gate patch (managed by patch_silence_gate.py) >>>
+import { noteInbound, beginReply, endReply } from './reply-gate.js';
+// <<< silence-gate patch <<<
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -103,6 +107,12 @@ export class MessageRuntime {
         this.config = config;
         const chatConfig = config.chat || {};
         this.bufferWindowMs = chatConfig.bufferWindowMs ?? 1200;
+        // >>> silence-gate patch (managed by patch_silence_gate.py) >>>
+        // 本轮「第一句」等更久（用户常在第一句之后接着打），后续用较短的窗口
+        this.firstBufferWindowMs = chatConfig.firstBufferWindowMs ?? this.bufferWindowMs;
+        // 静默到这个时刻就提前调 AI，窗口一结束即可发出
+        this.bufferPrefetchMs = chatConfig.bufferPrefetchMs ?? 0;
+        // <<< silence-gate patch <<<
         this.replyDelayMs = chatConfig.replyDelayMs ?? 800;
         this.dedupeWindowMs = chatConfig.dedupeWindowMs ?? 10000;
         const maxConcurrent = chatConfig.maxConcurrentSessions ?? 2;
@@ -137,15 +147,40 @@ export class MessageRuntime {
             item: summarizeRuntimeItems([item])
         });
 
+        // >>> silence-gate patch (managed by patch_silence_gate.py) >>>
+        const nowTs = Date.now();
+        // 有新消息进来 ⇒ 若有在途回复，作废它（它生的是上一轮的内容）
+        noteInbound(item.sessionKey);
+        // 距上一条消息超过一个窗口 ⇒ 算新一轮的开头，给更长的静默时间
+        const freshTurn = !state.lastEnqueueTs || (nowTs - state.lastEnqueueTs > this.bufferWindowMs);
+        state.lastEnqueueTs = nowTs;
+        const silentMs = Math.max(0, freshTurn ? this.firstBufferWindowMs : this.bufferWindowMs);
+        state.holdUntil = nowTs + silentMs;
+        // <<< silence-gate patch <<<
         if (state.timer) {
             clearTimeout(state.timer);
         }
 
         state.timer = setTimeout(() => {
-            this.flush(item.sessionKey).catch((error) => {
+            this.flush(item.sessionKey, { holdUntil: state.holdUntil }).catch((error) => {
                 this.logger.error?.(`[调度] 刷新缓冲失败: ${error.message}`);
             });
-        }, this.bufferWindowMs);
+        }, silentMs);
+
+        // >>> silence-gate patch <<<
+        // 提前 flush：先生成，发送仍被闸门压到 holdUntil
+        if (state.prefetchTimer) {
+            clearTimeout(state.prefetchTimer);
+            state.prefetchTimer = null;
+        }
+        if (this.bufferPrefetchMs > 0 && this.bufferPrefetchMs < silentMs) {
+            state.prefetchTimer = setTimeout(() => {
+                this.flush(item.sessionKey, { holdUntil: state.holdUntil }).catch((error) => {
+                    this.logger.error?.(`[调度] 预生成刷新失败: ${error.message}`);
+                });
+            }, this.bufferPrefetchMs);
+        }
+        // <<< silence-gate patch <<<
 
         return true;
     }
@@ -154,20 +189,33 @@ export class MessageRuntime {
         if (!this.buffers.has(sessionKey)) {
             this.buffers.set(sessionKey, {
                 items: [],
-                timer: null
+                timer: null,
+                // >>> silence-gate patch <<<
+                prefetchTimer: null,
+                holdUntil: 0,
+                lastEnqueueTs: 0
+                // <<< silence-gate patch <<<
             });
         }
 
         return this.buffers.get(sessionKey);
     }
 
-    async flush(sessionKey) {
+    async flush(sessionKey, options = {}) {
         const state = this.buffers.get(sessionKey);
         if (!state || state.items.length === 0) {
             return;
         }
 
         const items = state.items.splice(0, state.items.length);
+        // >>> silence-gate patch <<<
+        // 标记本轮开始：holdUntil 之前不许发送，被新消息作废就放弃
+        beginReply(sessionKey, Number(options.holdUntil) || 0);
+        if (state.prefetchTimer) {
+            clearTimeout(state.prefetchTimer);
+            state.prefetchTimer = null;
+        }
+        // <<< silence-gate patch <<<
         this.lastFlushAt = Date.now();
         if (state.timer) {
             clearTimeout(state.timer);
@@ -190,6 +238,9 @@ export class MessageRuntime {
             });
 
         this.chains.set(sessionKey, chain.finally(() => {
+            // >>> silence-gate patch <<<
+            endReply(sessionKey);
+            // <<< silence-gate patch <<<
             if (this.chains.get(sessionKey) === chain) {
                 this.chains.delete(sessionKey);
             }
@@ -238,6 +289,40 @@ export class MessageRuntime {
         }
     }
 
+// >>> recall-drop patch (managed by patch_recall.py) >>>
+    /**
+     * 撤回：把还没送进模型的缓冲项摘掉。
+     * 20s 静默窗口下，大多数撤回都发生在 flush 之前，这是主路径。
+     * @returns {number} 摘掉的条数
+     */
+    dropBufferedMessage(sessionKey, messageId) {
+        const state = this.buffers.get(sessionKey);
+        if (!state || !Array.isArray(state.items) || state.items.length === 0) {
+            return 0;
+        }
+        const target = String(messageId === undefined || messageId === null ? '' : messageId).trim();
+        if (!target) return 0;
+        const before = state.items.length;
+        state.items = state.items.filter((item) => {
+            const ids = [
+                item && item.event ? item.event.message_id : null,
+                item && item.standardEvent ? item.standardEvent.messageId : null
+            ];
+            if (Array.isArray(item && item.standardEvents)) {
+                for (const ev of item.standardEvents) {
+                    ids.push(ev && ev.messageId);
+                }
+            }
+            return !ids.map((v) => String(v === undefined || v === null ? '' : v)).includes(target);
+        });
+        const dropped = before - state.items.length;
+        if (dropped > 0) {
+            this.logger.info?.('[撤回] 已从本轮缓冲中移除', { sessionKey, messageId: target, dropped });
+        }
+        return dropped;
+    }
+
+// <<< recall-drop patch <<<
     cleanupSeenMessages() {
         const now = Date.now();
         for (const [key, timestamp] of this.seenMessages.entries()) {

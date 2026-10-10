@@ -17,6 +17,16 @@ services:
       - ./config:/etc/searxng:rw
     environment:
       - SEARXNG_BASE_URL=http://127.0.0.1:${SEARXNG_PORT:-8888}/
+    # The campus resolvers (www.digi.cdut.edu.cn / secdns.cdut.edu.cn) answer
+    # yandex.com and yandex.ru with NXDOMAIN -- a domain-level block, not
+    # poisoning, so a hosts-file entry cannot fix it. The IPs themselves are
+    # perfectly reachable: 77.88.55.88 / 77.88.44.55 / 5.255.255.77 all accept
+    # :443 from inside the container. Pointing the container at public
+    # resolvers restores the engine without touching anything else.
+    # Verified: yandex.com resolves again, bing/baidu/360 keep working.
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
     cap_drop:
       - ALL
     cap_add:

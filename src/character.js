@@ -104,6 +104,17 @@ export class CharacterManager {
             throw new Error('无法从 PNG 文件中读取角色数据');
         }
 
+        // >>> card-v2-flatten patch (managed by patch_character_card_v2.py) >>>
+        // SillyTavern V2/V3 卡把所有字段放在 data 下，而 MimirLink 的读取方
+        // (prompt.js 读 character.description / personality / scenario / first_mes)
+        // 全在顶层取。不展开就会拿到空人设：角色描述/性格/场景三段都不生成，
+        // 模型只能以通用助手身份作答。这里展开，但保留 spec/spec_version/data，
+        // 让 updateCharacter() 仍能原样把卡写回 PNG。
+        if (character.data && typeof character.data === 'object' && !Array.isArray(character.data)) {
+            const cardData = character.data;
+            character = { ...cardData, ...character, data: cardData };
+        }
+        // <<< card-v2-flatten patch <<<
         // 检查是否有覆盖层文件
         const overridePath = path.join(this.overridesDir, characterName + '.json');
         if (fs.existsSync(overridePath)) {

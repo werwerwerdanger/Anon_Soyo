@@ -323,7 +323,7 @@ async function resolveImage(data = {}, bot) {
     return normalizeImageSource(text(resolved?.url) || text(resolved?.file));
 }
 
-export async function prepareImageInput({ items = [], config = {}, bot, aiClient, resolveHost } = {}) {
+async function prepareImageInputInner({ items = [], config = {}, bot, aiClient, resolveHost } = {}) {
     // 图片可来自本条消息本身，也可来自被引用（回复）的消息：回复一张图提问同样应进入识图链路。
     const images = items.flatMap(item => getOneBotMessageSegments(item.event?.message || item.event?.raw_message)
         .filter(segment => segment.type === 'image'));
@@ -462,3 +462,48 @@ export function attachImageParts(messages, imageParts = []) {
     currentInput.content = [...parts, ...imageParts];
     return messages;
 }
+
+// >>> image-hash patch (managed by patch_image_hash.py) >>>
+// 同一张图（字节相同）算出同一个短哈希，模型据此可判断"这张刚才发过"。
+// 用 FNV-1a 自实现，不引入额外 import。
+function shortImageHash(value) {
+    let h = 2166136261;
+    for (let i = 0; i < value.length; i += 1) {
+        h ^= value.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function buildImageTags(result) {
+    const parts = Array.isArray(result?.imageParts) ? result.imageParts : [];
+    const tags = [];
+    for (const part of parts) {
+        const url = String(part?.image_url?.url || '');
+        if (!url) continue;
+        if (url.startsWith('data:')) {
+            const comma = url.indexOf(',');
+            tags.push('#' + shortImageHash(comma >= 0 ? url.slice(comma + 1) : url));
+        } else {
+            // 远端 URL 带签名参数，取路径部分更稳定
+            tags.push('#' + shortImageHash(url.split('?')[0]));
+        }
+    }
+// >>> image-tag-clean patch (managed by patch_image_tag_clean.py) >>>
+    if (!tags.length) return '';
+    // 只输出标识本身。使用说明放在卡的 system_prompt 里——塞进 user 消息会被
+    // 模型当成"用户说的话"，还会写进历史每轮重放（2026-10-10 修复）。
+    return '[图片标识 ' + tags.join(' ') + ']';
+}
+// <<< image-tag-clean patch <<<
+
+export async function prepareImageInput(args = {}) {
+    const result = await prepareImageInputInner(args);
+    try {
+        result.imageTags = buildImageTags(result);
+    } catch {
+        result.imageTags = '';
+    }
+    return result;
+}
+// <<< image-hash patch <<<

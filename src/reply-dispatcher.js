@@ -1,3 +1,4 @@
+import { sessionKeyFromEvent, waitUntilSendable } from './reply-gate.js';
 import { parseVoiceTags } from './tts.js';
 import { buildVoicePrefaceText } from './tools.js';
 
@@ -65,6 +66,46 @@ function buildVoicePrefixSegments(event, {
     });
 }
 
+// >>> send-interval patch (managed by patch_send_interval.py) >>>
+// 同一个机器人两次下发之间至少间隔 chat.minSendIntervalMs（默认 5000ms）。
+// 起因：2026-10-09 群里 300ms 连发，QQ 直接 result:120 拒发（连错误提示一起拒）。
+// 模块级变量 ⇒ 跨会话全局生效；sendText / sendVoice 是本文件唯一的两条下发出口。
+let lastOutboundAt = 0;
+
+async function awaitSendSlot(config = {}, sleepFn, logger = console, event = null, isBurst = false) {
+    // >>> private-interval patch <<<
+    // 私聊（尤其两个机器人互相私聊）用更长的间隔；群里维持原值。
+    const isGroup = event?.message_type === 'group';
+    let rawMs = isGroup
+        ? (config?.chat?.minSendIntervalMs ?? 0)
+        : (config?.chat?.minSendIntervalMsPrivate ?? config?.chat?.minSendIntervalMs ?? 0);
+    // >>> burst-interval patch (managed by patch_burst_interval.py) >>>
+    // 同一轮回复内的连续分段按「连发」处理：真人是在一两秒内把两三句发完的。
+    // 段间再压 minSendIntervalMs 会让整轮看起来像逐字蹦；跨轮的长间隔仍然生效，
+    // 因为下面 lastOutboundAt 无论走哪条路径都会照常更新。
+    if (isBurst === true) {
+        rawMs = config?.chat?.burstIntervalMs ?? 1200;
+    }
+    // <<< burst-interval patch <<<
+    const minIntervalMs = Math.max(0, Number(rawMs) || 0);
+    // <<< private-interval patch <<<
+    const wait = typeof sleepFn === 'function'
+        ? sleepFn
+        : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    if (minIntervalMs <= 0) {
+        lastOutboundAt = Date.now();
+        return 0;
+    }
+    const waitMs = lastOutboundAt + minIntervalMs - Date.now();
+    if (waitMs > 0) {
+        logger.info?.(`[限速] 距上次下发不足 ${minIntervalMs}ms，再等 ${waitMs}ms`);
+        await wait(waitMs);
+    }
+    lastOutboundAt = Date.now();
+    return Math.max(0, waitMs);
+}
+// <<< send-interval patch <<<
+
 export async function dispatchReply(event, processedReply, options = {}, deps = {}) {
     const {
         config,
@@ -75,21 +116,96 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
         sleep = defaultSleep
     } = deps;
 
+    // >>> cobot-truncate patch >>>
+    // 用户 2026-10-10：「两个人在群里互相说话一轮不能超过 2 句，直接截断」。
+    // 放在最前面（拆段/引用/语音之前），保证后面所有路径看到的都是截断后的文本。
+    const coBotCapRaw = Number(config?.chat?.coBotMaxSentences);
+    const coBotCap = Number.isFinite(coBotCapRaw) && coBotCapRaw > 0 ? Math.floor(coBotCapRaw) : 0;
+    if (options?.isCoBotTurn === true && coBotCap > 0) {
+        const rawText = String(processedReply || '');
+        // 句末标点或换行都算一句的边界
+        const sentences = rawText
+            .split(/(?<=[。！？!?])|\r?\n+/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+        if (sentences.length > coBotCap) {
+            processedReply = sentences.slice(0, coBotCap).join('\n');
+            logger.info(`[互怼] 回复 ${sentences.length} 句 → 截断到 ${coBotCap} 句`);
+        }
+    }
+    // <<< cobot-truncate patch <<<
     const ttsConfig = ttsManager?.getConfig?.() || {};
     const { textParts, hasVoice } = parseVoiceTags(String(processedReply || ''));
     const splitMessage = options.forceSingleMessage ? false : config.chat.splitMessage !== false;
     const segmentDelayMs = config.chat.segmentDelayMs ?? 300;
     const proactiveIntervalMs = config.chat.proactiveMessageIntervalMs ?? Math.max(segmentDelayMs, 1200);
     const quoteReplyEnabled = config.chat.quoteReplyEnabled !== false;
+    // >>> reply-style patch (managed by patch_reply_style.py) >>>
+    // 1) 句号即消息边界：QQ 上没人一句话全用句号收尾，断句交给换行/分段。
+    // 2) 引用回复只留给长消息，而且只挂第一条：短回复直接发正文，
+    //    拆成多条时后面的也普通发，别每条都顶个引用框。
+    const splitOnPeriod = config.chat.splitOnPeriod !== false;
+    const rawQuoteMinLines = config.chat.quoteReplyMinLines;
+    const quoteReplyMinLines = (rawQuoteMinLines === undefined
+        || rawQuoteMinLines === null
+        || rawQuoteMinLines === '')
+        ? 6
+        : (Number.isFinite(Number(rawQuoteMinLines)) ? Number(rawQuoteMinLines) : 6);
+    const replyLineCount = String(processedReply || '')
+        .split(/\r?\n/)
+        .filter((line) => line.trim())
+        .length;
+    // quoteReplyMinLines <= 0 表示「永远引用」，即本补丁之前的旧行为。
+    const quoteThisReply = quoteReplyEnabled
+        && (quoteReplyMinLines <= 0 || replyLineCount >= quoteReplyMinLines);
+    const splitReplyIntoSegments = (text) => {
+        // >>> code-safety patch (managed by patch_code_safety.py) >>>
+        // 围栏代码块整体算一段：按行拆会把一个程序拆成几十条 QQ 消息
+        //（配合 minSendIntervalMs=5000 更是灾难）。只有围栏外的正文才按句号/换行切。
+        const source = String(text === undefined || text === null ? '' : text);
+        const splitPlain = (part) => {
+            const chunks = splitOnPeriod ? part.split('。') : [part];
+            return chunks.flatMap((chunk) => chunk.split(/\r?\n+/));
+        };
+        const segments = [];
+        const fence = /```[\s\S]*?```/g;
+        let cursor = 0;
+        let match;
+        while ((match = fence.exec(source)) !== null) {
+            segments.push(...splitPlain(source.slice(cursor, match.index)));
+            segments.push(match[0]);
+            cursor = match.index + match[0].length;
+        }
+        segments.push(...splitPlain(source.slice(cursor)));
+        return segments
+            .map((segment) => segment.trim())
+            .filter(Boolean);
+        // <<< code-safety patch <<<
+    };
+    // <<< reply-style patch <<<
     const mentionSenderOnReply = config.chat.mentionSenderOnReply !== false;
     const mentionPrefix = event.message_type === 'group' && mentionSenderOnReply ? buildGroupMentionPrefix(event.user_id) : '';
     const ttsEnabled = ttsConfig.enabled === true;
     let hasSentPrimary = false;
 
-    const sendText = async (content) => {
+    const sendText = async (content, options = {}) => {
+        // >>> silence-gate patch (managed by patch_silence_gate.py) >>>
+        // 生成可以提前（runtime 的 prefetch 计时器），但发送必须等本轮静默窗口结束；
+        // 期间用户又发了消息 ⇒ 本轮作废，直接不发。
+        const gateKey = sessionKeyFromEvent(event);
+        if (gateKey) {
+            const sendable = await waitUntilSendable(gateKey, sleep, logger);
+            if (!sendable) {
+                return;
+            }
+        }
+        // <<< silence-gate patch <<<
+        // >>> send-interval patch <<<
+        await awaitSendSlot(config, sleep, logger, event, options.burst === true);
+        // <<< send-interval patch <<<
         const message = !hasSentPrimary && mentionPrefix ? `${mentionPrefix}${content}` : content;
         if (event.message_type === 'group') {
-            if (quoteReplyEnabled && event.message_id) {
+            if (quoteThisReply && event.message_id && !hasSentPrimary) {
                 if (!hasSentPrimary && mentionSenderOnReply && event.user_id) {
                     const segments = [
                         { type: 'reply', data: { id: String(event.message_id) } },
@@ -103,7 +219,7 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
             } else {
                 await bot.sendGroupMessage(event.group_id, message);
             }
-        } else if (quoteReplyEnabled && event.message_id) {
+        } else if (quoteThisReply && event.message_id && !hasSentPrimary) {
             await bot.sendPrivateReply(event.user_id, event.message_id, message);
         } else {
             await bot.sendPrivateMessage(event.user_id, message);
@@ -113,6 +229,9 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
     };
 
     const sendVoice = async (audioPath) => {
+        // >>> send-interval patch <<<
+        await awaitSendSlot(config, sleep, logger, event);
+        // <<< send-interval patch <<<
         // TTS 语音不走文本「必须 @」策略：只保留可选引用，绝不拼 at。
         // 点歌路径在 index.js 单独传 mentionSender，不会被这里影响。
         const prefixSegments = buildMediaPrefixSegments(event, {
@@ -164,7 +283,7 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
             }
 
             const segments = splitMessage
-                ? content.split(/\n\n+/).filter((segment) => segment.trim())
+                ? splitReplyIntoSegments(content)
                 : [content];
 
             for (let index = 0; index < segments.length; index += 1) {
@@ -175,7 +294,7 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
                 }
 
                 const isPrimarySend = !hasSentPrimary;
-                await sendText(segmentContent);
+                await sendText(segmentContent, { burst: !isPrimarySend });
                 const hasMoreSegments = index < segments.length - 1 || partIndex < textParts.length - 1;
                 const delayMs = isPrimarySend ? segmentDelayMs : proactiveIntervalMs;
                 if (hasMoreSegments && delayMs > 0) {

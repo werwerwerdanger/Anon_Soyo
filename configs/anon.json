@@ -37,8 +37,8 @@
     "baseUrl": "https://api.deepseek.com",
     "apiKey": "your-api-key-here",
     "model": "deepseek-flash",
-    "maxTokens": 4096,
-    "temperature": 1,
+    "maxTokens": 8192,
+    "temperature": 0.8,
     "timeout": 60000,
     "activeProviderId": "default",
     "providers": [
@@ -63,7 +63,7 @@
           {
             "id": "deepseek-chat",
             "name": "deepseek-chat",
-            "enabled": false
+            "enabled": true
           }
         ]
       }
@@ -126,10 +126,21 @@
     "imageCaptionSkipWhenModelSupportsImage": true,
     "imageCaptionFailContinue": false,
     "triggerMode": "auto",
-    "requireAtInGroup": true,
+    "requireAtInGroup": false,
     "triggerPrefix": "",
-    "triggerKeywords": [],
+    "triggerUsers": [],
+    "triggerKeywords": [
+      "爱音",
+      "千早爱音",
+      "爱音酱",
+      "Anon",
+      "anon",
+      "Ano-chan",
+      "アノン"
+    ],
     "historyLimit": 100,
+    "historyAssistantTrim": true,
+    "historyAssistantMaxChars": 40,
     "maxGlobalMessages": 2000,
     "allowedGroups": [],
     "blockedGroups": [],
@@ -138,21 +149,32 @@
     "emojiReaction": false,
     "emojiReactionId": "289",
     "pokeReaction": true,
-    "bufferWindowMs": 1200,
+    "bufferWindowMs": 20000,
+    "firstBufferWindowMs": 30000,
+    "bufferPrefetchMs": 15000,
+    "recallHandling": true,
+    "exampleDialogue": true,
+    "styleAnchor": "语气照这个来——诶，无视我? 那我吃一颗哦 我就是想看到嘛~ 啊，超可爱!",
+    "ignoreGroupMessages": false,
     "replyDelayMs": 800,
     "segmentDelayMs": 300,
     "proactiveMessageIntervalMs": 1500,
-    "dedupeWindowMs": 10000,
+    "dedupeWindowMs": 60000,
+    "repeatSuppressMinChars": 4,
+    "minSendIntervalMs": 5000,
+    "burstIntervalMs": 1200,
     "maxConcurrentSessions": 2,
     "quoteReplyEnabled": true,
+    "quoteReplyMinLines": 6,
+    "splitOnPeriod": true,
     "mentionSenderOnReply": true,
     "attachMetadata": true,
     "humanChatControlEnabled": true,
     "sendReasoningToQQ": false,
     "splitMessage": true,
     "groupRepeat": {
-      "enabled": false,
-      "triggerCount": 2,
+      "enabled": true,
+      "triggerCount": 3,
       "cooldownMs": 180000
     },
     "defaultCharacter": "Anon_Chihaya",
@@ -186,7 +208,28 @@
       "maxFilesizeMB": 30,
       "format": "mp3",
       "voiceSegmentSeconds": 120
-    }
+    },
+    "groupRepeatSuppressMs": 120000,
+    "coBotIds": [
+      "3628056487",
+      "2458713318"
+    ],
+    "botBanterMaxTurns": 2,
+    "botBanterWindowMs": 300000,
+    "replyDecision": {
+      "enabled": true,
+      "scope": "group",
+      "maxTokens": 4,
+      "minChars": 1
+    },
+    "coBotPrivateBlock": false,
+    "minSendIntervalMsPrivate": 2500,
+    "coBotPrivateMaxTurns": 4,
+    "stickerReplyChance": 0.2,
+    "coBotMaxSentences": 2,
+    "humanShapeHint": "真人在群里打字是这个形状：一半的消息在六个字以内，几乎不打标点，也不追求把一句话说完整。一件事可以拆成两条发 —— 先敲一句四五个字的，再补一句。别攒成一条二十个字的完整句子。",
+    "historyAssistantMaxLines": 2,
+    "ignoreNapcatOutput": true
   },
   "memory": {
     "storage": {
@@ -209,8 +252,8 @@
     },
     "summary": {
       "enabled": true,
-      "triggerMessages": 80,
-      "keepRecent": 30,
+      "triggerMessages": 100,
+      "keepRecent": 50,
       "maxSummaries": 8,
       "useAI": true,
       "maxSourceMessages": 50,

@@ -35,7 +35,13 @@ function getSegmentTypes(event = {}) {
 }
 
 function hasEmojiSegment(event = {}) {
-    return getSegmentTypes(event).some((type) => ['face', 'mface', 'marketface'].includes(type));
+    // >>> image-as-sticker patch (managed by patch_image_as_sticker.py) >>>
+    // QQ 的表情包/动画表情在 OneBot 里是 image 段（summary: [动画表情]），
+    // 不是 face/mface/marketface。只认后三个会让「收图」这条路径完全不生效：
+    // emoji_reaction 意图不触发 ⇒ 对应策略和警告都不会出现（2026-10-10 实测踩到）。
+    return getSegmentTypes(event).some((type) =>
+        ['face', 'mface', 'marketface', 'image'].includes(type));
+    // <<< image-as-sticker patch <<<
 }
 
 function hasOnlyNonTextSegments(event = {}) {
@@ -98,9 +104,17 @@ function buildStrategies({ event, text, intent, routing }) {
     if (intent === 'poke') {
         strategies.push('acknowledge_poke_briefly');
     }
+    // >>> sticker-react patch (managed by patch_sticker_react.py) >>>
+    // 原来这里 push 的是 'describe_visible_emoji_or_mood'（字面意思：描述可见的表情），
+    // 结果机器人收到表情包就逐张描述画面/念图上的字。真人收到表情只会给反应。
     if (intent === 'emoji_reaction') {
-        strategies.push('describe_visible_emoji_or_mood');
+        // >>> sticker-strategy-ignore patch >>>
+        // 用户 2026-10-10：默认当没发过一样。策略名是原样喂给模型的，
+        // 写 'react' 就等于在命令她对表情包做反应（与「注意:」行自相矛盾）。
+        strategies.push('ignore_sticker_keep_talking_about_text');
+        // <<< sticker-strategy-ignore patch <<<
     }
+    // <<< sticker-react patch <<<
     if (intent === 'low_information' || intent === 'call_out') {
         strategies.push('give_short_acknowledgement');
         strategies.push('avoid_question_as_crutch');
@@ -113,11 +127,11 @@ function buildStrategies({ event, text, intent, routing }) {
         strategies.push('do_not_reply_unless_triggered');
     }
 
-    strategies.push('keep_one_to_three_short_sentences');
+    strategies.push('keep_lines_short_like_typing_on_a_phone');
     return [...new Set(strategies)];
 }
 
-function buildWarnings({ event, text, intent, routing }) {
+function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '' }) {
     const warnings = [];
     if (event?.reply?.fetchStatus === 'failed') {
         warnings.push(`引用消息获取失败: ${event.reply.fetchReason || 'unknown'}`);
@@ -134,10 +148,47 @@ function buildWarnings({ event, text, intent, routing }) {
     if (routing?.skipReason) {
         warnings.push(`当前路由未触发回复: ${routing.skipReason}`);
     }
+    // >>> length-anchor patch (managed by patch_length_anchor.py) >>>
+    // 这一行是模型产出回复前最后读到的 system 文本，压长度的最高杠杆位置。
+    // 数字来自实测（本群真人 296 条）：中位 7 字、≤6 字占 49%、换行 0%。
+    // >>> style-anchor-config patch (managed by patch_style_anchor_config.py) >>>
+    // 范句按角色配（chat.styleAnchor）—— 爱音多用感叹号波浪号，素世几乎不用，
+    // 写死在共享代码里会把两个人磨成同一种腔调。
+    const anchorText = typeof styleAnchor === 'string' ? styleAnchor.trim() : '';
+    warnings.push(
+        // 2026-10-10 实测：范句被**逐字照抄**过（输入「算了 不想聊了」时
+        // 素世把 styleAnchor 原样背了一遍）。加免责，让它当语气而不是模板。
+        (anchorText ? '（下面是语气参照，别原句照搬）' + anchorText + '；' : '')
+        + '长短拉开，短的四五个字也行，长的二三十个字也行；'
+        + '张嘴就直接接对方说的内容，第一句别去评价对方这句话本身；不要收尾金句'
+    );
+    // >>> human-shape patch >>>
+    // 用户 2026-10-10：「稍微学一学其他人说话」。只借**形状**不借内容（见脚本头注释）。
+    const shapeText = typeof humanShapeHint === 'string' ? humanShapeHint.trim() : '';
+    if (shapeText) warnings.push(shapeText);
+    // <<< human-shape patch <<<
+    // <<< style-anchor-config patch <<<
+    // >>> sticker-react patch (managed by patch_sticker_react.py) >>>
+    if (intent === 'emoji_reaction') {
+        // >>> sticker-default-ignore patch >>>
+        // 用户 2026-10-10：表情包一般没特别含义，默认根本不用管，只在被明确问时才解析。
+        // >>> bare-sticker patch >>>
+        // 用户 2026-10-10：'就当对方没发过一样' 在**空图**时会让她复读上一条
+        // （模型 reasoning 原话就引用了这句规则）。拆成两种情况 + 明令禁止复读。
+        // 词表会变成模板（实测 anon 7/9 都是「嗯?」）⇒ 只留硬约束，语气交给示例。
+        warnings.push('默认不用管表情包，不要提它、不要描述画面、不要念图上的字。'
+            + '图里还带了文字就只答那些文字；整条消息只有一张图、没有文字的时候，'
+            + '不要重复你上一条说过的话，也不要硬找话题接 —— 随手应一声，或者干脆不回。'
+            + '只有对方明确让你看图、或问你图里是什么时才看图');
+        // <<< bare-sticker patch <<<
+        // <<< sticker-default-ignore patch <<<
+    }
+    // <<< sticker-react patch <<<
+    // <<< length-anchor patch <<<
     return warnings;
 }
 
-export function buildCurrentMessageFocus(runtimeContext = {}) {
+export function buildCurrentMessageFocus(runtimeContext = {}, options = {}) {
     const event = getLatestEvent(runtimeContext) || {};
     const routing = getLatestRouting(runtimeContext) || {};
     const text = normalizeText(event.contentText || event.rawText || runtimeContext.currentUserMessage || '');
@@ -176,7 +227,15 @@ export function buildCurrentMessageFocus(runtimeContext = {}) {
         latestText: compactText(text, 220),
         segmentTypes: getSegmentTypes(event),
         strategies: buildStrategies({ event, text, intent, routing }),
-        warnings: buildWarnings({ event, text, intent, routing })
+        warnings: buildWarnings({
+            event, text, intent, routing,
+            // >>> style-anchor-config patch <<<
+            styleAnchor: options.styleAnchor || '',
+            // >>> human-shape patch >>>
+            humanShapeHint: options.humanShapeHint || ''
+            // <<< human-shape patch <<<
+            // <<< style-anchor-config patch <<<
+        })
     };
 
     return focus;

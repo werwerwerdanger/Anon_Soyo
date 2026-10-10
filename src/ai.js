@@ -291,7 +291,10 @@ export class AIClient {
         if (reasoningContent !== null) {
             this.logPipelineStage('reasoning_content 提取成功', {
                 contentLength: reasoningContent.length,
-                contentPreview: reasoningContent.slice(0, 200),
+                // >>> reason-log-full patch >>>
+                // 原先 200 字不够看（实测一条 987 字，结论都在被截掉的部分）
+                contentPreview: reasoningContent.slice(0, 3000),
+                // <<< reason-log-full patch <<<
                 rawReasoningType: typeof (message.reasoning_content ?? message.reasoningContent ?? message.reasoning),
                 rawReasoningLength: typeof (message.reasoning_content ?? message.reasoningContent ?? message.reasoning) === 'string'
                     ? (message.reasoning_content ?? message.reasoningContent ?? message.reasoning).length
@@ -419,19 +422,27 @@ export class AIClient {
             baseUrl: hasBaseUrlOverride ? overrides.baseUrl : this.config.baseUrl,
             apiKey: hasApiKeyOverride ? overrides.apiKey : this.config.apiKey,
             maxTokens: overrides.maxTokens ?? this.config.maxTokens,
-            temperature: overrides.temperature ?? this.config.temperature
+            temperature: overrides.temperature ?? this.config.temperature,
+            // >>> cobot-turn patch >>>
+            thinking: overrides.thinking
+            // <<< cobot-turn patch <<<
         };
     }
 
     buildChatPayload(messages, overrides = {}) {
         const options = this.resolveChatOptions(overrides);
-        return {
+        const payload = {
             model: options.model,
             messages,
             max_tokens: options.maxTokens,
             temperature: options.temperature,
             stream: false
         };
+        // >>> cobot-turn patch >>>
+        // 只在显式要求时带上；实测 deepseek-flash 支持 {type:'disabled'} 关掉思考。
+        if (options.thinking) payload.thinking = options.thinking;
+        // <<< cobot-turn patch <<<
+        return payload;
     }
 
     buildToolsChatPayload(messages, tools, overrides = {}) {

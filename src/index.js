@@ -33,6 +33,9 @@ import fs from 'fs';
 import { OneBotClient, buildMentionMessage } from './onebot.js';
 import { buildAIToolContext, appendMentionTaskToPromptMessages, generateMentionTextFromPrompt, buildToolPhaseResultMessage, buildToolPhaseMessages } from './tools.js';
 import { chatScopeKey } from './chat-scope.js';
+// >>> napcat-output-ignore patch (managed by patch_ignore_napcat.py) >>>
+import { isNapcatNoise } from './napcat-output.js';
+// <<< napcat-output-ignore patch <<<
 import { McpClientManager, normalizeMcpClientConfig } from './mcp-client.js';
 import { normalizeWebSearchConfig } from './search/index.js';
 import { findForwardSegments, fetchForwardTranscripts } from './forward-message.js';
@@ -41,6 +44,9 @@ import { WorldBookManager } from './worldbook.js';
 import { PromptBuilder } from './prompt.js';
 import { AIClient } from './ai.js';
 import { ImageInputError, normalizeImageCaptionConfig, getOneBotMessageSegments, prepareImageInput, attachImageParts } from './image-input.js';
+// >>> reply-decision patch <<<
+import { decideReply } from './reply-decision.js';
+// <<< reply-decision patch <<<
 import { SessionManager } from './session.js';
 import { RegexProcessor } from './regex.js';
 import { setupRoutes } from './routes.js';
@@ -895,6 +901,15 @@ function buildDebugReplyWithReasoning(reasoningContent, visibleReply) {
     return `【思维链】\n${reasoning}\n\n【正文】\n${reply}`;
 }
 
+// >>> send-failure-fallback patch (managed by patch_send_failure_fallback.py) >>>
+// QQNT 拒发时抛的是 EventChecker Failed + NodeIKernelMsgService/sendMsg（result 非 0、
+// errMsg 为空）。这类失败重发无意义 —— 2026-10-09 那天我们连错提示一起被拒了两条。
+function isOutboundSendFailure(error) {
+    const message = String(error?.message || '');
+    return /EventChecker Failed|sendMsg|retcode/i.test(message);
+}
+// <<< send-failure-fallback patch <<<
+
 function buildAIServiceFailureMessage(error, config = {}) {
     const message = String(error?.message || '');
     if (message === 'AI_TIMEOUT') {
@@ -924,6 +939,29 @@ function buildAIServiceFailureMessage(error, config = {}) {
     return '处理消息时出现错误，请稍后重试';
 }
 
+
+// >>> repeat-suppress patch (managed by patch_repeat_suppress.py) >>>
+// 原去重键只用 message_id：那只挡得住"同一条消息被重投"，挡不住"同一个人复读同一句"
+// —— 2026-10-09 私聊里用户把同一句话发了九遍，她逐条回应还数起"第三遍了"，最出戏。
+// 纯文本消息改用内容做键（带 user_id，免得把不同人的同句话并掉、毁掉群聊复读）；
+// 图片/表情继续用 message_id，重复发表情不受影响。
+function normalizeRepeatText(value) {
+    return String(value ?? '').trim().replace(/\s+/g, ' ');
+}
+
+function buildMessageDedupeKey(config, sessionKey, event, plainText, messageSegments = []) {
+    const normalized = normalizeRepeatText(plainText);
+    const minChars = Math.max(1, Number(config?.chat?.repeatSuppressMinChars) || 4);
+    const onlyText = Array.isArray(messageSegments) && messageSegments.length > 0
+        && messageSegments.every((segment) => segment && segment.type === 'text');
+    if (onlyText && normalized.length >= minChars) {
+        return `${sessionKey}:u${event?.user_id}:text:${normalized}`;
+    }
+    return event?.message_id
+        ? `${sessionKey}:${event.message_id}`
+        : `${sessionKey}:${event?.time}:${normalized}`;
+}
+// <<< repeat-suppress patch <<<
 
 function buildStructuredMessage(event, plainText, meta = {}) {
     const { message_type, user_id, group_id, sender } = event;
@@ -1548,7 +1586,24 @@ function matchesKeywords(text, keywords = []) {
         return false;
     }
 
-    return keywords.some((keyword) => keyword && text.includes(keyword));
+    // >>> keyword-boundary patch >>>
+    // 用户 2026-10-10：「群聊关键字只设置成自己和自己的别称」。
+    // 原文是朴素 `text.includes(keyword)`（大小写敏感）⇒ 小写 `anon` 会在
+    // `canon` / `anonymous` 里命中，`soyo` 同理。
+    // 规则：**纯 ASCII 关键词按词边界匹配**（大小写不敏感），CJK 保持子串
+    //（中文没有词边界，且「素世」出现在「长崎素世」里本来就该命中）。
+    return keywords.some((keyword) => {
+        if (!keyword) {
+            return false;
+        }
+        const kw = String(keyword);
+        if (/^[\x20-\x7E]+$/.test(kw)) {
+            const esc = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(`(^|[^A-Za-z0-9_])${esc}($|[^A-Za-z0-9_])`, 'i').test(text);
+        }
+        return text.includes(kw);
+    });
+    // <<< keyword-boundary patch <<<
 }
 
 function toComparableId(value) {
@@ -1590,6 +1645,112 @@ function isAllowed(config, event) {
 
     return true;
 }
+
+// >>> trigger-users patch (managed by patch_trigger_users.py) >>>
+// 群里「免 @ 直通 LLM」的白名单：名单里的人说话就触发，其他人仍要 @ 或关键词。
+// 为什么不用 triggerMode='always'：270 人群里每条消息都触发 = 每条 2 次 LLM 调用
+// 再叠 5s 下发间隔，队列会拖到回复完全没有时效。
+function isTriggerUser(config, event) {
+    const list = config?.chat?.triggerUsers;
+    if (!Array.isArray(list) || list.length === 0) return false;
+    const id = String(event?.user_id ?? '').trim();
+    if (!id) return false;
+    return list.some((value) => String(value ?? '').trim() === id);
+}
+// <<< trigger-users patch <<<
+
+// >>> group-repeat-and-names patch (managed by patch_group_repeat_and_names.py) >>>
+// 群里「同一句被多人重复」不该每条都触发一次回复。注意与 patch_repeat_suppress.py 的分工：
+// 那个按「会话+用户+内容」去重（保住群聊复读的探测能力），这个按「群+内容」不区分发言者，
+// 只用来**抑制触发**，消息本身照常入库。
+const recentGroupTexts = new Map();
+
+function groupTextKey(groupId, text) {
+    return `${groupId}:${String(text ?? '').trim().replace(/\s+/g, ' ')}`;
+}
+
+function isRepeatedGroupText(config, event, plainText) {
+    const windowMs = Math.max(0, Number(config?.chat?.groupRepeatSuppressMs) || 0);
+    if (windowMs <= 0) return false;
+    if (event?.message_type !== 'group' || !event?.group_id) return false;
+    const key = groupTextKey(event.group_id, plainText);
+    if (!key.split(':')[1]) return false;
+    const now = Date.now();
+    for (const [k, ts] of [...recentGroupTexts.entries()]) {
+        if (now - ts > windowMs) recentGroupTexts.delete(k);
+    }
+    if (recentGroupTexts.has(key)) return true;
+    recentGroupTexts.set(key, now);
+    return false;
+}
+// <<< group-repeat-and-names patch <<<
+
+// >>> sticker-assertion patch >>>
+// 用户 2026-10-10：「给表情包加一个回复断言把回复意愿变低」。
+// 纯表情包（有图无文字）默认低意愿：按 chat.stickerReplyChance 概率决定回不回。
+// 判据用 messageSegments（extractMessageInfo 已返回），只认「图/表情 + 占位文字」。
+const STICKER_SEG_TYPES = new Set(['image', 'face', 'mface', 'marketface']);
+
+function isStickerOnlyMessage(messageInfo = {}) {
+    const segs = Array.isArray(messageInfo.messageSegments) ? messageInfo.messageSegments : [];
+    if (!segs.length) return false;
+    let hasSticker = false;
+    for (const seg of segs) {
+        const type = String(seg?.type || '');
+        if (STICKER_SEG_TYPES.has(type)) { hasSticker = true; continue; }
+        // reply/at/forward 不产生正文，放行
+        if (type === 'reply' || type === 'at' || type === 'forward' || type === 'json' || type === 'xml') continue;
+        if (type === 'text') {
+            const raw = String(seg?.text ?? seg?.data?.text ?? '').trim();
+            // 「[图片]」「[动画表情]」这类占位文本不算真文字
+            if (raw && !/^\[[^\]]{0,10}\]$/.test(raw)) return false;
+            continue;
+        }
+        return false;
+    }
+    return hasSticker;
+}
+// <<< sticker-assertion patch <<<
+
+
+// >>> bot-banter-limit patch (managed by patch_bot_banter_limit.py) >>>
+// 群里两个机器人互相触发会形成循环（实测两边都能看见对方：902 / 1325 条），
+// 而且已经导致群内被禁言。
+// ⚠ 2026-10-09 修：初版是「人类一说话就清零」—— 但活跃群里人类一直在插话，
+// 计数**永远到不了上限**，等于没做（实测 21:20 有 co_bot 却始终没有 bot_banter_limit）。
+// 改成**滑动窗口计数**：在 botBanterWindowMs 内机器人之间的来回累计到上限就停，
+// 人类插话不再清零。
+const botBanterTurns = new Map();
+
+function isCoBot(config, event) {
+    const list = config?.chat?.coBotIds;
+    if (!Array.isArray(list) || list.length === 0) return false;
+    const id = String(event?.user_id ?? '').trim();
+    return Boolean(id) && list.some((v) => String(v ?? '').trim() === id);
+}
+
+// 返回 'human'（不是机器人）/ 'allow' / 'limit'
+function botBanterDecision(config, event) {
+    if (!isCoBot(config, event)) return 'human';
+    const isGroup = event?.message_type === 'group';
+    if (isGroup && !event?.group_id) return 'human';
+    // 私聊也要算 —— 群里压住之后它们会转到私聊继续吵（实测 21:53 私聊五连）
+    const maxTurns = isGroup
+        ? Math.max(0, Number(config?.chat?.botBanterMaxTurns) || 0)
+        : Math.max(0, Number(config?.chat?.coBotPrivateMaxTurns) || 0);
+    const windowMs = Math.max(1000, Number(config?.chat?.botBanterWindowMs) || 300000);
+    const key = isGroup ? ('g:' + event.group_id) : ('p:' + (event.user_id ?? ''));
+    const now = Date.now();
+    const recent = (botBanterTurns.get(key) || []).filter((t) => now - t < windowMs);
+    if (recent.length >= maxTurns) {
+        botBanterTurns.set(key, recent);
+        return 'limit';
+    }
+    recent.push(now);
+    botBanterTurns.set(key, recent);
+    return 'allow';
+}
+// <<< bot-banter-limit patch <<<
 
 function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}) {
     const triggerMode = config.chat.triggerMode || 'auto';
@@ -1635,10 +1796,52 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
         return skip('access_denied');
     }
 
+    // >>> napcat-output-ignore patch (managed by patch_ignore_napcat.py) >>>
+    // NapCat 的 `#`-命令输出会以各 bot 自己的账号刷进群，被当成普通群友发言；
+    // 两个实例互为 coBot 时会互相把对方的输出当群友 ⇒ 来回聊。按内容特征挡掉。
+    // 开关 chat.ignoreNapcatOutput !== false（默认开）。
+    if (config?.chat?.ignoreNapcatOutput !== false && isNapcatNoise(plainText)) {
+        return skip('napcat_output');
+    }
+    // <<< napcat-output-ignore patch <<<
+
+    // >>> sticker-assertion patch >>>
+    // 纯表情包低意愿。放在这里 = 群聊/私聊两条路都吃到；
+    // 被 @ / 被回复 / 白名单用户仍然照常回（那是明确被叫到，不该被概率挡）。
+    if (!isAtMe && !messageInfo.replyToBot && !isTriggerUser(config, event)
+        && isStickerOnlyMessage(messageInfo)) {
+        const rawChance = Number(config?.chat?.stickerReplyChance);
+        const chance = Number.isFinite(rawChance) ? Math.min(1, Math.max(0, rawChance)) : 0.2;
+        if (Math.random() >= chance) {
+            return skip('sticker_low_willingness');
+        }
+    }
+    // <<< sticker-assertion patch <<<
+
     if (event.message_type === 'group') {
+        // >>> bot-banter-limit patch <<<
+        // 放在 replyToBot 之前 —— 否则机器人之间用"回复"接话会绕过上限（实测漏洞）。
+        if (isCoBot(config, event)) {
+            return botBanterDecision(config, event) === 'limit'
+                ? skip('bot_banter_limit')
+                : accept('co_bot');
+        }
+        // <<< bot-banter-limit patch <<<
         if (messageInfo.replyToBot) {
             return accept('reply_to_bot');
         }
+        // >>> trigger-users patch <<<
+        if (isTriggerUser(config, event)) {
+            return accept('trigger_user');
+        }
+        // <<< trigger-users patch <<<
+        // >>> group-repeat-and-names patch <<<
+        // 放在关键词/@ 之前：否则复读的那句只要含关键词，照样每条都触发一次。
+        // 只让「直接回复机器人」绕开它（那是有明确指向的动作）。
+        if (isRepeatedGroupText(config, event, routingText)) {
+            return skip('repeated_text');
+        }
+        // <<< group-repeat-and-names patch <<<
         if (triggerMode === 'always') {
             return accept('always');
         }
@@ -1670,6 +1873,18 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
     if (triggerMode === 'prefix') {
         return hasPrefix ? accept('prefix') : skip('private_prefix_required');
     }
+    // >>> cobot-private-block patch <<<
+    // 两个机器人互相私聊会变成无限对话，每一轮 2 次 LLM 调用 —— 纯烧 token。
+    // 只挡私聊；群里的互动不受影响（那条由 botBanterMaxTurns 管）。
+    if (config?.chat?.coBotPrivateBlock !== false && isCoBot(config, event)) {
+        return skip('cobot_private');
+    }
+    // <<< cobot-private-block patch <<<
+    // >>> bot-banter-limit patch <<<
+    if (isCoBot(config, event) && botBanterDecision(config, event) === 'limit') {
+        return skip('bot_banter_limit');
+    }
+    // <<< bot-banter-limit patch <<<
     return accept('private');
 }
 
@@ -3216,6 +3431,51 @@ async function processBatch(batch) {
             }
 
             // 图片输入：留空时把图片直传聊天模型；显式选择图片转述模型时先转述，只把转述文本并入本轮输入
+            // >>> reply-decision patch <<<
+            // 先决定"要不要回"，再进入两次大调用。整段包 try/catch：任何意外都退化成
+            // 「照常回复」，绝不能让决策层成为"她突然哑了"的原因。
+            if (shouldRunLlm && config.chat?.replyDecision?.enabled === true) {
+                try {
+                    const decision = await decideReply({
+                        config,
+                        aiClient,
+                        logger,
+                        sessionId,
+                        // >>> group-reply-gate patch (managed by patch_group_reply_gate.py) >>>
+                        // 原来只传当前这批、且全标成 user
+                        // ⇒ 判「这轮结束没/换话题没」时看不到任何历史，等于瞎猜。
+                        // 改成传真实会话历史（含机器人自己上一条）。
+                        recentMessages: (context?.recentMessages || []).map((item) => ({
+                            role: item.role === 'assistant' ? 'assistant' : 'user',
+                            content: item.content || ''
+                        })),
+                        // <<< group-reply-gate patch <<<
+                        plainText: processedInput,
+                        // group-reply-gate patch: 原来是 `primary?.structuredText ? '' : ''`
+                        // ⇒ 恒为空串，判定时不知道是谁在说话。
+                        speaker: primary?.event?.sender?.card
+                            || primary?.event?.sender?.nickname
+                            || '',
+                        // <<< group-reply-gate patch <<<
+                        // >>> decision-private patch <<<
+                        messageType: event?.message_type || ''
+                        // <<< decision-private patch <<<
+                    });
+                    if (decision.skip) {
+                        logger.info('[决策] 本轮不回复', {
+                            sessionId,
+                            reason: decision.reason,
+                            raw: decision.raw
+                        });
+                        return;
+                    }
+                    logger.info('[决策] 本轮回复', { sessionId, reason: decision.reason });
+                } catch (error) {
+                    logger.warn(`[决策] 判定异常，按"回"处理: ${error?.message || error}`);
+                }
+            }
+            // <<< reply-decision patch <<<
+
             let imageInput = { mode: 'none', imageCount: 0, imageParts: [], captionText: '' };
             if (shouldRunLlm) {
                 try {
@@ -3239,6 +3499,11 @@ async function processBatch(batch) {
                 } else if (imageInput.mode === 'direct') {
                     const inlineCount = imageInput.imageParts.filter(part => String(part.image_url?.url || '').startsWith('data:')).length;
                     logger.info('[图片] 图片直传聊天模型', { sessionId, imageCount: imageInput.imageCount, inlineCount, captionSkipped: imageInput.captionSkipped || '', mode: 'direct' });
+                    // >>> image-hash patch <<<
+                    if (imageInput.imageTags) {
+                        processedInput = `${processedInput}\n\n${imageInput.imageTags}`;
+                    }
+                    // <<< image-hash patch <<<
                 }
                 for (const warning of imageInput.warnings || []) {
                     logger.warn(`[图片] ${warning}`, { sessionId });
@@ -3512,6 +3777,19 @@ async function processBatch(batch) {
                 mcpClient
             });
             const chatAIOverrides = buildChatAIOverrides(config);
+            // >>> cobot-turn patch >>>
+            // 用户 2026-10-10：两个机器人在群里互相说话时
+            //  ① 不思考（thinking disabled —— 实测思考 91字→0字、prompt 37→11 token）
+            //  ② 回复硬截断到 chat.coBotMaxSentences 句
+            // 判据直接看事件：发言人 ∈ coBotIds 且是群聊。不看 routing，避免和别的分支耦合。
+            const coBotTurn = event.message_type === 'group' && isCoBot(config, event);
+            if (coBotTurn) {
+                chatAIOverrides.thinking = { type: 'disabled' };
+                logger.info('[互怼] 本轮按 bot-to-bot 处理：停思考 + 截断到 '
+                    + (config.chat?.coBotMaxSentences ?? 2) + ' 句');
+            }
+            // <<< cobot-turn patch <<<
+
             const chatAISelection = getChatAISelectionSnapshot(config);
 
             // 两阶段提示词（工具阶段 / 正式回复）：
@@ -3753,7 +4031,12 @@ ${varStatus || '(无)'}
                 splitMessage: sendReasoningToQQ && reasoningContent ? false : config.chat.splitMessage !== false,
                 includeReasoningContent: sendReasoningToQQ && !!reasoningContent
             });
-            await dispatchReply(event, replyToSend, { forceSingleMessage: sendReasoningToQQ && !!reasoningContent });
+            // >>> cobot-turn patch >>>
+            await dispatchReply(event, replyToSend, {
+                forceSingleMessage: sendReasoningToQQ && !!reasoningContent,
+                isCoBotTurn: coBotTurn === true
+            });
+            // <<< cobot-turn patch <<<
             logger.info('[执行] 回复下发完成', {
                 sessionId
             });
@@ -3788,7 +4071,15 @@ ${varStatus || '(无)'}
             }
 
             logger.error(`处理会话 ${sessionId} 失败: ${error.message}`);
-            await sendQuotedStatusMessage(event, failMessage);
+            // >>> send-failure-fallback patch <<<
+            // 失败原因本身就是"发不出去"时，再补一条提示只会多一次被拒的请求，
+            // 群里也照样看不到。只记日志，给风控留出恢复时间。
+            if (isOutboundSendFailure(error)) {
+                logger.warn('[兜底] 本轮失败发生在消息下发环节，已跳过错误提示，避免再次被拒');
+            } else {
+                await sendQuotedStatusMessage(event, failMessage);
+            }
+            // <<< send-failure-fallback patch <<<
         }
     });
 }
@@ -3995,6 +4286,17 @@ async function handleMessage(event) {
         return;
     }
 
+    // >>> ignore-group patch (managed by patch_ignore_group.py) >>>
+    // 用户要求：先不要在群里处理任何消息。
+    // 放在 extractMessageInfo 之前 —— 连消息解析和图片抓取都不做。
+    if (event.message_type === 'group' && config.chat?.ignoreGroupMessages === true) {
+        logger.debug?.('[群聊] 已按要求跳过群消息', {
+            groupId: event.group_id,
+            userId: event.user_id
+        });
+        return;
+    }
+    // <<< ignore-group patch <<<
     const messageInfo = await extractMessageInfo(config, event, bot);
     const { plainText, isAtMe, structuredText, replyToMessageId, replyToBot, replyInfo, replyImageSegments, messageSegments, standardEvent } = messageInfo;
 
@@ -4096,7 +4398,9 @@ async function handleMessage(event) {
     runtime.enqueue({
         sessionKey,
         memoryScope,
-        dedupeKey: event.message_id ? `${sessionKey}:${event.message_id}` : `${sessionKey}:${event.time}:${plainText}`,
+        // >>> repeat-suppress patch <<<
+        dedupeKey: buildMessageDedupeKey(config, sessionKey, event, plainText, messageSegments),
+        // <<< repeat-suppress patch <<<
         event,
         plainText,
         structuredText,
@@ -4112,10 +4416,47 @@ async function handleMessage(event) {
     });
 }
 
+// >>> recall-handling patch (managed by patch_recall.py) >>>
+/**
+ * 撤回处理：用户明确要求"不要看我输撤回的话"。
+ * 两条路都走 —— 没 flush 的从缓冲摘掉，已入库的从历史删掉。
+ */
+async function handleRecallEvent(event) {
+    try {
+        if (config.chat?.recallHandling === false) return;
+        const messageId = String(event?.message_id ?? '').trim();
+        if (!messageId) return;
+        const sessionKey = event.group_id ? `group:${event.group_id}` : `private:${event.user_id}`;
+        const dropped = runtime.dropBufferedMessage(sessionKey, messageId);
+        let deleted = null;
+        if (managers.sessionManager?.deleteRecalledMessage) {
+            deleted = managers.sessionManager.deleteRecalledMessage(sessionKey, messageId);
+        }
+        logger.info('[撤回] 已处理', {
+            sessionKey,
+            messageId,
+            bufferedDropped: dropped,
+            historyRemoved: deleted?.removed ?? 0,
+            historyStripped: deleted?.stripped ?? 0,
+            error: deleted?.error || ''
+        });
+    } catch (error) {
+        // 撤回处理失败绝不能影响正常消息流
+        logger.warn(`[撤回] 处理失败: ${error.message}`);
+    }
+}
+// <<< recall-handling patch <<<
+
 bot.on('message', (event) => {
     // 戳一戳通知单独处理
     if (event && event.post_type === 'notice' && event.notice_type === 'notify' && event.sub_type === 'poke') {
         handlePokeEvent(event);
+        return;
+    }
+    // 撤回通知：撤回的消息不再进模型，也不留在历史里
+    if (event && event.post_type === 'notice'
+        && (event.notice_type === 'group_recall' || event.notice_type === 'friend_recall')) {
+        handleRecallEvent(event);
         return;
     }
     handleMessage(event);
