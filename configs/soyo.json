@@ -125,6 +125,11 @@
     "imageTrustedHosts": "",
     "imageCaptionSkipWhenModelSupportsImage": true,
     "imageCaptionFailContinue": false,
+    "stickers": {
+      "enabled": true,
+      "dir": "data/stickers",
+      "maxPerReply": 1
+    },
     "triggerMode": "auto",
     "requireAtInGroup": false,
     "triggerPrefix": "",
@@ -143,7 +148,8 @@
     "historyLimit": 100,
     "historyAssistantTrim": true,
     "historyAssistantMaxChars": 40,
-    "maxGlobalMessages": 2000,
+    "maxGlobalMessages": 8000,
+    "adminUsers": [],
     "allowedGroups": [],
     "blockedGroups": [],
     "allowedUsers": [],
@@ -173,6 +179,14 @@
     "attachMetadata": true,
     "humanChatControlEnabled": true,
     "sendReasoningToQQ": false,
+    "showThinking": {
+      "enabled": false,
+      "format": "paren",
+      "label": "思考",
+      "maxChars": 1200,
+      "position": "after",
+      "scope": "all"
+    },
     "splitMessage": true,
     "groupRepeat": {
       "enabled": true,
@@ -193,6 +207,28 @@
       "participantProfileManual": {
         "enabled": true,
         "command": "/人物档案"
+      },
+      "roster": {
+        "enabled": true,
+        "command": "/名册",
+        "maxEntries": 100,
+        "maxAliases": 8
+      },
+      "forget": {
+        "enabled": true,
+        "command": "/忘记"
+      },
+      "thinking": {
+        "enabled": true,
+        "command": "/思考"
+      },
+      "ojFeedback": {
+        "enabled": true,
+        "command": "/反馈"
+      },
+      "help": {
+        "enabled": true,
+        "command": "/帮助"
       }
     },
     "music": {
@@ -214,7 +250,8 @@
     "groupRepeatSuppressMs": 120000,
     "coBotIds": [
       "3628056487",
-      "2458713318"
+      "2458713318",
+      "1960433614"
     ],
     "botBanterMaxTurns": 2,
     "botBanterWindowMs": 300000,
@@ -228,18 +265,50 @@
     "minSendIntervalMsPrivate": 2500,
     "coBotPrivateMaxTurns": 4,
     "stickerReplyChance": 0.2,
+    "storeUntriggeredMessages": true,
+    "replyWindow": {
+      "enabled": true,
+      "ms": 180000,
+      "sameSpeakerOnly": true
+    },
     "coBotMaxSentences": 2,
-    "humanShapeHint": "真人在群里打字是这个形状：一半的消息在六个字以内，几乎不打标点，也不追求把一句话说完整。一件事可以拆成两条发 —— 先敲一句四五个字的，再补一句。别攒成一条二十个字的完整句子。",
+    "humanShapeHint": "真人在群里打字是这个形状：一半的消息在六个字以内，几乎不打标点，也不追求把一句话说完整。一件事可以拆成两条发 —— 先敲一句四五个字的，再补一句。别攒成一条二十个字的完整句子。用词照自己平时的说法来 —— 讲具体的事和感受，抽象的说法落到自己能说出口的话上；别人消息里的措辞是别人的，你用自己会说的讲法接。",
     "historyAssistantMaxLines": 2,
-    "ignoreNapcatOutput": true
+    "ignoreNapcatOutput": true,
+    "coBotYieldEnabled": true,
+    "coBotActiveMs": 300000,
+    "coBotMyMaxLines": 2,
+    "coBotCooldownMs": 300000
+  },
+  "ojFeedback": {
+    "enabled": false,
+    "baseUrl": "https://47.109.76.66:3002",
+    "username": "",
+    "password": "",
+    "intervalMs": 60000,
+    "timeoutMs": 15000,
+    "notifyPrivate": true,
+    "notifyGroups": [],
+    "aiComment": true,
+    "maxPerPoll": 5,
+    "maxContentChars": 1200,
+    "stateFile": "data/oj-feedback-state.json"
+  },
+  "ojAc": {
+    "enabled": false
   },
   "memory": {
+    "crossScope": {
+      "enabled": true,
+      "includeOthersInGroups": true,
+      "includeOthersPrivate": false
+    },
     "storage": {
       "type": "sqlite",
       "path": "./data/chats/memory-store.sqlite"
     },
     "participantProfile": {
-      "enabled": false,
+      "enabled": true,
       "injectEnabled": true,
       "blacklistParticipantIds": [],
       "manualCommand": "/人物档案",
@@ -251,6 +320,17 @@
       "analysisMode": "profile_plus_messages",
       "providerId": "default",
       "model": "deepseek-chat"
+    },
+    "participantRoster": {
+      "enabled": true,
+      "maxEntries": 12,
+      "maxListedTotal": 40,
+      "maxAgeDays": 30,
+      "minMessages": 1,
+      "includeGroupMembers": true,
+      "excludeIds": [],
+      "maxNameHistory": 8,
+      "maxAliasesShown": 3
     },
     "summary": {
       "enabled": true,

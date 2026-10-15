@@ -987,7 +987,8 @@ test('index.js 已接入点歌指令、访问控制与语音下发', () => {
     assert.ok(source.includes("} from './music.js';"));
     assert.ok(source.includes('config.chat.music = normalizeMusicConfig(config.chat.music);'), '配置必须归一化');
     assert.ok(source.includes('async function handleMusicCommand(event, plainText)'));
-    assert.ok(source.includes('if (await handleMusicCommand(event, plainText)) {'), 'handleMessage 必须调用点歌处理');
+    // 2026-10-12：指令派发加了群聊 @ 闸门，实参也换成剥掉 @ 标记的 commandInput
+    assert.ok(source.includes('if (commandGate && await handleMusicCommand(event, commandInput)) {'), 'handleMessage 必须调用点歌处理');
     const handlerStart = source.indexOf('async function handleMusicCommand(event, plainText)');
     const handler = source.slice(handlerStart, source.indexOf('async function processBatch'));
     assert.ok(handler.includes('if (!isAllowed(config, event))'), '点歌必须走访问控制');

@@ -414,6 +414,18 @@ export class AIClient {
         return error?.message || '连接 AI 服务失败';
     }
 
+    /**
+     * 单次 LLM 请求的超时（毫秒）。非流式=总超时；流式=空闲超时（来数据就续命）。
+     * 2026-10-15 实测：DeepSeek 拥塞时「响应头 1 秒到、body 卡 14 分钟」，
+     * 而 ai.js 的 fetch 原本没有任何超时 ⇒ 摘要/画像调用裸奔，会话槽位被占半小时，
+     * 期间同会话消息全排队 ⇒ bot 回復的是几十分钟前的上下文（前言不搭后语）。
+     */
+    resolveRequestTimeout(overrides = {}) {
+        const raw = overrides?.timeout ?? this.config?.timeout ?? 60000;
+        const ms = Number(raw);
+        return Number.isFinite(ms) && ms >= 100 ? ms : 60000;
+    }
+
     resolveChatOptions(overrides = {}) {
         const hasBaseUrlOverride = Object.prototype.hasOwnProperty.call(overrides, 'baseUrl') && overrides.baseUrl !== undefined;
         const hasApiKeyOverride = Object.prototype.hasOwnProperty.call(overrides, 'apiKey') && overrides.apiKey !== undefined;
@@ -546,6 +558,34 @@ export class AIClient {
         );
     }
 
+    /**
+     * 上游瞬时拥塞/网关错误（502/503/504、DeepSeek "Service is too busy" 等）。
+     * 与 401/403/404 这类"请求本身有问题"的错误不同，这类等几秒重试大概率能好。
+     * 2026-10-15 实测：DeepSeek 半天内连抛 3 次 503，bot 每次都直接装死。
+     */
+    isTransientServerError(status, errorText = '') {
+        const code = Number(status);
+        if ([408, 502, 503, 504].includes(code)) {
+            return true;
+        }
+        const normalized = String(errorText || '').toLowerCase();
+        if (!normalized) {
+            return false;
+        }
+        return (
+            /service_unavailable/.test(normalized)
+            || /service is too busy/.test(normalized)
+            || /\btoo busy\b/.test(normalized)
+            || /overloaded/.test(normalized)
+            || /temporarily unavailable/.test(normalized)
+            || /bad gateway/.test(normalized)
+            || /gateway time-?out/.test(normalized)
+            || /超时/.test(normalized)
+            || /\btimed?\s*out\b/.test(normalized)
+            || /\btimeout\b/.test(normalized)
+        );
+    }
+
     assertNotProviderErrorContent(content, source = 'content') {
         const text = String(content || '').trim();
         if (!this.isProviderErrorContent(text)) {
@@ -642,14 +682,41 @@ export class AIClient {
             throw new Error('未配置 AI API URL (baseUrl 或 apiUrl)');
         }
 
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                ...payload,
-                stream: true
-            })
-        });
+        // 流式用「空闲超时」：每收到一个 chunk 就续命，只有持续 N ms 没有新数据才掐断。
+        // （正常长回复会一直有数据流动；2026-10-15 那种卡死是半天不来一个字节。）
+        const idleMs = this.resolveRequestTimeout(overrides);
+        const controller = new AbortController();
+        let idleTimer = setTimeout(() => controller.abort(), idleMs);
+        const resetIdle = () => {
+            clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => controller.abort(), idleMs);
+        };
+
+        let response;
+        try {
+            response = await fetch(apiUrl, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    ...payload,
+                    stream: true
+                }),
+                signal: controller.signal
+            });
+        } catch (error) {
+            clearTimeout(idleTimer);
+            if (controller.signal.aborted) {
+                this.logPipelineStage('流式 chat/completions 请求超时', { idleMs });
+                return {
+                    ok: false,
+                    status: 408,
+                    errorText: `AI API 流式请求超时（${idleMs}ms 无响应）`,
+                    timedOut: true
+                };
+            }
+            throw new Error(this.describeNetworkError(error));
+        }
+        resetIdle();
 
         this.logPipelineStage('收到流式 chat/completions 响应', {
             status: response.status,
@@ -659,17 +726,31 @@ export class AIClient {
             messageCount: payloadPreview.messageCount
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            this.logPipelineStage('流式 chat/completions 返回错误', {
-                status: response.status,
-                errorText: String(errorText || '').slice(0, 1000)
-            });
-            return {
-                ok: false,
-                errorText,
-                status: response.status
-            };
+        try {
+            if (!response.ok) {
+                const errorText = await response.text();
+                this.logPipelineStage('流式 chat/completions 返回错误', {
+                    status: response.status,
+                    errorText: String(errorText || '').slice(0, 1000)
+                });
+                return {
+                    ok: false,
+                    errorText,
+                    status: response.status
+                };
+            }
+        } catch (error) {
+            clearTimeout(idleTimer);
+            if (controller.signal.aborted) {
+                this.logPipelineStage('流式 chat/completions 错误响应读取超时', { idleMs });
+                return {
+                    ok: false,
+                    status: 408,
+                    errorText: `AI API 流式请求超时（${idleMs}ms 无响应）`,
+                    timedOut: true
+                };
+            }
+            throw error;
         }
 
         const reader = response.body?.getReader?.();
@@ -739,19 +820,35 @@ export class AIClient {
             }
         };
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-                break;
-            }
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                resetIdle();
+                if (done) {
+                    break;
+                }
 
-            buffer += decoder.decode(value, { stream: true });
-            const events = buffer.split('\n\n');
-            buffer = events.pop() || '';
-            for (const eventText of events) {
-                processEvent(eventText);
+                buffer += decoder.decode(value, { stream: true });
+                const events = buffer.split('\n\n');
+                buffer = events.pop() || '';
+                for (const eventText of events) {
+                    processEvent(eventText);
+                }
             }
+        } catch (error) {
+            clearTimeout(idleTimer);
+            if (controller.signal.aborted) {
+                this.logPipelineStage('流式 chat/completions 数据超时', { idleMs });
+                return {
+                    ok: false,
+                    status: 408,
+                    errorText: `AI API 流式响应超时（${idleMs}ms 无新数据）`,
+                    timedOut: true
+                };
+            }
+            throw error;
         }
+        clearTimeout(idleTimer);
 
         buffer += decoder.decode();
         if (buffer.trim()) {
@@ -802,14 +899,28 @@ export class AIClient {
             throw new Error('未配置 AI API URL (baseUrl 或 apiUrl)');
         }
 
+        const timeoutMs = this.resolveRequestTimeout(overrides);
+        const controller = new AbortController();
+        const timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
         let response;
         try {
             response = await fetch(apiUrl, {
                 method: 'POST',
                 headers,
-                body: JSON.stringify(payload)
+                body: JSON.stringify(payload),
+                signal: controller.signal
             });
         } catch (error) {
+            clearTimeout(timeoutTimer);
+            if (controller.signal.aborted) {
+                this.logPipelineStage('chat/completions 请求超时', { timeoutMs });
+                return {
+                    ok: false,
+                    status: 408,
+                    errorText: `AI API 超时（${timeoutMs}ms 无响应）`,
+                    timedOut: true
+                };
+            }
             throw new Error(this.describeNetworkError(error));
         }
 
@@ -821,43 +932,60 @@ export class AIClient {
             messageCount: payloadPreview.messageCount
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            this.logPipelineStage('chat/completions 返回错误', {
-                status: response.status,
-                errorText: String(errorText || '').slice(0, 1000)
+        // 响应头到了不算完：body 读取同样会卡死（2026-10-15 实测卡了 14 分钟），
+        // 超时定时器保持有效直到 body 读完。
+        try {
+            if (!response.ok) {
+                const errorText = await response.text();
+                this.logPipelineStage('chat/completions 返回错误', {
+                    status: response.status,
+                    errorText: String(errorText || '').slice(0, 1000)
+                });
+                return {
+                    ok: false,
+                    errorText,
+                    status: response.status
+                };
+            }
+
+            const rawText = await response.text();
+            this.lastChatRawText = rawText;
+
+            let data;
+            try {
+                data = JSON.parse(rawText);
+            } catch (error) {
+                this.logPipelineStage('chat/completions 响应 JSON 解析失败', {
+                    rawTextPreview: String(rawText || '').slice(0, 2000)
+                });
+                throw new Error('AI API 返回了非 JSON 响应');
+            }
+            this.lastChatRawResponse = data;
+            if (data.usage) this.recordUsage(data.usage);
+            this.logPipelineStage('已解析 chat/completions 响应体', {
+                responseModel: data?.model || null,
+                choiceCount: Array.isArray(data?.choices) ? data.choices.length : 0,
+                finishReason: data?.choices?.[0]?.finish_reason || null,
+                messageKeys: Object.keys(data?.choices?.[0]?.message || {})
             });
             return {
-                ok: false,
-                errorText,
-                status: response.status
+                ok: true,
+                data
             };
-        }
-
-        const rawText = await response.text();
-        this.lastChatRawText = rawText;
-
-        let data;
-        try {
-            data = JSON.parse(rawText);
         } catch (error) {
-            this.logPipelineStage('chat/completions 响应 JSON 解析失败', {
-                rawTextPreview: String(rawText || '').slice(0, 2000)
-            });
-            throw new Error('AI API 返回了非 JSON 响应');
+            if (controller.signal.aborted) {
+                this.logPipelineStage('chat/completions 响应体读取超时', { timeoutMs });
+                return {
+                    ok: false,
+                    status: 408,
+                    errorText: `AI API 超时（${timeoutMs}ms 响应体未读完）`,
+                    timedOut: true
+                };
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeoutTimer);
         }
-        this.lastChatRawResponse = data;
-        if (data.usage) this.recordUsage(data.usage);
-        this.logPipelineStage('已解析 chat/completions 响应体', {
-            responseModel: data?.model || null,
-            choiceCount: Array.isArray(data?.choices) ? data.choices.length : 0,
-            finishReason: data?.choices?.[0]?.finish_reason || null,
-            messageKeys: Object.keys(data?.choices?.[0]?.message || {})
-        });
-        return {
-            ok: true,
-            data
-        };
     }
 
     extractAssistantMessage(data = {}) {
@@ -992,6 +1120,23 @@ export class AIClient {
                 errorText: String(primaryResult.errorText || '').slice(0, 300)
             });
             await new Promise((resolve) => setTimeout(resolve, 1500));
+            primaryResult = await this.sendChatRequest(primaryPayload, overrides);
+        }
+        // 502/503/504 等瞬时拥塞：退避重试，别让上游打嗝直接变成 bot 装死
+        let transientRetries = 0;
+        while (!primaryResult.ok
+            && transientRetries < 3
+            && this.isTransientServerError(primaryResult.status, primaryResult.errorText)) {
+            transientRetries += 1;
+            const backoffMs = 3000 * transientRetries; // 3s / 6s / 9s
+            this.logPipelineStage('检测到上游拥塞错误，退避后重试主请求', {
+                attempt: transientRetries,
+                maxAttempts: 3,
+                backoffMs,
+                status: primaryResult.status,
+                errorText: String(primaryResult.errorText || '').slice(0, 300)
+            });
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
             primaryResult = await this.sendChatRequest(primaryPayload, overrides);
         }
         if (primaryResult.ok) {

@@ -39,14 +39,32 @@ for (const inst of ['MimirLink', 'MimirLink-soyo']) {
     check(config.chat.minSendIntervalMs === 5000, 'config minSendIntervalMs = 5000',
         String(config.chat.minSendIntervalMs));
 
-    const sendTextBody = src.slice(src.indexOf('const sendText = async (content) => {'));
-    const sendVoiceBody = src.slice(src.indexOf('const sendVoice = async (audioPath) => {'));
-    // 签名在 2026-10-09 扩成 (config, sleep, logger, event)，event 用于区分群聊/私聊间隔
-    const slotCall = /await awaitSendSlot\(config, sleep, logger(, event)?\);/;
-    check(slotCall.test(sendTextBody.slice(0, 400)),
-        'sendText awaits a slot before sending');
-    check(slotCall.test(sendVoiceBody.slice(0, 400)),
-        'sendVoice awaits a slot before sending');
+    // ⚠ 2026-10-13 修：这里原来按**完整签名**定位函数体：
+    //      src.indexOf('const sendText = async (content) => {')
+    //    签名后来扩成 `(content, options = {})` ⇒ indexOf 返回 -1 ⇒ slice(-1) 只拿到最后一个字符
+    //    ⇒ 断言必然 FAIL，而且报的是「sendText awaits a slot before sending」这种**误导性**标签
+    //    （看起来像闸门没了，其实只是找不到函数）。改成按**前缀**定位，签名再扩也不受影响。
+    const fromMarker = (source, marker) => {
+        const at = source.indexOf(marker);
+        if (at < 0) throw new Error(`marker not found: ${marker}`);
+        return source.slice(at);
+    };
+    const sendTextBody = fromMarker(src, 'const sendText = async (content');
+    const sendVoiceBody = fromMarker(src, 'const sendVoice = async (audioPath');
+
+    // 真正要守的不变量是**顺序**：发出去之前必须先等过槽位。
+    // 签名会变（2026-10-13 加了 options.burst），"slot 调用排在 bot.send 之前"不会变。
+    const awaitsSlotBeforeSending = (body) => {
+        const sendAt = body.indexOf('await bot.send');
+        const slotAt = body.indexOf('await awaitSendSlot(');
+        return slotAt >= 0 && (sendAt < 0 || slotAt < sendAt);
+    };
+    check(awaitsSlotBeforeSending(sendTextBody), 'sendText awaits a slot before sending');
+    check(awaitsSlotBeforeSending(sendVoiceBody), 'sendVoice awaits a slot before sending');
+    // 参数形状单独钉一条（宽松：只要求 event 与 burst 都以命名实参传入，不钉死其它细节）
+    // ⚠ 窗口别用 600 —— slot 调用实际落在偏移 532，加上尾部 `);` 刚好被切掉（自己踩了一次）。
+    check(/await awaitSendSlot\(config, sleep, logger(?:, event(?:, [^)]*)?)?\);/.test(sendTextBody.slice(0, 1200)),
+        'sendText 的 slot 调用带着 event/burst 实参');
     // there must be no other outbound call outside the two wrapped helpers
     const rawSends = (src.match(/await bot\.send[A-Za-z]+\(/g) || []).length;
     console.log(`  ..  ${rawSends} await bot.sendXxx() call sites, all inside the two helpers`);

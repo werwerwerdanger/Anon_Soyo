@@ -279,7 +279,17 @@ async function downloadImageDataUri(startUrl, { resolveHost } = {}) {
                 current = await assertPublicImageUrl(new URL(location, current).href, resolveHost);
                 continue;
             }
-            if (!response.ok) throw new ImageInputError(`图片下载失败（HTTP ${response.status}），请稍后重试。`);
+            // >>> image-dead-link patch >>>
+            // 把状态码挂到错误上，调用方据此区分两种失败：
+            //   4xx = CDN **明确拒绝**了这个链接（实测：rkey 失效时 gchat.qpic.cn/download 一律回 400，
+            //         连不带任何参数、换 POST 都回 400）⇒ 供应商拿同一个链接同样读不到。
+            //   5xx / 超时 / DNS = 可能只是本机这一跳不通 ⇒ 供应商那一侧还有机会。
+            if (!response.ok) {
+                const failure = new ImageInputError(`图片下载失败（HTTP ${response.status}），请稍后重试。`);
+                failure.httpStatus = response.status;
+                throw failure;
+            }
+            // <<< image-dead-link patch <<<
             const contentType = text(response.headers.get('content-type')).toLowerCase();
             if (contentType && !contentType.startsWith('image/')) throw new ImageInputError('图片地址返回的不是图片内容。');
             const declared = Number(response.headers.get('content-length'));
@@ -384,6 +394,10 @@ async function prepareImageInputInner({ items = [], config = {}, bot, aiClient, 
     const warnings = forwardWarning ? [forwardWarning] : [];
     const fetchMode = normalizeImageFetchMode(config.chat?.imageFetchMode);
     let totalBytes = 0;
+    // >>> image-dead-link patch >>>
+    // 因"链接已失效"被跳过的张数（HTTP 4xx）。全网拿不到时会走下面的占位分支。
+    let droppedImages = 0;
+    // <<< image-dead-link patch <<<
     for (const image of images) {
         let resolved = await resolveImage(image.data, bot);
         if (!resolved.url.startsWith('data:')) {
@@ -392,8 +406,25 @@ async function prepareImageInputInner({ items = [], config = {}, bot, aiClient, 
                 try {
                     resolved = await downloadImageDataUri(resolved.url, { resolveHost });
                 } catch (error) {
-                    // 下载失败不阻断本轮：退回把原始 URL 交给供应商读取，并在日志里说明
                     if (!(error instanceof ImageInputError)) throw error;
+                    // >>> image-dead-link patch >>>
+                    // 🔴 2026-10-13 修（原来的"回退"是个**陷阱**）：
+                    //   以前这里无条件把**原始 URL** 交给模型供应商读，注释还写着"不阻断本轮"。
+                    //   但 4xx 意味着 **CDN 明确拒绝了这个链接**（实测 gchat.qpic.cn/download 对
+                    //   rkey 失效的链接一律回 400）—— 供应商拿同一个链接一样读不到，而 DeepSeek
+                    //   会因此把**整个请求**判成 400：
+                    //     `.messages[175].image[0]: Failed to download image from https://gchat.qpic.cn/...`
+                    //   ⇒ 这一轮**连一句回复都没有**。用户看到的是"读不了图"，实际是"整条消息被丢掉"。
+                    //   2026-10-13 实测：本地下载成功数从 10-09 的 68/69、10-12 的 14/14 掉到今天 0/3。
+                    //   ⇒ 4xx 就**丢掉这张图**、只回文字；5xx/网络类才保留原来的供应商回退。
+                    const status = Number(error.httpStatus) || 0;
+                    if (status >= 400 && status < 500) {
+                        droppedImages += 1;
+                        warnings.push(`图片链接已失效（HTTP ${status}），本轮跳过这张图：${error.message}`);
+                        continue;
+                    }
+                    // <<< image-dead-link patch <<<
+                    // 下载失败不阻断本轮：退回把原始 URL 交给供应商读取，并在日志里说明
                     warnings.push(`图片下载失败，已改为交给模型供应商读取：${error.message}`);
                 }
             }
@@ -402,6 +433,19 @@ async function prepareImageInputInner({ items = [], config = {}, bot, aiClient, 
         if (totalBytes > IMAGE_INPUT_LIMITS.maxTotalBytes) throw new ImageInputError('本轮内联图片超过 20 MiB，请压缩或分批发送。');
         imageParts.push({ type: 'image_url', image_url: { url: resolved.url } });
     }
+    // >>> image-dead-link patch >>>
+    // 一张都没拿到 ⇒ 走"占位提示"（让她知道自己没看到图），而不是硬把坏链接发出去。
+    // ⚠ 这段必须放在下面两个 early-return **之前**：`imageCaptionModel` 为空时第 413 行
+    //   会直接 return 'direct'，占位分支就再也走不到了（占位那两处都在它下面）。
+    if (imageParts.length === 0 && imageCount > 0 && droppedImages > 0) {
+        warnings.push(`本轮 ${imageCount} 张图都没取到内容，按"看不到图"处理，不要猜图里有什么。`);
+        return {
+            mode: 'placeholder', imageCount, imageParts: [],
+            captionText: buildImageCaptionBlock(IMAGE_CAPTION_FAILED_TEXT),
+            warnings
+        };
+    }
+    // <<< image-dead-link patch <<<
     const overrides = getImageCaptionOverrides(config);
     // 聊天模型自己就能看图时跳过额外转述：省一次调用，也避免转述丢细节。
     if (overrides && shouldSkipImageCaption(config)) {

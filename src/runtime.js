@@ -150,7 +150,9 @@ export class MessageRuntime {
         // >>> silence-gate patch (managed by patch_silence_gate.py) >>>
         const nowTs = Date.now();
         // 有新消息进来 ⇒ 若有在途回复，作废它（它生的是上一轮的内容）
-        noteInbound(item.sessionKey);
+        // 2026-10-13：带上新消息文本 —— 只有「判出换了话题」才作废在途回复，
+        // 否则连打时会吃掉上一句已经生成好的回复（实测私聊被作废 17 次）。
+        noteInbound(item.sessionKey, item.plainText || '');
         // 距上一条消息超过一个窗口 ⇒ 算新一轮的开头，给更长的静默时间
         const freshTurn = !state.lastEnqueueTs || (nowTs - state.lastEnqueueTs > this.bufferWindowMs);
         state.lastEnqueueTs = nowTs;
@@ -210,7 +212,10 @@ export class MessageRuntime {
         const items = state.items.splice(0, state.items.length);
         // >>> silence-gate patch <<<
         // 标记本轮开始：holdUntil 之前不许发送，被新消息作废就放弃
-        beginReply(sessionKey, Number(options.holdUntil) || 0);
+        // 把本轮在回的那些消息的文本一起交给闸门，用于跟新消息比较「是否换了话题」。
+        // items 在这里已经 splice 出来了（下面还会用到），所以能拿到。
+        beginReply(sessionKey, Number(options.holdUntil) || 0,
+            items.map((it) => (it && it.plainText) || '').filter(Boolean).join(' '));
         if (state.prefetchTimer) {
             clearTimeout(state.prefetchTimer);
             state.prefetchTimer = null;
@@ -237,14 +242,25 @@ export class MessageRuntime {
                 this.logger.error?.(`[调度] 会话 ${sessionKey} 批处理失败: ${error.message}`);
             });
 
-        this.chains.set(sessionKey, chain.finally(() => {
+        // >>> chains-leak fix >>>
+        // 🔴 `chain.finally(...)` 返回的是**新 promise**。原代码把 `chain.finally(...)`
+        //    存进 map，却在里面拿 `chains.get(sessionKey) === chain` 比 —— 一个是包装后的、
+        //    一个是没包装的，**永远不相等** ⇒ 条目永不删除。
+        //    症状（2026-10-11 实测）：健康行的 `active`（= chains.size）只增不减
+        //    （21:25 active=2 → 21:36 active=4，而 `maxConcurrentSessions` 只有 2），
+        //    `[调度] 开始刷新缓冲` 里的 `activeSessions` 同样失真；顺便每个会话留一条
+        //    已 resolve 的 promise 不释放。
+        //    修法：把 finally 的结果存成变量，用它自己和 map 里的值比。
+        const tracked = chain.finally(() => {
             // >>> silence-gate patch <<<
             endReply(sessionKey);
             // <<< silence-gate patch <<<
-            if (this.chains.get(sessionKey) === chain) {
+            if (this.chains.get(sessionKey) === tracked) {
                 this.chains.delete(sessionKey);
             }
-        }));
+        });
+        this.chains.set(sessionKey, tracked);
+        // <<< chains-leak fix <<<
     }
 
     async runBatch(sessionKey, items) {

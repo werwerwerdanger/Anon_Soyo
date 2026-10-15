@@ -27,7 +27,7 @@ import createFileStore from 'session-file-store';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, isAbsolute, join } from 'path';
 import fs from 'fs';
 
 import { OneBotClient, buildMentionMessage } from './onebot.js';
@@ -44,10 +44,16 @@ import { WorldBookManager } from './worldbook.js';
 import { PromptBuilder } from './prompt.js';
 import { AIClient } from './ai.js';
 import { ImageInputError, normalizeImageCaptionConfig, getOneBotMessageSegments, prepareImageInput, attachImageParts } from './image-input.js';
+// >>> sticker-send patch >>>
+import { normalizeStickerConfig } from './sticker-library.js';
+// <<< sticker-send patch <<<
 // >>> reply-decision patch <<<
 import { decideReply } from './reply-decision.js';
 // <<< reply-decision patch <<<
 import { SessionManager } from './session.js';
+// >>> participant-roster patch >>>
+import { buildParticipantRoster } from './participant-roster.js';
+// <<< participant-roster patch <<<
 import { RegexProcessor } from './regex.js';
 import { setupRoutes } from './routes.js';
 import { createPanelAuthGate } from './auth-gate.js';
@@ -61,13 +67,42 @@ import { buildStandardEvent, updateStandardEventRouting } from './standard-event
 import { detectChainLeak, buildChainLeakRetryMessage } from './chain-leak-detection.js';
 import { getParticipantProfileConfig, normalizeParticipantProfileConfig } from './participant-profile-config.js';
 import { GroupRepeatDetector, normalizeGroupRepeatConfig, shouldObserveGroupRepeatMessage } from './group-repeat.js';
-import { DEFAULT_QQ_EMOJI_REACTION_ID, executeAdminPokeCommand, isCommandInvocation, normalizeEmojiReactionId, resolveEmojiReactionId } from './qq-interactions.js';
+import { DEFAULT_QQ_EMOJI_REACTION_ID, executeAdminPokeCommand, isCommandInvocation, normalizeEmojiReactionId, resolveEmojiReactionId, resolveQqFaceName, stripLeadingAtMarkers } from './qq-interactions.js';
 import {
     MusicBridgeClient,
     MusicCommandHandler,
     MusicSessionStore,
     normalizeMusicConfig
 } from './music.js';
+// >>> roster-commands patch >>>
+import {
+    FORGET_COMMAND_DEFAULTS,
+    ROSTER_COMMAND_DEFAULTS,
+    THINKING_COMMAND_DEFAULTS,
+    THINKING_DISPLAY_DEFAULTS,
+    buildThinkingAnnotatedReply,
+    executeForgetCommand,
+    executeRosterCommand,
+    isThinkingDisplayAllowed
+} from './roster-commands.js';
+// <<< roster-commands patch <<<
+// >>> help-command patch >>>
+import { HELP_COMMAND_DEFAULTS, executeHelpCommand } from './help-command.js';
+// <<< help-command patch <<<
+// >>> oj-feedback patch >>>
+import {
+    OJ_FEEDBACK_COMMAND_DEFAULTS,
+    OjFeedbackPoller,
+    buildFeedbackNotice,
+    buildOjCommentPrompt,
+    executeOjFeedbackCommand,
+    normalizeOjFeedbackConfig,
+    sanitizeOjComment
+} from './oj-feedback.js';
+// <<< oj-feedback patch <<<
+// >>> oj-ac patch >>>
+import { OjAcPoller, buildAcNotice, normalizeOjAcConfig } from './oj-ac.js';
+// <<< oj-ac patch <<<
 import { collectParticipantGroupIds, mergeParticipantIdentity, resolveParticipantIdentityFromOneBot } from './participant-identity.js';
 import {
     getParticipantProfileTimerKey,
@@ -421,6 +456,10 @@ function normalizeAIConfig(config) {
     config.chat.varparseModel = normalizeAIModelId(config.chat.varparseModel);
     // 图片转述模型：留空表示不启用，只有显式选择模型时才规范化 provider
     normalizeImageCaptionConfig(config);
+    // >>> sticker-send patch >>>
+    // 本地表情包库（让她能**发**表情包；段里 sub_type:1 才会被 QQ 读成表情）
+    normalizeStickerConfig(config);
+    // <<< sticker-send patch <<<
 
     if (config.ai.variableParsing && typeof config.ai.variableParsing === 'object' && !Array.isArray(config.ai.variableParsing)) {
         config.ai.variableParsing.providerId = toOptionalString(config.ai.variableParsing.providerId);
@@ -457,6 +496,50 @@ function normalizeServerConfig(config) {
     config.server.logCleanupIntervalMs = clampInteger(config.server.logCleanupIntervalMs, 60000, 86400000, 3600000);
 }
 
+// >>> roster-commands patch >>>
+/**
+ * 思考显示的配置归一化。幂等：WebUI 保存时会重新走一遍 normalizeConfig。
+ * ⚠ `maxChars` 允许 0（= 不截断），所以不能用 clampInteger（它会把 0 顶到最小值 1）。
+ */
+function normalizeShowThinkingConfig(source = {}) {
+    const input = source && typeof source === 'object' ? source : {};
+    const formatRaw = typeof input.format === 'string' ? input.format.trim().toLowerCase() : '';
+    const positionRaw = typeof input.position === 'string' ? input.position.trim().toLowerCase() : '';
+    const scopeRaw = typeof input.scope === 'string' ? input.scope.trim().toLowerCase() : '';
+    return {
+        enabled: typeof input.enabled === 'boolean' ? input.enabled : THINKING_DISPLAY_DEFAULTS.enabled,
+        format: ['paren', 'debug'].includes(formatRaw) ? formatRaw : THINKING_DISPLAY_DEFAULTS.format,
+        // label 用 `in` 判断：显式写 "" 表示要纯括号（角色的心理活动式），不能被默认值顶掉
+        label: (typeof input.label === 'string' || input.label === null)
+            ? String(input.label ?? '').trim()
+            : THINKING_DISPLAY_DEFAULTS.label,
+        maxChars: clampIntegerAllowZero(input.maxChars, 0, 20000, THINKING_DISPLAY_DEFAULTS.maxChars),
+        position: ['after', 'before'].includes(positionRaw) ? positionRaw : THINKING_DISPLAY_DEFAULTS.position,
+        scope: ['all', 'private', 'group'].includes(scopeRaw) ? scopeRaw : THINKING_DISPLAY_DEFAULTS.scope
+    };
+}
+
+/**
+ * `/思考` 的热开关。`null` = 跟随配置；true/false = 本次运行内的强制值。
+ * ⚠ 只存在内存里（重启回到配置默认）—— 不改 `config.json`，因为那个文件同时也被
+ *   WebUI 写，两条写入路径叠在一起容易互相覆盖。
+ */
+let showThinkingOverride = null;
+
+function getShowThinkingConfig() {
+    const base = normalizeShowThinkingConfig(config.chat?.showThinking);
+    if (showThinkingOverride === null) {
+        return base;
+    }
+    return { ...base, enabled: showThinkingOverride };
+}
+
+function setShowThinkingOverride(nextValue) {
+    showThinkingOverride = nextValue === null ? null : nextValue === true;
+    return getShowThinkingConfig().enabled;
+}
+// <<< roster-commands patch <<<
+
 function ensureCommandAndToolConfig(config) {
     config.chat = config.chat || {};
     config.chat.commands = config.chat.commands || {};
@@ -485,6 +568,57 @@ function ensureCommandAndToolConfig(config) {
         enabled: typeof participantProfileManual.enabled === 'boolean' ? participantProfileManual.enabled : true,
         command: normalizeCommandText(participantProfileManual.command, participantProfileConfig.manualCommand)
     };
+
+    // >>> roster-commands patch >>>
+    const rosterCommand = config.chat.commands.roster || {};
+    const forgetCommand = config.chat.commands.forget || {};
+    const thinkingCommand = config.chat.commands.thinking || {};
+    const showThinking = config.chat.showThinking || {};
+
+    config.chat.commands.roster = {
+        enabled: typeof rosterCommand.enabled === 'boolean' ? rosterCommand.enabled : ROSTER_COMMAND_DEFAULTS.enabled,
+        command: normalizeCommandText(rosterCommand.command, ROSTER_COMMAND_DEFAULTS.command),
+        maxEntries: clampInteger(rosterCommand.maxEntries, 1, 500, ROSTER_COMMAND_DEFAULTS.maxEntries),
+        maxAliases: clampInteger(rosterCommand.maxAliases, 1, 20, ROSTER_COMMAND_DEFAULTS.maxAliases)
+    };
+
+    config.chat.commands.forget = {
+        enabled: typeof forgetCommand.enabled === 'boolean' ? forgetCommand.enabled : FORGET_COMMAND_DEFAULTS.enabled,
+        command: normalizeCommandText(forgetCommand.command, FORGET_COMMAND_DEFAULTS.command)
+    };
+
+    config.chat.commands.thinking = {
+        enabled: typeof thinkingCommand.enabled === 'boolean' ? thinkingCommand.enabled : THINKING_COMMAND_DEFAULTS.enabled,
+        command: normalizeCommandText(thinkingCommand.command, THINKING_COMMAND_DEFAULTS.command)
+    };
+
+    // 思考显示：`enabled` 是配置默认值，`/思考 开|关` 的热开关在运行时覆盖它。
+    config.chat.showThinking = normalizeShowThinkingConfig(showThinking);
+    // <<< roster-commands patch <<<
+
+    // >>> oj-feedback patch >>>
+    const ojFeedbackCommand = config.chat.commands.ojFeedback || {};
+    config.chat.commands.ojFeedback = {
+        enabled: typeof ojFeedbackCommand.enabled === 'boolean'
+            ? ojFeedbackCommand.enabled : OJ_FEEDBACK_COMMAND_DEFAULTS.enabled,
+        command: normalizeCommandText(ojFeedbackCommand.command, OJ_FEEDBACK_COMMAND_DEFAULTS.command)
+    };
+    config.ojFeedback = normalizeOjFeedbackConfig(config.ojFeedback);
+    // <<< oj-feedback patch <<<
+
+    // >>> oj-ac patch >>>
+    // 凭据**继承 ojFeedback**：那串密码只在 config 里存一份（理由见 oj-ac.js 文件头）
+    config.ojAc = normalizeOjAcConfig(config.ojAc, config.ojFeedback);
+    // <<< oj-ac patch <<<
+
+    // >>> help-command patch >>>
+    const helpCommand = config.chat.commands.help || {};
+    config.chat.commands.help = {
+        enabled: typeof helpCommand.enabled === 'boolean'
+            ? helpCommand.enabled : HELP_COMMAND_DEFAULTS.enabled,
+        command: normalizeCommandText(helpCommand.command, HELP_COMMAND_DEFAULTS.command)
+    };
+    // <<< help-command patch <<<
 
     config.chat.music = normalizeMusicConfig(config.chat.music);
 
@@ -933,7 +1067,7 @@ function buildAIServiceFailureMessage(error, config = {}) {
         const retryAttempts = Number(error.retryAttempts) || ((config.chat?.chainLeakRetry?.maxRetries || 0) + 1);
         return `AI 回复疑似泄露思维链，已自动重试 ${retryAttempts} 次仍失败，本轮已拦截`;
     }
-    if (message.includes('500') || message.includes('502')) {
+    if (message.includes('500') || message.includes('502') || message.includes('503') || message.includes('504')) {
         return 'AI 服务暂时不可用，请稍后重试';
     }
     return '处理消息时出现错误，请稍后重试';
@@ -1017,9 +1151,22 @@ function summarizeOneBotSegment(segment, botSelfId = '') {
         }
         const name = getAny('name', 'card', 'nickname', 'display_name');
         const isBot = botSelfId ? qq === String(botSelfId) : false;
+        // >>> mention-name-slot patch >>>
+        // @ 段永远留一个名字位：`[@某人|QQ:123]`。
+        //
+        // 为什么（2026-10-11 实测）：`sanitizeForInjection()`（防提示注入，**只对非管理员生效**，
+        // `src/index.js:752`）会把 `QQ:` 替换成 `扣扣:`，用来阻止别人伪造 `[群聊|QQ:…]` 消息头。
+        // 但它**分不清**"伪造的消息头"和"我们自己生成的 @ 标记" ⇒ 对方没昵称时标记是
+        // `[@QQ:1000000001]`，被替换成 **`[@扣扣:1000000001]`** —— 既不是名字也不是可读标记，
+        // 她根本看不出谁被 @ 了（今天日志里 `[@扣扣:1000000002]` 54 次、`[@扣扣:1000000001]` 34 次）。
+        // 留一个名字位后，被替换成 `[@某人|扣扣:1000000001]`：**@ 的是谁、号码多少都还在**。
+        // ⚠ 只改这里的**生成**侧；`sanitizeForInjection` 的替换规则不要动 ——
+        //   它挡"伪造消息头"的本职是对的。
+        const mentionName = name ? String(name) : '某人';
         const mentionText = isBot
             ? '[@bot] '
-            : `[@${name ? `${name}|` : ''}QQ:${qq}] `;
+            : `[@${mentionName}|QQ:${qq}] `;
+        // <<< mention-name-slot patch >>>
         return { type, qq, name: name ? String(name) : '', isBot, promptText: mentionText };
     }
 
@@ -1029,7 +1176,12 @@ function summarizeOneBotSegment(segment, botSelfId = '') {
 
     if (type === 'face') {
         const id = getAny('id', 'face_id');
-        const name = getAny('name', 'text', 'summary');
+        // >>> qq-face-names patch >>>
+        // 收进来的 face 段 `name` 经常是空串（实测 {"type":"face","id":"66","name":""}），
+        // 只拼 segment 自带的字段就会剩 `[QQ表情|id=66]` —— 模型不可能从数字知道那是爱心，
+        // 表现出来就是「她好像不认识这个表情」。查不到名字时仍然只留 id，不瞎猜。
+        const name = getAny('name', 'text', 'summary') || resolveQqFaceName(id);
+        // <<< qq-face-names patch <<<
         const promptText = `[QQ表情${name ? `:${name}` : ''}${id ? `|id=${id}` : ''}]`;
         return { type, id: id ? String(id) : '', name: name ? String(name) : '', promptText };
     }
@@ -1470,6 +1622,20 @@ async function generateContextualMentionReply({
     runtimeContext.currentSpeakerProfile = runtimeContext.currentSpeaker
         ? sessionManager.getParticipantProfile(runtimeContext.recallNamespace, runtimeContext.currentSpeaker.participantId)
         : null;
+    // >>> participant-roster patch >>>
+    // 跨会话身份名册（只含 昵称/QQ/最后联系时间）。为什么不复用 currentSpeakerProfile：
+    // getParticipantProfile(recallNamespace, currentSpeaker.participantId) 只认**当前发言人**，
+    // 本质是"我正在跟谁说话"，不是通讯录 —— 有人报另一个 QQ 号她照样认不出。
+    // 记忆层那条能跨作用域的 SQL（listParticipantProfilesFiltered）只被面板/MCP 调用，
+    // 而且 memory.participantProfile.enabled=false 时库里一条画像都没有。
+    // >>> participant-roster patch >>>
+    {
+        const rosterInfo = resolveParticipantRoster('admin-mention', processedInput, String(event?.user_id || ''));
+        runtimeContext.participantRoster = rosterInfo.text;
+        runtimeContext.participantRosterMention = rosterInfo.mention;
+    }
+    // <<< participant-roster patch <<<
+    // <<< participant-roster patch <<<
     runtimeContext.recalledEntries = sessionManager.recallMemory(runtimeContext.recallNamespace, processedInput, {
         currentParticipantId: runtimeContext.currentSpeaker?.participantId || null,
         recentLimit: 3,
@@ -1689,7 +1855,39 @@ function isRepeatedGroupText(config, event, plainText) {
 // 用户 2026-10-10：「给表情包加一个回复断言把回复意愿变低」。
 // 纯表情包（有图无文字）默认低意愿：按 chat.stickerReplyChance 概率决定回不回。
 // 判据用 messageSegments（extractMessageInfo 已返回），只认「图/表情 + 占位文字」。
-const STICKER_SEG_TYPES = new Set(['image', 'face', 'mface', 'marketface']);
+// >>> builtin-face-split patch >>>
+// 2026-10-11 用户：「把内置表情从『默认无视表情包』里摘出来」。
+// 所以 **`face` 从这份名单里去掉了**：QQ 自带表情（爱心/赞/心碎）是有语义的，
+// 不再走 `stickerReplyChance` 低意愿（否则一个爱心 80% 概率根本不回，
+// 看起来就像"她不认识"）。`current-message-focus.js` 里有一个同名的
+// `STICKER_SEG_TYPES`，**两处要一起改**。
+const STICKER_SEG_TYPES = new Set(['image', 'mface', 'marketface']);
+// <<< builtin-face-split patch <<<
+
+// >>> sticker-vs-image patch >>>
+// 🔴 `image` 段要再分一次：**真表情包** vs **上传的图片/截图**。
+// 判据（实测两边的形状）：
+//   QQ 表情包/动画表情 ⇒ `{"type":"image","summary":"[动画表情]"}`
+//   用户上传的图/截图   ⇒ `{"type":"image","summary":""}`
+// 2026-10-11 事故：朋友在群里发了一张**舞萌成绩截图**（summary 为空），
+// 被判成"纯表情包" ⇒ 撞上 `sticker_low_willingness`（20% 才过）⇒ 那条被
+// `skip('sticker_low_willingness')` 直接丢掉，**连库都没入** ——
+// 表现成"她不能识别我朋友的舞萌成绩"，其实她压根没收到（日志里只有
+// `[路由] 消息未触发回复 / skipReason=sticker_low_willingness`）。
+// ⇒ 只有真表情包才吃"低意愿"，上传的图当内容对待。
+const STICKER_SUMMARY_RE = /动画表情|表情|贴图|sticker|magic/i;
+
+function isStickerImageSegment(segment = {}) {
+    const summary = String(segment?.summary ?? segment?.data?.summary ?? '').trim();
+    if (summary) return STICKER_SUMMARY_RE.test(summary);
+    // 没有 summary 时退回 OneBot 的 subType 约定（1 = 表情包）
+    const raw = segment?.subType ?? segment?.sub_type
+        ?? segment?.data?.subType ?? segment?.data?.sub_type;
+    const sub = Number(raw);
+    if (Number.isFinite(sub)) return sub === 1;
+    return false;                       // summary 空 + 没有 subType ⇒ 上传的图，不是表情包
+}
+// <<< sticker-vs-image patch <<<
 
 function isStickerOnlyMessage(messageInfo = {}) {
     const segs = Array.isArray(messageInfo.messageSegments) ? messageInfo.messageSegments : [];
@@ -1697,7 +1895,13 @@ function isStickerOnlyMessage(messageInfo = {}) {
     let hasSticker = false;
     for (const seg of segs) {
         const type = String(seg?.type || '');
-        if (STICKER_SEG_TYPES.has(type)) { hasSticker = true; continue; }
+        if (STICKER_SEG_TYPES.has(type)) {
+            // >>> sticker-vs-image patch >>>
+            // 上传的图/截图不是表情包 ⇒ 这条消息不算"纯表情包"，不该被低意愿闸门丢
+            if (type === 'image' && !isStickerImageSegment(seg)) return false;
+            // <<< sticker-vs-image patch <<<
+            hasSticker = true; continue;
+        }
         // reply/at/forward 不产生正文，放行
         if (type === 'reply' || type === 'at' || type === 'forward' || type === 'json' || type === 'xml') continue;
         if (type === 'text') {
@@ -1712,6 +1916,131 @@ function isStickerOnlyMessage(messageInfo = {}) {
 }
 // <<< sticker-assertion patch <<<
 
+// >>> reply-window patch >>>
+/**
+ * 回复窗口（2026-10-11 用户：「加一个热开关在自己回复消息以后提高回复意愿一段时间，
+ * 不然每次在群里和他聊天都要 @ 好麻烦的」）。
+ *
+ * 语义：她**刚在这个会话里说过话** ⇒ 给**刚才那个人**开一段窗口，窗内他再说话
+ * 不需要 @ / 关键词，直接算触发（triggerReason: 'reply_window'）。
+ *
+ * 设计要点：
+ *  - **按"会话 + 人"配对**（sameSpeakerOnly: true）：只对刚跟她对话的那个人放宽，
+ *    别人插话仍走原规则 ⇒ 不会让她在群里变成话痨。
+ *  - 每次回复都会**续期**（until 往后推），只要还在聊就一直有效。
+ *  - 放在路由里**黑名单 / NapCat 噪音之后**、**表情包低意愿之前** ——
+ *    刚聊到一半发个表情包不该被 stickerReplyChance 掐掉。
+ *  - 只在内存里：重启即失效（今天重启频繁，重启后第一条仍需 @，可接受）。
+ *  - 不绕过 replyDecision（群聊"该不该开口"那道闸门）—— 它本来就是判
+ *    "是不是接着上一条在说"，正常对话它会放行。
+ * 开关 `chat.replyWindow = { enabled, ms, sameSpeakerOnly }`。
+ * ⚠ 本段在 JS 里，注释里别用反引号。
+ */
+const replyWindows = new Map();
+
+function getReplyWindowConfig() {
+    const cfg = config?.chat?.replyWindow || {};
+    const ms = Number(cfg.ms);
+    return {
+        enabled: cfg.enabled !== false,
+        ms: Number.isFinite(ms) && ms > 0 ? ms : 180000,
+        sameSpeakerOnly: cfg.sameSpeakerOnly !== false
+    };
+}
+
+function openReplyWindow(sessionKey, participantId) {
+    const cfg = getReplyWindowConfig();
+    if (!cfg.enabled || !sessionKey || !participantId) return;
+    const id = String(participantId);
+    const existing = replyWindows.get(sessionKey);
+    replyWindows.set(sessionKey, { participantId: id, until: Date.now() + cfg.ms });
+    logger.info?.('[回复窗口] 打开', {
+        sessionKey,
+        participantId: id,
+        seconds: Math.round(cfg.ms / 1000),
+        extended: Boolean(existing && existing.participantId === id)
+    });
+}
+
+function isReplyWindowOpen(sessionKey, participantId) {
+    const cfg = getReplyWindowConfig();
+    if (!cfg.enabled || !sessionKey) return false;
+    const window = replyWindows.get(sessionKey);
+    if (!window) return false;
+    if (Date.now() > window.until) {
+        replyWindows.delete(sessionKey);
+        return false;
+    }
+    if (!cfg.sameSpeakerOnly) return true;
+    return window.participantId === String(participantId || '');
+}
+// <<< reply-window patch <<<
+
+// >>> passive-store patch >>>
+/**
+ * 群里**没触发她**的消息也入库（2026-10-11 用户要求：「能不能入库然后定期压缩」）。
+ *
+ * 为什么：跳过分支原来是 `logger.debug(...); return;` —— **什么都不存**。
+ * ⇒ 她的群历史只有"她愿意接的那些话"，于是说不出群里聊过什么、也认不出人。
+ * 实测（2026-10-11 20:48:39）：朋友的舞萌成绩截图被判成"纯表情包"，
+ * 撞上 `sticker_low_willingness` 丢掉，**连库都没入** —— 表现成"她不认识那张图"。
+ *
+ * 哪些原因才存：只存"**真人在群里正常说话、只是这次没叫我**"这几种。
+ * 结构性跳过（空文本 / 黑名单 / NapCat 自己的输出 / coBot 互相触发）不存 ——
+ * 那些不是聊天内容，存了只会污染历史。
+ *
+ * 「定期压缩」用现成的：`memory.summary`（triggerMessages 100 / keepRecent 50 / useAI），
+ * 由 `maybeSummarizeSession` 按会话消息数触发，会把老的压成摘要
+ * （原文删掉、摘要在 `summaries` 里、逐字副本进 `memory_entries`）。
+ * 所以这里不用自己写压缩，只要保证消息进得来。
+ *
+ * ⚠ 这些消息带 `passive: true`：要进她的**历史**（这是重点），但**不能**被当成
+ *   "最近用户意图"（`prompt.js` 按这个标记过滤），否则真正在跟她说话的那几句
+ *   会被群里的闲话挤出 `【最近用户意图】`。
+ * ⚠ 全局上限 `chat.maxGlobalMessages` 已从 2000 提到 8000 —— `enforceGlobalMessageLimit`
+ *   是按**全局最旧**删的，入库量变大后不提高会把别的会话的历史一起挤掉。
+ */
+const PASSIVE_STORE_SKIP_REASONS = new Set([
+    'sticker_low_willingness',        // 表情包/图没触发（含被误判的截图）
+    'repeated_text',                  // 复读：不接话，但记录下来
+    'keyword_or_at_required',         // 群聊需要关键词/@
+    'group_requires_at_prefix_keyword_or_reply_to_bot',
+    'group_no_trigger_matched'        // 群里没匹配到触发条件
+]);
+
+let passiveStoredTotal = 0;
+
+function maybeStoreUntriggeredMessage({ event, sessionKey, structuredText, plainText, skipReason }) {
+    if (config.chat?.storeUntriggeredMessages === false) return false;
+    if (!sessionKey) return false;
+    if (!PASSIVE_STORE_SKIP_REASONS.has(skipReason)) return false;
+    const body = String(structuredText || plainText || '').trim();
+    if (!body) return false;
+    try {
+        sessionManager.addMessage(sessionKey, 'user', body, {
+            messageType: event.message_type || '',
+            userId: event.user_id,
+            groupId: event.group_id || null,
+            // 让通讯录也能从群里的闲聊里学到人（规则见 session.js 的 recordContactsFromMessage）
+            participants: buildParticipants([{ event }]),
+            passive: true,
+            skipReason,
+            inboundMessageIds: event.message_id ? [event.message_id] : []
+        });
+        passiveStoredTotal += 1;
+        logger.debug?.('[被动入库] 未触发但已记录', {
+            sessionKey,
+            skipReason,
+            total: passiveStoredTotal,
+            preview: (plainText || '').slice(0, 40)
+        });
+        return true;
+    } catch (error) {
+        logger.warn?.('[被动入库] 失败', { sessionKey, skipReason, error: error?.message });
+        return false;
+    }
+}
+// <<< passive-store patch <<<
 
 // >>> bot-banter-limit patch (managed by patch_bot_banter_limit.py) >>>
 // 群里两个机器人互相触发会形成循环（实测两边都能看见对方：902 / 1325 条），
@@ -1752,7 +2081,73 @@ function botBanterDecision(config, event) {
 }
 // <<< bot-banter-limit patch <<<
 
-function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}) {
+// >>> cobot-yield patch (managed by patch_cobot_yield.py) >>>
+// 用户 2026-10-11：「在另一个 bot 在 5 分钟内在群聊发过言并且自己说过两句话
+// 就会结束话题并且进 5 分钟冷却」
+//
+// 为什么需要它：上面的 `botBanterMaxTurns` 只覆盖「发言者 ∈ coBotIds」这一条路径。
+// **群友发的消息 isCoBot=false ⇒ 整个分支被跳过** ⇒ 群友一说话，两个 bot 都能回，
+// 配额完全不参与。实测两个 bot 抢答同一条群消息，最短间隔 0.07 秒。
+//
+// 本块加的是**在场感知配额**（不需要跨进程通信）：
+//   ① 对方 bot 每在本群发一句 → 记 lastCoBotAt
+//      （它的发言会作为普通群消息到达本实例，所以两个进程各记各的即可）
+//   ② now - lastCoBotAt < coBotActiveMs（默认 5min）⇒ 处于「两个 bot 都在场」局面
+//   ③ 这个局面下，本实例在本群最多再说 coBotMyMaxLines（默认 2）句
+//   ④ 用完 → 静默 + coBotCooldownMs（默认 5min）冷却
+//   ⑤ 被 @ 时不受限（那是明确指名）
+const coBotYieldState = new Map();
+
+function coBotYieldNoteCoBot(config, event) {
+    if (config?.chat?.coBotYieldEnabled === false) return;
+    if (event?.message_type !== 'group' || !event?.group_id) return;
+    const key = String(event.group_id);
+    const st = coBotYieldState.get(key) || { lastCoBotAt: 0, myLines: [], cooldownUntil: 0 };
+    st.lastCoBotAt = Date.now();
+    coBotYieldState.set(key, st);
+}
+
+// 'allow' / 'limit'
+function coBotYieldDecision(config, event) {
+    if (config?.chat?.coBotYieldEnabled === false) return 'allow';
+    if (event?.message_type !== 'group' || !event?.group_id) return 'allow';
+    const st = coBotYieldState.get(String(event.group_id));
+    if (!st) return 'allow';
+    const activeMs = Math.max(1000, Number(config?.chat?.coBotActiveMs) || 300000);
+    const maxLines = Math.max(1, Number(config?.chat?.coBotMyMaxLines) || 2);
+    const cooldownMs = Math.max(1000, Number(config?.chat?.coBotCooldownMs) || 300000);
+    const now = Date.now();
+    if (!st.lastCoBotAt || now - st.lastCoBotAt >= activeMs) return 'allow';
+    if (now < st.cooldownUntil) return 'limit';
+    st.myLines = (st.myLines || []).filter((t) => now - t < activeMs);
+    if (st.myLines.length >= maxLines) {
+        st.cooldownUntil = now + cooldownMs;
+        st.myLines = [];
+        coBotYieldState.set(String(event.group_id), st);
+        return 'limit';
+    }
+    coBotYieldState.set(String(event.group_id), st);
+    return 'allow';
+}
+
+// 只在**真的要回**时才记账 —— 挂在 accept() 上，所以 skip 掉的消息不占配额。
+function coBotYieldMarkSpoken(config, event) {
+    if (config?.chat?.coBotYieldEnabled === false) return;
+    if (event?.message_type !== 'group' || !event?.group_id) return;
+    if (isCoBot(config, event)) return;
+    const key = String(event.group_id);
+    const st = coBotYieldState.get(key);
+    if (!st || !st.lastCoBotAt) return;
+    const activeMs = Math.max(1000, Number(config?.chat?.coBotActiveMs) || 300000);
+    const now = Date.now();
+    if (now - st.lastCoBotAt >= activeMs) return;
+    st.myLines = (st.myLines || []).filter((t) => now - t < activeMs);
+    st.myLines.push(now);
+    coBotYieldState.set(key, st);
+}
+// <<< cobot-yield patch <<<
+
+function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}, hints = {}) {
     const triggerMode = config.chat.triggerMode || 'auto';
     const requireAtInGroup = config.chat.requireAtInGroup !== false;
     const triggerPrefix = config.chat.triggerPrefix || '';
@@ -1776,12 +2171,17 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
         messageType: event.message_type || ''
     };
 
-    const accept = (triggerReason) => ({
-        shouldRespond: true,
-        triggerReason,
-        skipReason: '',
-        checks
-    });
+    const accept = (triggerReason) => {
+        // >>> cobot-yield patch <<<
+        coBotYieldMarkSpoken(config, event);
+        // <<< cobot-yield patch <<<
+        return {
+            shouldRespond: true,
+            triggerReason,
+            skipReason: '',
+            checks
+        };
+    };
     const skip = (skipReason) => ({
         shouldRespond: false,
         triggerReason: '',
@@ -1805,6 +2205,26 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
     }
     // <<< napcat-output-ignore patch <<<
 
+    // >>> reply-window patch >>>
+    // 刚跟她聊过的人再说话 ⇒ 不需要 @ / 关键词。
+    // ⚠ 位置有讲究：在黑名单(access_denied) / NapCat 噪音**之后**（那两个必须优先），
+    //   在表情包低意愿**之前**（聊到一半发个表情包不该被概率掐掉）。
+    if (hints.replyWindowOpen) {
+        // >>> reply-window-sticker patch >>>
+        // chat.replyWindow.stickersTrigger=false 时，窗口**不再放行纯表情包**：
+        // 那种消息落到下面的 stickerReplyChance 走低意愿。
+        // 起因（2026-10-13）：群里连着聊时窗口一直开着，用户发个动画表情她也回，
+        // 看起来像"不描述表情包"这条失效了 —— 其实是窗口在表情包检查**之前**就放行了。
+        // 只挡**纯表情包**；"图 + 文字"的消息照旧（那里面有真文字，该回应文字）。
+        // ⚠ 必须从**传入的 config** 读，不要调 getReplyWindowConfig()（它读模块级 config）——
+        //   否则 verify_trigger_routing.mjs 把本函数抠出来求值时会 ReferenceError。
+        if (config?.chat?.replyWindow?.stickersTrigger !== false || !isStickerOnlyMessage(messageInfo)) {
+            return accept('reply_window');
+        }
+        // <<< reply-window-sticker patch <<<
+    }
+    // <<< reply-window patch <<<
+
     // >>> sticker-assertion patch >>>
     // 纯表情包低意愿。放在这里 = 群聊/私聊两条路都吃到；
     // 被 @ / 被回复 / 白名单用户仍然照常回（那是明确被叫到，不该被概率挡）。
@@ -1822,6 +2242,9 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
         // >>> bot-banter-limit patch <<<
         // 放在 replyToBot 之前 —— 否则机器人之间用"回复"接话会绕过上限（实测漏洞）。
         if (isCoBot(config, event)) {
+            // >>> cobot-yield patch <<<
+            coBotYieldNoteCoBot(config, event);
+            // <<< cobot-yield patch <<<
             return botBanterDecision(config, event) === 'limit'
                 ? skip('bot_banter_limit')
                 : accept('co_bot');
@@ -1834,6 +2257,11 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
         if (isTriggerUser(config, event)) {
             return accept('trigger_user');
         }
+        // >>> cobot-yield patch <<<
+        if (!isAtMe && coBotYieldDecision(config, event) === 'limit') {
+            return skip('cobot_yield');
+        }
+        // <<< cobot-yield patch <<<
         // <<< trigger-users patch <<<
         // >>> group-repeat-and-names patch <<<
         // 放在关键词/@ 之前：否则复读的那句只要含关键词，照样每条都触发一次。
@@ -1915,6 +2343,26 @@ const DATA_DIR = config.chat?.dataDir || join(ROOT_DIR, 'data');
 const characterManager = new CharacterManager(DATA_DIR);
 const worldBookManager = new WorldBookManager(DATA_DIR);
 const sessionManager = new SessionManager(DATA_DIR, config, logger);
+// >>> participant-roster patch >>>
+// 计算身份名册，并把"算出来多少字"打进日志。
+// ⚠ 为什么非要有日志：主提示词在 logs/ 里的 contentPreview 只留前 ~120 字，情境段
+// 永远看不到 ⇒ 从日志无法判断这类注入到底有没有生效（styleAnchor 已经因此害过一轮，
+// 名册又差点再来一次）。用 info 级别，保证一定写进日志。
+// 「注入 0 字」是有意义的信息：说明它被 enabled=false / 无联系人 / 查询抛错 三者之一挡了。
+const resolveParticipantRoster = (stage, messageText = '', speakerId = '') => {
+    const rosterConfig = config.memory?.participantRoster;
+    // 顺带算「对方提到的人就在名单上」那句（落在「注意:」行，杠杆最高的位置）。
+    // 实测：名单在系统消息中段时，问她「XX 怎么样」她会跑去联网搜 XX 而不看名单。
+    // ⚠ speakerId 必须传：发言人**自己**不算"被提到的人"（实测群里 `小摸` 发「小摸听到了」
+    //   每轮都命中提及）。缺了它这块逻辑会退回到"自己提到自己"。
+    const info = buildParticipantRoster(sessionManager, rosterConfig, { messageText, speakerId });
+    if (rosterConfig?.enabled === true) {
+        logger.info(`[身份名册] ${stage} 注入 ${info.text.length} 字`
+            + `${info.mention ? '（命中提及，已放进注意行）' : ''}`);
+    }
+    return info;
+};
+// <<< participant-roster patch <<<
 const regexProcessor = new RegexProcessor(config.regex, logger);
 const aiClient = new AIClient({ ...config.ai, chat: config.chat }, logger);
 const mcpClient = new McpClientManager({ config, logger });
@@ -3272,6 +3720,326 @@ async function handleAdminPokeCommand(event, plainText) {
     return result.handled === true;
 }
 
+// >>> roster-commands patch >>>
+async function handleRosterCommand(event, plainText) {
+    const commandConfig = config.chat?.commands?.roster || {};
+    const result = await executeRosterCommand({
+        event,
+        plainText,
+        command: commandConfig.command || ROSTER_COMMAND_DEFAULTS.command,
+        enabled: commandConfig.enabled !== false,
+        maxEntries: commandConfig.maxEntries ?? ROSTER_COMMAND_DEFAULTS.maxEntries,
+        maxAliases: commandConfig.maxAliases ?? ROSTER_COMMAND_DEFAULTS.maxAliases,
+        isAdmin: isAdminUser(config, event.user_id),
+        sessionManager,
+        onCommandAccepted: () => sendEmojiReactionForEvent(event),
+        sendStatusMessage: (message) => sendQuotedStatusMessage(event, message),
+        sendFailureMessage: (message) => sendFailureMessage(event, message),
+        logger
+    });
+    return result.handled === true;
+}
+
+async function handleForgetCommand(event, plainText) {
+    const commandConfig = config.chat?.commands?.forget || {};
+    const mentioned = extractMentionedParticipant(event);
+    const result = await executeForgetCommand({
+        event,
+        plainText,
+        command: commandConfig.command || FORGET_COMMAND_DEFAULTS.command,
+        enabled: commandConfig.enabled !== false,
+        maxAliases: config.chat?.commands?.roster?.maxAliases,
+        mentionedParticipantId: mentioned?.participantId || '',
+        isAdmin: isAdminUser(config, event.user_id),
+        sessionManager,
+        onCommandAccepted: () => sendEmojiReactionForEvent(event),
+        sendStatusMessage: (message) => sendQuotedStatusMessage(event, message),
+        sendFailureMessage: (message) => sendFailureMessage(event, message),
+        logger
+    });
+    return result.handled === true;
+}
+
+const THINKING_COMMAND_ON = new Set(['开', '开启', 'on', 'true', '1', '打开']);
+const THINKING_COMMAND_OFF = new Set(['关', '关闭', 'off', 'false', '0', '关上']);
+const THINKING_COMMAND_RESET = new Set(['配置', '默认', 'reset', 'auto', '跟随']);
+
+/**
+ * `/思考` —— 热开关，让"自己回复的思考内容"用括号带出来（调试用）。
+ * 不带参数 = 查状态；`开`/`关` 覆盖本次运行；`配置` 回到 `chat.showThinking.enabled`。
+ */
+async function handleThinkingCommand(event, plainText) {
+    const commandConfig = config.chat?.commands?.thinking || {};
+    if (commandConfig.enabled === false) {
+        return false;
+    }
+    const command = commandConfig.command || THINKING_COMMAND_DEFAULTS.command;
+    if (!isCommandInvocation(plainText, command)) {
+        return false;
+    }
+
+    sendEmojiReactionForEvent(event);
+    if (!isAdminUser(config, event.user_id)) {
+        await sendFailureMessage(event, '只有管理员可以切换思考显示');
+        return true;
+    }
+
+    const argument = plainText.slice(command.length).replace(/^[\s@]+/, '').trim().toLowerCase();
+    const base = normalizeShowThinkingConfig(config.chat?.showThinking);
+    let reply;
+    if (!argument) {
+        const current = getShowThinkingConfig();
+        reply = `思考显示：${current.enabled ? '开' : '关'}`
+            + `（配置默认 ${base.enabled ? '开' : '关'}，样式 ${current.format}/${current.scope}，上限 ${current.maxChars || '不限'} 字）\n`
+            + `用法：${command} 开 / ${command} 关 / ${command} 配置`;
+    } else if (THINKING_COMMAND_ON.has(argument)) {
+        const state = setShowThinkingOverride(true);
+        reply = `思考显示已打开：${state ? '开' : '关'}（重启后回到配置默认 ${base.enabled ? '开' : '关'}）`;
+    } else if (THINKING_COMMAND_OFF.has(argument)) {
+        const state = setShowThinkingOverride(false);
+        reply = `思考显示已关闭：${state ? '开' : '关'}（重启后回到配置默认 ${base.enabled ? '开' : '关'}）`;
+    } else if (THINKING_COMMAND_RESET.has(argument)) {
+        const state = setShowThinkingOverride(null);
+        reply = `思考显示已回到配置默认：${state ? '开' : '关'}`;
+    } else {
+        reply = `看不懂「${argument}」。用法：${command} 开 / ${command} 关 / ${command} 配置`;
+    }
+
+    logger.info('[思考] 指令', { raw: plainText, argument, enabled: getShowThinkingConfig().enabled });
+    await sendQuotedStatusMessage(event, reply);
+    return true;
+}
+// <<< roster-commands patch <<<
+
+// >>> oj-feedback patch >>>
+let ojFeedbackPoller = null;
+// >>> oj-ac patch >>>
+let ojAcPoller = null;
+// <<< oj-ac patch <<<
+let ojCharacterNameKey = null;
+let ojCharacterNameValue = '';
+
+/**
+ * 角色真名，给补话提示词用「你是XX」。
+ * 按 `defaultCharacter` 缓存 —— 启动期那句 `loadCharacter` 在轮询器启动之后，
+ * 所以这里不能指望它已经加载过，只能自己按需读一次并缓存。
+ */
+function resolveOjCharacterName() {
+    const key = String(config.chat?.defaultCharacter || '');
+    if (key && key === ojCharacterNameKey) {
+        return ojCharacterNameValue;
+    }
+    let name = key;
+    if (key && key !== '你的角色名') {
+        try {
+            const character = characterManager.loadCharacter(key);
+            name = String(character?.name || key);
+        } catch {
+            name = key;
+        }
+    }
+    ojCharacterNameKey = key;
+    ojCharacterNameValue = name;
+    return name;
+}
+
+/**
+ * 让她对这条反馈补一句话。
+ * 失败一律返回 `''` —— 退化成"只发原文"比塞一句占位符诚实，也不该因为模型抖动
+ * 把整条通知拦下来（那是本末倒置：通知的价值在原文）。
+ */
+async function generateOjFeedbackComment(item) {
+    if (config.ojFeedback?.aiComment === false) {
+        return '';
+    }
+    const timeoutMs = Math.min(Number(config.ai?.timeout) || 60000, 30000);
+    try {
+        const prompt = buildOjCommentPrompt(item, {
+            characterName: resolveOjCharacterName(),
+            styleAnchor: config.chat?.styleAnchor,
+            maxContentChars: 600
+        });
+        const result = await callWithTimeout(
+            () => aiClient.chat([{ role: 'user', content: prompt }], {
+                temperature: 0.9,
+                maxTokens: 120,
+                // 关思考：这条只要一句话，推理 token 会把 maximaTokens 吃光（replyDecision 踩过）
+                thinking: { type: 'disabled' }
+            }),
+            timeoutMs
+        );
+        return sanitizeOjComment(aiClient.getVisibleResponseContent(result), 60);
+    } catch (error) {
+        logger.warn(`[OJ反馈] 补话失败，改为只发原文: ${error?.message}`);
+        return '';
+    }
+}
+
+/**
+ * 转发一条反馈：私聊所有管理员 + 配置里的群。
+ * ⚠ 全部目标都失败时**抛错**：让轮询器不推进游标，下一轮重试。
+ *   （单条部分失败只记 warn —— 比如机器人不在那个群里，重试也不会好。）
+ */
+async function notifyOjFeedback(item) {
+    const cfg = normalizeOjFeedbackConfig(config.ojFeedback);
+    const comment = await generateOjFeedbackComment(item);
+    const text = buildFeedbackNotice(item, comment, { maxContentChars: cfg.maxContentChars });
+
+    const targets = [];
+    if (cfg.notifyPrivate) {
+        for (const admin of (config.chat?.adminUsers || [])) {
+            targets.push({ kind: 'private', id: String(admin) });
+        }
+    }
+    for (const groupId of cfg.notifyGroups) {
+        targets.push({ kind: 'group', id: groupId });
+    }
+    if (targets.length === 0) {
+        throw new Error('没有通知目标（chat.adminUsers 与 ojFeedback.notifyGroups 都是空的）');
+    }
+
+    let sent = 0;
+    const errors = [];
+    for (const target of targets) {
+        try {
+            if (target.kind === 'private') {
+                await bot.sendPrivateMessage(target.id, text);
+            } else {
+                await bot.sendGroupMessage(target.id, text);
+            }
+            sent += 1;
+        } catch (error) {
+            errors.push(`${target.kind}:${target.id} ${error?.message}`);
+        }
+    }
+    if (sent === 0) {
+        throw new Error(`全部目标发送失败: ${errors.join('; ')}`);
+    }
+    if (errors.length > 0) {
+        logger.warn(`[OJ反馈] #${item.id} 部分目标发送失败: ${errors.join('; ')}`);
+    }
+    logger.info(`[OJ反馈] 已转发 #${item.id}（${sent}/${targets.length} 个目标）`, {
+        id: item.id,
+        kind: item.kind,
+        username: item.username,
+        hasComment: !!comment,
+        textLength: text.length
+    });
+    return sent;
+}
+
+function startOjFeedbackPoller() {
+    const cfg = normalizeOjFeedbackConfig(config.ojFeedback);
+    if (!cfg.enabled) {
+        logger.info('[OJ反馈] 未启用，跳过轮询');
+        return null;
+    }
+    // 相对路径按**实例根目录**解析：进程 cwd 不一定等于实例根
+    // （`memory.storage.path` 就栽在这一点上，见 MIMIRLINK-NOTES）
+    const stateFile = isAbsolute(cfg.stateFile) ? cfg.stateFile : join(ROOT_DIR, cfg.stateFile);
+    ojFeedbackPoller = new OjFeedbackPoller({
+        getConfig: () => config.ojFeedback,
+        logger,
+        stateFile,
+        onNewFeedback: (item) => notifyOjFeedback(item)
+    });
+    ojFeedbackPoller.start();
+    return ojFeedbackPoller;
+}
+
+// >>> oj-ac patch >>>
+/** AC 播报的发送：纯文本通知，不过 AI（要加"她自己补一句"就照 notifyOjFeedback 加） */
+async function notifyOjAc(item) {
+    const cfg = normalizeOjAcConfig(config.ojAc, config.ojFeedback);
+    const text = buildAcNotice(item, { baseUrl: cfg.baseUrl });
+    if (cfg.notifyGroups.length === 0) {
+        throw new Error('没有通知目标（ojAc.notifyGroups 是空的）');
+    }
+    let sent = 0;
+    const errors = [];
+    for (const groupId of cfg.notifyGroups) {
+        try {
+            await bot.sendGroupMessage(groupId, text);
+            sent += 1;
+        } catch (error) {
+            errors.push(`group:${groupId} ${error?.message}`);
+        }
+    }
+    if (sent === 0) {
+        throw new Error(`全部目标发送失败: ${errors.join('; ')}`);
+    }
+    if (errors.length > 0) {
+        logger.warn(`[AC播报] #${item.id} 部分目标发送失败: ${errors.join('; ')}`);
+    }
+    logger.info(`[AC播报] 已播报 #${item.id}（${sent}/${cfg.notifyGroups.length} 个群）`, {
+        id: item.id,
+        username: item.username,
+        problemNo: item.problemNo,
+        status: item.status
+    });
+    return sent;
+}
+
+function startOjAcPoller() {
+    const cfg = normalizeOjAcConfig(config.ojAc, config.ojFeedback);
+    if (!cfg.enabled) {
+        logger.info('[AC播报] 未启用，跳过轮询');
+        return null;
+    }
+    // 相对路径按**实例根目录**解析（同 ojFeedback：进程 cwd 不一定等于实例根）
+    const stateFile = isAbsolute(cfg.stateFile) ? cfg.stateFile : join(ROOT_DIR, cfg.stateFile);
+    ojAcPoller = new OjAcPoller({
+        getConfig: () => config.ojAc,
+        getFallbackConfig: () => config.ojFeedback,
+        logger,
+        stateFile,
+        onNewAc: (item) => notifyOjAc(item)
+    });
+    ojAcPoller.start();
+    return ojAcPoller;
+}
+// <<< oj-ac patch <<<
+
+/**
+ * `/帮助` —— 指令清单。面向所有人（普通用户也有点歌这类指令），
+ * 所以要像点歌一样过访问控制：未授权会话里静默返回，不回"你没权限"。
+ */
+async function handleHelpCommand(event, plainText) {
+    const commandConfig = config.chat?.commands?.help || {};
+    const result = await executeHelpCommand({
+        event,
+        plainText,
+        getConfig: () => config,
+        command: commandConfig.command || HELP_COMMAND_DEFAULTS.command,
+        enabled: commandConfig.enabled !== false,
+        isAdmin: isAdminUser(config, event.user_id),
+        allowed: isAllowed(config, event),
+        characterName: resolveOjCharacterName(),
+        onCommandAccepted: () => sendEmojiReactionForEvent(event),
+        sendStatusMessage: (message) => sendQuotedStatusMessage(event, message),
+        logger
+    });
+    return result.handled === true;
+}
+
+async function handleOjFeedbackCommand(event, plainText) {
+    const commandConfig = config.chat?.commands?.ojFeedback || {};
+    const result = await executeOjFeedbackCommand({
+        event,
+        plainText,
+        command: commandConfig.command || OJ_FEEDBACK_COMMAND_DEFAULTS.command,
+        enabled: commandConfig.enabled !== false,
+        isAdmin: isAdminUser(config, event.user_id),
+        poller: ojFeedbackPoller,
+        onCommandAccepted: () => sendEmojiReactionForEvent(event),
+        sendStatusMessage: (message) => sendQuotedStatusMessage(event, message),
+        sendFailureMessage: (message) => sendFailureMessage(event, message),
+        logger
+    });
+    return result.handled === true;
+}
+// <<< oj-feedback patch <<<
+
 function probeMusicBridge() {
     const musicConfig = normalizeMusicConfig(config.chat?.music);
     if (!musicConfig.enabled) {
@@ -3527,6 +4295,13 @@ async function processBatch(batch) {
             runtimeContext.currentSpeakerProfile = runtimeContext.currentSpeaker
                 ? sessionManager.getParticipantProfile(runtimeContext.recallNamespace, runtimeContext.currentSpeaker.participantId)
                 : null;
+            // >>> participant-roster patch >>>
+            {
+                const rosterInfo = resolveParticipantRoster('main', processedInput, String(event?.user_id || ''));
+                runtimeContext.participantRoster = rosterInfo.text;
+                runtimeContext.participantRosterMention = rosterInfo.mention;
+            }
+            // <<< participant-roster patch <<<
             runtimeContext.recalledEntries = sessionManager.recallMemory(runtimeContext.recallNamespace, processedInput, {
                 currentParticipantId: runtimeContext.currentSpeaker?.participantId || null,
                 recentLimit: 3,
@@ -3990,16 +4765,37 @@ ${varStatus || '(无)'}
                 });
             }
             const sendReasoningToQQ = config.chat?.sendReasoningToQQ === true;
-            const replyToSend = sendReasoningToQQ && reasoningContent
-                ? buildDebugReplyWithReasoning(reasoningContent, processedReply)
-                : processedReply;
+            // >>> thinking-display patch >>>
+            // 括号显示思考内容（`chat.showThinking` 配置 + `/思考` 热开关）。
+            // `sendReasoningToQQ` 是旧的调试格式（【思维链】/【正文】），优先级更高。
+            const showThinkingConfig = getShowThinkingConfig();
+            const showThinkingActive = isThinkingDisplayAllowed(showThinkingConfig, event);
+            const reasoningDisplay = sendReasoningToQQ
+                ? 'debug'
+                : (showThinkingActive ? showThinkingConfig.format : 'none');
+            const reasoningIncluded = reasoningDisplay !== 'none' && !!reasoningContent;
+            const replyToSend = !reasoningIncluded
+                ? processedReply
+                : (reasoningDisplay === 'debug'
+                    ? buildDebugReplyWithReasoning(reasoningContent, processedReply)
+                    : buildThinkingAnnotatedReply(reasoningContent, processedReply, showThinkingConfig));
+            logger.info('[思考] 显示判定', {
+                sessionId,
+                messageType: event.message_type,
+                override: showThinkingOverride,
+                configured: showThinkingConfig.enabled,
+                scope: showThinkingConfig.scope,
+                format: reasoningDisplay,
+                reasoningLength: typeof reasoningContent === 'string' ? reasoningContent.length : 0
+            });
+            // <<< thinking-display patch >>>
             logger.info('[执行] 输出后处理完成', {
                 sessionId,
                 processedReplyLength: typeof processedReply === 'string' ? processedReply.length : 0,
                 processedReplyPreview: typeof processedReply === 'string' ? processedReply.slice(0, 200) : null,
                 sendReplyLength: typeof replyToSend === 'string' ? replyToSend.length : 0,
                 reasoningAvailable: !!reasoningContent,
-                sendReplyIncludesReasoning: sendReasoningToQQ && !!reasoningContent
+                sendReplyIncludesReasoning: reasoningIncluded
             });
 
             sessionManager.addMessage(sessionId, 'assistant', processedReply, {
@@ -4028,18 +4824,22 @@ ${varStatus || '(无)'}
             logger.info('[执行] 准备下发回复', {
                 sessionId,
                 messageType: event.message_type,
-                splitMessage: sendReasoningToQQ && reasoningContent ? false : config.chat.splitMessage !== false,
-                includeReasoningContent: sendReasoningToQQ && !!reasoningContent
+                splitMessage: reasoningIncluded ? false : config.chat.splitMessage !== false,
+                includeReasoningContent: reasoningIncluded
             });
             // >>> cobot-turn patch >>>
             await dispatchReply(event, replyToSend, {
-                forceSingleMessage: sendReasoningToQQ && !!reasoningContent,
+                forceSingleMessage: reasoningIncluded,
                 isCoBotTurn: coBotTurn === true
             });
             // <<< cobot-turn patch <<<
             logger.info('[执行] 回复下发完成', {
                 sessionId
             });
+            // >>> reply-window patch >>>
+            // 她刚说过话 ⇒ 给这个会话里"刚才那个人"开一段不用 @ 的窗口
+            openReplyWindow(sessionId, event.user_id);
+            // <<< reply-window patch <<<
 
             if (runtimeContext.currentSpeaker) {
                 scheduleParticipantProfileUpdate(
@@ -4300,8 +5100,22 @@ async function handleMessage(event) {
     const messageInfo = await extractMessageInfo(config, event, bot);
     const { plainText, isAtMe, structuredText, replyToMessageId, replyToBot, replyInfo, replyImageSegments, messageSegments, standardEvent } = messageInfo;
 
+    // >>> group-command-at-gate patch >>>
+    // 指令匹配用**剥掉开头 @ 标记**的文本：群里 @ 之后 plainText 会以 `[@bot] ` 开头
+    // （由 @ 段生成），带着它 `startsWith(command)` 永远不成立 ⇒
+    // "必须 @" 和 "@ 了匹配不上"会互相打架，结果是群里指令一次都不响应。
+    // ⚠ 只有指令用它；`buildRoutingDecision` 仍拿原始 plainText（它要知道 @ 的存在）。
+    const commandInput = stripLeadingAtMarkers(plainText);
+
+    // 群里**只有 @ 了才认指令**（用户 2026-10-12 要求）。
+    // 不然任何群友随手打一个 /帮助、/音乐 都能让她在群里开口 —— 指令绕过了
+    // 触发规则（它们在 buildRoutingDecision 之前），所以必须单独设这道闸门。
+    // 私聊没有 @ 的概念，不受影响。
+    const commandGate = event.message_type !== 'group' || isAtMe;
+    // <<< group-command-at-gate patch <<<
+
     // /llm 指令：管理员切换 LLM 开关
-    if (plainText.trim() === '/llm' && isAdminUser(config, event.user_id)) {
+    if (commandGate && commandInput.trim() === '/llm' && isAdminUser(config, event.user_id)) {
         const newState = setLlmEnabled(!llmEnabled);
         const statusText = newState ? '✅ LLM 已开启' : '⛔ LLM 已关闭';
         logger.info(`[指令] 管理员 ${event.user_id} 切换 LLM 状态: ${newState}`);
@@ -4315,25 +5129,63 @@ async function handleMessage(event) {
     }
 
     // 点歌是独立能力，不依赖 LLM，所以放在 LLM 开关判断之前
-    if (await handleMusicCommand(event, plainText)) {
+    // >>> group-command-at-gate patch >>>
+    if (commandGate && await handleMusicCommand(event, commandInput)) {
         return;
     }
+    // <<< group-command-at-gate patch <<<
+    // 注意：`!llmEnabled` 这道判断刻意**留在闸门外面** —— 放进闸门里的话，
+    // 群里没 @ 时连"关掉 LLM 就不处理"都会一起失效，那是不相干的语义。
 
     // LLM 关闭时不处理任何消息
     if (!llmEnabled) {
         return;
     }
 
-    if (await handleParticipantProfileManualCommand(event, plainText)) {
+    // >>> group-command-at-gate patch >>>
+    // 下面这一整批都是指令：群里必须 @ 才认
+    if (commandGate) {
+    // <<< group-command-at-gate patch <<<
+    if (await handleParticipantProfileManualCommand(event, commandInput)) {
         return;
     }
-    if (await handleAdminPokeCommand(event, plainText)) {
+    if (await handleAdminPokeCommand(event, commandInput)) {
         return;
     }
-    if (await handleAdminMentionCommand(event, plainText)) {
+    // >>> help-command patch >>>
+    // 不依赖任何其它状态，所以放在这批指令的最前面
+    if (await handleHelpCommand(event, commandInput)) {
         return;
     }
-    const routingDecision = buildRoutingDecision(config, event, plainText, isAtMe, messageInfo);
+    // <<< help-command patch <<<
+    // >>> roster-commands patch >>>
+    if (await handleRosterCommand(event, commandInput)) {
+        return;
+    }
+    if (await handleForgetCommand(event, commandInput)) {
+        return;
+    }
+    if (await handleThinkingCommand(event, commandInput)) {
+        return;
+    }
+    if (await handleOjFeedbackCommand(event, commandInput)) {
+        return;
+    }
+    // <<< roster-commands patch <<<
+    if (await handleAdminMentionCommand(event, commandInput)) {
+        return;
+    }
+    // >>> group-command-at-gate patch >>>
+    }   // if (commandGate)
+    // <<< group-command-at-gate patch <<<
+    // >>> reply-window patch >>>
+    const routingSessionKey = event.message_type === 'group'
+        ? `group:${event.group_id || ''}`
+        : `private:${event.user_id || ''}`;
+    const routingDecision = buildRoutingDecision(config, event, plainText, isAtMe, messageInfo, {
+        replyWindowOpen: isReplyWindowOpen(routingSessionKey, event.user_id)
+    });
+    // <<< reply-window patch <<<
     if (standardEvent) {
         updateStandardEventRouting(standardEvent, routingDecision);
     }
@@ -4365,6 +5217,16 @@ async function handleMessage(event) {
             dbPath: sessionManager.getDbPath()
         };
         logger.debug('[路由] 消息未触发回复', lastRoutingSnapshot);
+        // >>> passive-store patch >>>
+        // 不回复 ≠ 不记录：群里没触发的正常发言也要进历史（定期由摘要压缩）
+        maybeStoreUntriggeredMessage({
+            event,
+            sessionKey: lastRoutingSnapshot.sessionKey,
+            structuredText,
+            plainText,
+            skipReason: routingDecision.skipReason
+        });
+        // <<< passive-store patch <<<
         return;
     }
 
@@ -4486,6 +5348,14 @@ server.listen(config.server.port, config.server.host, () => {
     startHealthTicker();
     startParticipantProfileIntervalScheduler(sessionManager, aiClient, logger);
     probeMusicBridge();
+    // >>> oj-feedback patch >>>
+    // 轮询器自己带首次运行对齐（不回补历史），所以放启动期启动是安全的
+    startOjFeedbackPoller();
+    // <<< oj-feedback patch <<<
+    // >>> oj-ac patch >>>
+    // 同上：首次运行会把游标对齐到当前最大提交号，一条历史都不会播
+    startOjAcPoller();
+    // <<< oj-ac patch <<<
 
     const defaultCharacter = config.chat.defaultCharacter;
     applyMemoryBinding();

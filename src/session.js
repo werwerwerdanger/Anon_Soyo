@@ -9,6 +9,19 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { getParticipantProfileConfig } from './participant-profile-config.js';
 import { chatScopePullLimit, filterMessagesForChat } from './chat-scope.js';
+// >>> participant-roster patch >>>
+// 身份名册的解析规则只有一份（`昵称(QQ)` 的切法、通知文本过滤、曾用名合并），
+// 写库（本文件）和渲染（participant-roster.js）必须用同一套，所以从那里 import。
+// participant-roster.js 不 import 任何东西，不存在循环依赖。
+import {
+    parseContactToken,
+    parseSessionKey,
+    mergeNameHistory,
+    isPlausibleName,
+    normalizeParticipantRosterConfig,
+    PARTICIPANT_ROSTER_DEFAULTS
+} from './participant-roster.js';
+// <<< participant-roster patch <<<
 
 function ensureDir(dirPath) {
     if (!fs.existsSync(dirPath)) {
@@ -539,6 +552,11 @@ export class SessionManager {
         this.db.exec('PRAGMA foreign_keys = ON;');
         this.prepareSchema();
         this.prepareStatements();
+        // >>> participant-roster patch >>>
+        // 表为空时从历史 messages 回填一次。**必须回填**：否则升级后名册会突然空掉，
+        // 看起来像功能坏了（这个坑今天已经因为别的原因踩过一次）。
+        this.backfillParticipantContacts();
+        // <<< participant-roster patch <<<
     }
 
     resolveDbPath(config = {}, overridePath = null) {
@@ -577,6 +595,12 @@ export class SessionManager {
             type: memoryConfig.storage?.type || 'sqlite',
             path: memoryConfig.storage?.path || './data/chats/memory-store.sqlite'
         };
+        // >>> participant-roster patch >>>
+        // 曾用名保留几个由配置决定（"很多个称呼"就靠它）
+        this.participantContactNameLimit = normalizeParticipantRosterConfig(
+            memoryConfig.participantRoster
+        ).maxNameHistory || PARTICIPANT_ROSTER_DEFAULTS.maxNameHistory;
+        // <<< participant-roster patch <<<
     }
 
     closeStatements() {
@@ -711,6 +735,26 @@ export class SessionManager {
 
             CREATE INDEX IF NOT EXISTS idx_summary_index_namespace_time
             ON summary_index_entries(namespace_id, updated_at DESC);
+
+            -- >>> participant-roster patch >>>
+            -- 「认识谁」的**持久身份**。为什么不从 messages 现算：摘要会把 messages
+            -- 删掉（实测 group:929159193 累计 560 条、现存 106），一个只在被清那段里
+            -- 说过话的人就会**静默**从名单里消失 —— 而"认识他"本该是永久的。
+            -- 只存身份，**不存一个字正文**（否则会串台 + 变成编造源）。
+            CREATE TABLE IF NOT EXISTS participant_contacts (
+                participant_id   TEXT PRIMARY KEY,          -- QQ：唯一稳定的键
+                display_name     TEXT,                      -- 最近一次见到的昵称
+                name_history     TEXT NOT NULL DEFAULT '[]',-- JSON 数组，最近在前（昵称会改）
+                first_seen_at    INTEGER,
+                last_seen_at     INTEGER,
+                message_count    INTEGER NOT NULL DEFAULT 0,
+                last_scope_kind  TEXT,                      -- private | group
+                last_scope_key   TEXT                       -- private:<qq> / group:<gid>
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_participant_contacts_last_seen
+            ON participant_contacts(last_seen_at DESC);
+            -- <<< participant-roster patch <<<
         `);
     }
 
@@ -871,6 +915,136 @@ export class SessionManager {
                 ORDER BY updated_at DESC, rowid DESC
                 LIMIT ?
             `),
+            // >>> cross-scope recall patch >>>
+            // 跨场景召回：捞「当前发言人**自己在别的会话里**说过的话」（含别的群、含私聊）。
+            //
+            // 🔴 安全全靠那两件套，缺一不可：
+            //   1) `|QQ:<id>|` **作者过滤** —— 只捞这个人自己写的。别人的发言一条都进不来；
+            //      也顺带保证了**别人的私聊命名空间**不可能被命中（那里面的作者不是他）。
+            //      尾部的 `|` 是防前缀碰撞（2063362809 vs 20633628090）。
+            //   2) `ns.scope_key != ?` **排除当前会话** —— 当前会话的内容走原来的同作用域召回，
+            //      不要在这里重复捞。
+            // ⚠ 限定 `entry_type='conversation'`：不要画像/知识条目。
+            //
+            // ⛔ 仍然**不做**的事：把「别人」的话带到他不在的场合。那会在 A 群念出 B 群某人的私事。
+            //    这条不是技术限制，是别把别人的话搬给第三方看 —— 即使用户说"都是我的机器人"，
+            //    群里坐着的其它成员也不是他的。
+            searchCrossScopeEntriesByParticipant: this.db.prepare(`
+                SELECT
+                    e.id, e.entry_type, e.title, e.content, e.tags_json, e.metadata_json,
+                    e.source_session_id, e.source_message_id, e.created_at, e.updated_at,
+                    ns.scope_key AS origin_scope_key
+                FROM memory_entries e
+                JOIN memory_namespaces ns ON ns.id = e.namespace_id
+                WHERE ns.scope_key <> ?
+                    AND e.entry_type = 'conversation'
+                    AND e.content LIKE ?
+                    AND e.content LIKE ?
+                ORDER BY e.updated_at DESC, e.rowid DESC
+                LIMIT ?
+            `),
+            // 档位 B：他自己 + **所有群里任何人**说的话（跨群互通）。
+            // `includeOthersInGroups: true` 时用这条。用户 2026-10-11 的论据：
+            // 「我都能把机器人拉到群里说明这个群都是熟人」。
+            searchCrossScopeWithGroups: this.db.prepare(`
+                SELECT
+                    e.id, e.entry_type, e.title, e.content, e.tags_json, e.metadata_json,
+                    e.source_session_id, e.source_message_id, e.created_at, e.updated_at,
+                    ns.scope_key AS origin_scope_key
+                FROM memory_entries e
+                JOIN memory_namespaces ns ON ns.id = e.namespace_id
+                WHERE ns.scope_key <> ?
+                    AND e.entry_type = 'conversation'
+                    -- 🔴 括号必须只包住「作者条件」，不能包住关键词条件！
+                    --    第一版写成 author AND (keyword OR group_shared) ⇒ 群条目
+                    --    不需要命中关键词就能进来，等于捞回一堆无关的近期群消息
+                    --    （测试里"捞军训结果 20 条全是自己的、且都不含军训"就是这么抓到的）。
+                    -- ⚠ 这个注释在 JS 模板字符串里，别用反引号（会截断模板）。
+                    AND (e.content LIKE ? OR ns.scope_type = 'group_shared')
+                    AND e.content LIKE ?
+                ORDER BY e.updated_at DESC, e.rowid DESC
+                LIMIT ?
+            `),
+            // 档位 C：**连别人的私聊内容也公开**。`includeOthersPrivate: true` 时才用，
+            // 默认关 —— 用户的论据只覆盖了"群都是熟人"，没覆盖"一对一私聊也能公开"。
+            searchCrossScopeAll: this.db.prepare(`
+                SELECT
+                    e.id, e.entry_type, e.title, e.content, e.tags_json, e.metadata_json,
+                    e.source_session_id, e.source_message_id, e.created_at, e.updated_at,
+                    ns.scope_key AS origin_scope_key
+                FROM memory_entries e
+                JOIN memory_namespaces ns ON ns.id = e.namespace_id
+                WHERE ns.scope_key <> ?
+                    AND e.entry_type = 'conversation'
+                    AND e.content LIKE ?
+                ORDER BY e.updated_at DESC, e.rowid DESC
+                LIMIT ?
+            `),
+            // <<< cross-scope recall patch <<<
+            // >>> participant-roster patch >>>
+            // 「认识谁」读的是**持久表** participant_contacts，不是 messages。
+            // 理由：messages 会被摘要删掉，而"认识"应该是永久的。见 prepareSchema 里的建表注释。
+            listRecentContacts: this.db.prepare(`
+                SELECT
+                    participant_id,
+                    display_name,
+                    name_history,
+                    first_seen_at,
+                    last_seen_at,
+                    message_count,
+                    last_scope_kind,
+                    last_scope_key
+                FROM participant_contacts
+                ORDER BY last_seen_at DESC
+                LIMIT ?
+            `),
+            getContact: this.db.prepare(`
+                SELECT participant_id, display_name, name_history, first_seen_at, last_seen_at,
+                       message_count, last_scope_kind, last_scope_key
+                FROM participant_contacts
+                WHERE participant_id = ?
+            `),
+            upsertContact: this.db.prepare(`
+                INSERT INTO participant_contacts (
+                    participant_id, display_name, name_history, first_seen_at,
+                    last_seen_at, message_count, last_scope_kind, last_scope_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(participant_id) DO UPDATE SET
+                    display_name    = excluded.display_name,
+                    name_history    = excluded.name_history,
+                    first_seen_at   = excluded.first_seen_at,
+                    last_seen_at    = excluded.last_seen_at,
+                    message_count   = excluded.message_count,
+                    last_scope_kind = excluded.last_scope_kind,
+                    last_scope_key  = excluded.last_scope_key
+            `),
+            // 一次性回填的**数据来源**（只在表为空时跑一次）。
+            // ⚠ 要点（都踩过）：
+            //  - 用户消息的 `metadata_json.participants` 是权威发言人名单，格式
+            //    `["明末美食家(3184426518)","werwer(2063362809)"]`，实测 167/167 条非空。
+            //  - ⚠ **别用 `metadata_json.userId`**：它是"触发那次的主发言人"，批量合并时
+            //    和正文头对不上（实测有行 userId=werwer 但正文头是 QQ:3184426518|明末美食家）。
+            //  - ⚠ **别用「每个会话取一条」**：那样一个群只会出**最后发言的那一个人**
+            //    （实测 group:929159193 里出现过 17 个人，旧写法全库只给 6 行，平铺后 26 行）。
+            //  - ⚠ **别用 `MAX(content)` 配 GROUP BY**：那是任取一行，不是最新那行。
+            //  - `ORDER BY timestamp ASC` 是故意的：recordContact 把新名字**插到前面**，
+            //    所以按时间正序喂，最后得到的历史就是"最近在前"。
+            backfillContactSources: this.db.prepare(`
+                SELECT
+                    m.session_id,
+                    TRIM(je.value) AS who,
+                    MAX(m.timestamp) AS timestamp,
+                    COUNT(*) AS count
+                FROM messages m, json_each(json_extract(m.metadata_json, '$.participants')) je
+                WHERE m.role = 'user'
+                    AND IFNULL(m.metadata_json, '') <> ''
+                    AND json_valid(m.metadata_json)
+                    AND TRIM(je.value) <> ''
+                GROUP BY m.session_id, TRIM(je.value)
+                ORDER BY timestamp ASC
+            `),
+            countContacts: this.db.prepare(`SELECT COUNT(*) AS n FROM participant_contacts`),
+            // <<< participant-roster patch <<<
             listParticipantProfiles: this.db.prepare(`
                 WITH profiles AS (
                     SELECT
@@ -1271,6 +1445,14 @@ export class SessionManager {
                 dateIso
             );
             this.statements.updateSessionActivity.run(timestamp, 1, sessionId);
+            // >>> participant-roster patch >>>
+            try {
+                this.recordContactsFromMessage(sessionId, metadata, timestamp);
+            } catch (error) {
+                // ⚠ 名册是附加能力。它的失败绝不能把一条消息一起回滚掉。
+                this.logger?.warn?.('[身份名册] 记录联系人失败', { sessionId, error: error?.message });
+            }
+            // <<< participant-roster patch <<<
             this.enforceGlobalMessageLimit(timestamp);
             this.db.exec('COMMIT');
         } catch (error) {
@@ -1758,6 +1940,92 @@ export class SessionManager {
         }));
     }
 
+    // >>> cross-scope recall patch >>>
+    /**
+     * 跨场景召回：把**当前发言人自己在别的会话里**说过的话捞过来（2026-10-11 用户：
+     * 「把跨域记忆能打通的地方都打通」「记忆都打通要做跨群的」）。
+     *
+     * 覆盖范围：
+     *  - 私聊里 ← 他在**任何群**里说过的话 ✓
+     *  - 群里 ← 他在**别的群**和他在**私聊**里说过的话 ✓
+     *  - 当前会话的内容照旧走同作用域召回（这里用 `scope_key <> 当前` 排除，不重复捞）
+     *
+     * 🔴 唯一的硬约束：**只捞他自己写的**（SQL 里的 `|QQ:<id>|` 作者过滤）。
+     *    ⇒ 别人的发言永远进不来，**别人的私聊命名空间也永远命中不了**（那里面的作者不是他）。
+     * ⛔ 仍然不做：把"别人"的话搬到他不在的场合 —— 那会在 A 群念出 B 群某人的私事。
+     *
+     * 结果里带 `crossScope: true` + `crossScopeKey`（来源会话），而 content 本身带着
+     * `[群聊|…|群名:…|时间:…]` / `[私聊|…]` 头，所以她在提示词里**看得出这是哪儿说的**，
+     * 不会说成"你刚跟我说"。
+     *
+     * ⚠ 实测动机：werwer 21:00 在群里说「你看小睦喝的就是soyo奶」，21:24 私聊问，
+     *   她只能答「soyo奶是什么啦」（7 个命名空间互不相通，私聊召回 5 条全是私聊的）。
+     *
+     * @param {string} participantId 当前发言人 QQ
+     * @param {string[]} keywords buildRecallKeywords 剥头后的关键词
+     * @param {{excludeScopeKey?: string, limit?: number}} options
+     */
+    searchCrossScopeEntries(participantId, keywords, options = {}) {
+        const id = String(participantId || '').trim();
+        const list = Array.isArray(keywords) ? keywords.filter(Boolean) : [];
+        const limit = options.limit || 3;
+        const excludeScopeKey = String(options.excludeScopeKey || '');
+        const cfg = this.config?.memory?.crossScope || {};
+        if (!id || list.length === 0) return [];
+        const authorPattern = `%|QQ:${id}|%`;
+        // 打通档位（2026-10-11 用户：「我都能把机器人拉到群里说明这个群都是熟人」）：
+        //   A 只他自己 / B 他自己 + 所有群里任何人（默认）/ C 连别人的私聊也公开（默认关）
+        const level = cfg.includeOthersPrivate === true
+            ? 'all'
+            : (cfg.includeOthersInGroups !== false ? 'groups' : 'self');
+        const statement = level === 'all'
+            ? this.statements.searchCrossScopeAll
+            : (level === 'groups'
+                ? this.statements.searchCrossScopeWithGroups
+                : this.statements.searchCrossScopeEntriesByParticipant);
+        const merged = new Map();
+        for (const keyword of list) {
+            let rows = [];
+            try {
+                rows = level === 'all'
+                    ? statement.all(excludeScopeKey, `%${keyword}%`, Math.max(limit * 3, 8))
+                    : statement.all(excludeScopeKey, authorPattern, `%${keyword}%`, Math.max(limit * 3, 8));
+            } catch (error) {
+                this.logger?.warn?.('[记忆] 跨场景召回失败', { participantId: id, error: error.message });
+                continue;
+            }
+            for (const row of rows) {
+                const hit = merged.get(row.id);
+                if (hit) hit.hits += 1;
+                else merged.set(row.id, { row, hits: 1 });
+            }
+        }
+        return Array.from(merged.values())
+            .sort((a, b) => (b.hits - a.hits) || ((b.row.updated_at || 0) - (a.row.updated_at || 0)))
+            .slice(0, limit)
+            .map((item) => ({
+                id: item.row.id,
+                entryType: item.row.entry_type,
+                title: item.row.title,
+                content: item.row.content,
+                tags: parseJson(item.row.tags_json, []),
+                metadata: parseJson(item.row.metadata_json, {}),
+                sourceSessionId: item.row.source_session_id,
+                sourceMessageId: item.row.source_message_id,
+                createdAt: item.row.created_at,
+                updatedAt: item.row.updated_at,
+                crossScope: true,
+                crossScopeLevel: level,
+                crossScopeKey: item.row.origin_scope_key || ''
+            }));
+    }
+
+    /** 兼容旧名字（第一版只做了"私聊 ← 群"）。 */
+    searchCrossScopeGroupEntries(participantId, keywords, limit = 3) {
+        return this.searchCrossScopeEntries(participantId, keywords, { limit });
+    }
+    // <<< cross-scope recall patch <<<
+
     listParticipantMessages(userId, options = {}) {
         const since = options.since || 0;
         const limit = options.limit || 50;
@@ -2161,6 +2429,159 @@ export class SessionManager {
         const searchPattern = search ? `%${search}%` : null;
         return { limit, search, searchPattern };
     }
+
+    // >>> participant-roster patch >>>
+    /**
+     * 跨会话的"认识谁"名单：每个会话一行（最近一条用户消息 + 消息数 + 最后活跃）。
+     * 调用方 participant-roster.js 负责解析昵称/QQ、按人合并、按时间截断。
+     * 只用于喂身份，**不返回任何可用于回放对话的东西**。
+     */
+    listRecentContacts(limit = 60) {
+        const n = Number.isFinite(Number(limit)) && Number(limit) > 0
+            ? Math.floor(Number(limit))
+            : 60;
+        try {
+            return this.statements.listRecentContacts.all(n);
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * 记一个联系人。QQ 是主键；昵称并进 name_history（最近在前，去重，截断）。
+     * 增量写消息时 countDelta=1，回填时是那条 (会话,发言人) 的条数。
+     */
+    recordContact(participantId, name, timestamp, scopeKind, scopeKey, countDelta = 1) {
+        const id = String(participantId || '').trim();
+        if (!id) return;
+        const ts = Number(timestamp) || Date.now();
+        const existing = this.statements.getContact.get(id);
+        const history = mergeNameHistory(
+            existing?.name_history,
+            name,
+            this.participantContactNameLimit || PARTICIPANT_ROSTER_DEFAULTS.maxNameHistory
+        );
+        // 名字/位置只跟着**更近的**那次走（与渲染层同一条规则）
+        const isNewer = !existing || ts >= Number(existing.last_seen_at || 0);
+        const safeName = isPlausibleName(name) ? String(name).trim() : '';
+        const displayName = isNewer
+            ? (safeName || existing?.display_name || '')
+            : (existing?.display_name || safeName);
+        this.statements.upsertContact.run(
+            id,
+            displayName,
+            JSON.stringify(history),
+            existing?.first_seen_at ? Math.min(Number(existing.first_seen_at), ts) : ts,
+            existing?.last_seen_at ? Math.max(Number(existing.last_seen_at), ts) : ts,
+            Number(existing?.message_count || 0) + (Number(countDelta) || 0),
+            (isNewer ? scopeKind : existing?.last_scope_kind) || null,
+            (isNewer ? scopeKey : existing?.last_scope_key) || null
+        );
+    }
+
+    /**
+     * 把一条用户消息里的发言人记进 participant_contacts。
+     * ⚠ 数据源是 `metadata.participants`（形如 `昵称(QQ)`），**不是** `metadata.userId`
+     *   —— 后者是"触发那次的主发言人"，批量合并时和正文头对不上。
+     */
+    recordContactsFromMessage(sessionId, metadata = {}, timestamp = Date.now()) {
+        const participants = Array.isArray(metadata?.participants) ? metadata.participants : [];
+        if (participants.length === 0) return;
+        const scope = parseSessionKey(sessionId) || { kind: null, id: null };
+        for (const token of participants) {
+            const parsed = parseContactToken(token);
+            if (!parsed) continue;
+            this.recordContact(parsed.participantId, parsed.name, timestamp, scope.kind, sessionId, 1);
+        }
+    }
+
+    // >>> roster-commands patch >>>
+    /**
+     * 按昵称/曾用名找 QQ（`/忘记 <昵称>` 用）。
+     * 先精确匹配 display_name，再匹配 name_history 里的曾用名。
+     */
+    findContactsByName(name) {
+        const n = String(name || '').trim();
+        if (!n) return [];
+        try {
+            return this.db.prepare(`
+                SELECT participant_id, display_name, name_history
+                FROM participant_contacts
+                WHERE display_name = ?
+                    OR name_history LIKE ?
+                ORDER BY last_seen_at DESC
+                LIMIT 5
+            `).all(n, `%${n}%`).map((row) => ({
+                participantId: row.participant_id,
+                displayName: row.display_name || ''
+            }));
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * 把一个人从「她认识谁」里删掉（管理员指令 /忘记 用）。
+     *
+     * 删两处：
+     *  - `participant_contacts` 那一行（通讯录 ⇒ 名册里不再出现）
+     *  - `memory_entries` 里**他署名的**逐字副本（召回时不再命中）
+     *
+     * ⚠ **不动 `messages`**：群历史是**批量合并**存的（一条里混着好几个人的话，
+     *   实测同一条里有别人的发言），按作者删会连累别人。
+     * ⚠ **不动 `summaries`**：摘要里可能混着多人的事，而且它会随时间自然滚掉。
+     * 所以这个指令是"让她不再认得这个人"，不是"抹掉他说过的每句话"。
+     */
+    forgetContact(participantId) {
+        const id = String(participantId || '').trim();
+        if (!id) return { participantId: '', contactDeleted: 0, memoryEntriesDeleted: 0 };
+        let contactDeleted = 0;
+        let memoryEntriesDeleted = 0;
+        try {
+            contactDeleted = Number(this.db.prepare(
+                'DELETE FROM participant_contacts WHERE participant_id = ?').run(id).changes) || 0;
+            memoryEntriesDeleted = Number(this.db.prepare(
+                'DELETE FROM memory_entries WHERE content LIKE ?').run(`%|QQ:${id}|%`).changes) || 0;
+        } catch (error) {
+            this.logger?.warn?.('[名册] 删除联系人失败', { participantId: id, error: error?.message });
+        }
+        return { participantId: id, contactDeleted, memoryEntriesDeleted };
+    }
+    // <<< roster-commands patch <<<
+
+    /**
+     * 表为空时从历史消息回填一次（升级后名册不能凭空空掉）。
+     * `force` 只在测试/修数据时用。
+     */
+    backfillParticipantContacts(force = false) {
+        try {
+            if (!force) {
+                const n = Number(this.statements.countContacts.get()?.n || 0);
+                if (n > 0) return 0;
+            }
+            // 按时间**正序**喂：recordContact 把新名字插到前面 ⇒ 历史自然"最近在前"
+            const rows = this.statements.backfillContactSources.all();
+            for (const row of rows) {
+                const parsed = parseContactToken(row.who);
+                if (!parsed) continue;
+                const scope = parseSessionKey(row.session_id) || { kind: null, id: null };
+                this.recordContact(
+                    parsed.participantId, parsed.name, Number(row.timestamp),
+                    scope.kind, row.session_id, Number(row.count) || 1
+                );
+            }
+            const total = Number(this.statements.countContacts.get()?.n || 0);
+            if (rows.length > 0) {
+                this.logger?.info?.(`[身份名册] 已从历史消息回填联系人：${total} 人`);
+            }
+            return rows.length;
+        } catch (error) {
+            this.logger?.warn?.('[身份名册] 回填失败', { error: error?.message });
+            return 0;
+        }
+    }
+    // <<< participant-roster patch <<<
+    // <<< participant-roster patch <<<
 
     listParticipantProfiles(limitOrOptions = 50) {
         const { limit, searchPattern } = this.normalizeParticipantProfileListOptions(limitOrOptions);
@@ -2608,6 +3029,19 @@ export class SessionManager {
         const blacklist = new Set(participantProfileConfig.blacklistParticipantIds);
         const currentParticipantId = options.currentParticipantId ? String(options.currentParticipantId) : '';
 
+        // >>> cross-scope recall patch >>>
+        // 私聊和群聊**都**外扩（2026-10-11 用户：「记忆都打通要做跨群的」）。
+        // 安全边界不靠"限定场景"，而是靠 SQL 里的**作者过滤** —— 只捞当前发言人自己写的。
+        const crossScopeConfig = this.config?.memory?.crossScope || {};
+        const crossScopeEnabled = crossScopeConfig.enabled !== false;
+        const crossScopeEntries = (crossScopeEnabled && currentParticipantId && recallKeywords.length > 0)
+            ? this.searchCrossScopeEntries(currentParticipantId, recallKeywords, {
+                excludeScopeKey: String(namespaceOptions?.scopeKey || ''),
+                limit: options.crossScopeLimit || 3
+            })
+            : [];
+        // <<< cross-scope recall patch <<<
+
         const shouldIncludeEntry = (entry) => {
             if (entry.entryType === 'knowledge_fixed' || entry.entryType === 'knowledge_dynamic') {
                 return true;
@@ -2630,7 +3064,7 @@ export class SessionManager {
         };
 
         const dedupe = new Map();
-        for (const entry of [...fixedKnowledgeEntries, ...matchedEntries, ...recentEntries]) {
+        for (const entry of [...fixedKnowledgeEntries, ...crossScopeEntries, ...matchedEntries, ...recentEntries]) {
             if (!shouldIncludeEntry(entry) || dedupe.has(entry.id)) {
                 continue;
             }
@@ -2638,9 +3072,12 @@ export class SessionManager {
             const contentText = String(entry.content || '').toLowerCase();
             const keywordHits = queryKeywords.filter((keyword) => contentText.includes(keyword)).length;
             const isMatched = matchedEntries.some((item) => item.id === entry.id);
+            // >>> cross-scope recall patch >>>
+            const isCrossScope = crossScopeEntries.some((item) => item.id === entry.id);
+            // <<< cross-scope recall patch <<<
             const isFixedKnowledge = entry.entryType === 'knowledge_fixed';
             const isDynamicKnowledge = entry.entryType === 'knowledge_dynamic';
-            const recencyBoost = isMatched ? 50 : 20;
+            const recencyBoost = isMatched ? 50 : (isCrossScope ? 35 : 20);
             const profileBoost = entry.entryType === 'participant_profile' ? 80 : 0;
             const knowledgeBoost = isFixedKnowledge ? 120 : (isDynamicKnowledge ? 70 : 0);
             dedupe.set(entry.id, {
@@ -2656,7 +3093,9 @@ export class SessionManager {
                         ? (isMatched ? 'dynamic_knowledge_match' : 'dynamic_knowledge_recent')
                         : (entry.entryType === 'participant_profile'
                             ? 'participant_profile'
-                            : (isMatched ? 'keyword_match' : 'recent_memory'))),
+                            : (isCrossScope
+                                ? 'cross_scope_group'
+                                : (isMatched ? 'keyword_match' : 'recent_memory')))),
                 recallScore: knowledgeBoost + profileBoost + recencyBoost + keywordHits * 8
             });
         }
@@ -2686,6 +3125,10 @@ export class SessionManager {
             query: summarizeText(query),
             recentCount: recentEntries.length,
             matchedCount: matchedEntries.length,
+            crossScopeCount: crossScopeEntries.length,
+            crossScopeLevel: (this.config?.memory?.crossScope?.includeOthersPrivate === true
+                ? 'all'
+                : (this.config?.memory?.crossScope?.includeOthersInGroups !== false ? 'groups' : 'self')),
             fixedKnowledgeCount: fixedKnowledgeEntries.length,
             summaryCount: summaryEntries.length,
             resultCount: results.length,

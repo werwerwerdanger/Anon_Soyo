@@ -113,6 +113,14 @@ for (const [inst, label] of [['MimirLink-soyo', 'soyo'], ['MimirLink', 'anon']])
         extractFunction(src, 'toComparableId'),
         extractFunction(src, 'isAllowed'),
         extractFunction(src, 'isTriggerUser'),
+        // 🔴 2026-10-13 补：`accept()` 里调了 coBotYieldMarkSpoken / coBotYieldNoteCoBot，
+        //    它们又依赖 coBotYieldState(Map) —— 以前这些都没进求值环境，
+        //    一走到 accept() 就是 `ReferenceError: coBotYieldNoteCoBot is not defined`
+        //    （verify_trigger_routing.mjs 踩过同一个坑，照同一套补）。
+        'const coBotYieldState = new Map();',
+        extractFunction(src, 'coBotYieldNoteCoBot'),
+        extractFunction(src, 'coBotYieldDecision'),
+        extractFunction(src, 'coBotYieldMarkSpoken'),
         extractFunction(src, 'buildRoutingDecision'),
         'return { buildRoutingDecision };',
     ].join('\n');

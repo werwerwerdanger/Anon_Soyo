@@ -20,6 +20,9 @@ data/range-sync-history.json
 data/range-snapshots/
 data/presets/
 data/kb_*.json
+# OJ 反馈轮询的游标（本地运行态；丢了会导致重启后要么重发历史、要么漏通知）
+data/oj-feedback-state.json
+data/oj-feedback-state.json.tmp
 data/range_*.json
 data/test_*.txt
 data/*_result.txt
@@ -75,3 +78,11 @@ tmp-*.py
 *.bak_*
 *.orig
 *.rej
+
+# Local runtime state: sticker library (~114 MB), inbox, oj state, ...
+# Only the .gitkeep that holds the directory open is tracked.
+data/*
+!data/.gitkeep
+
+# Throwaway artifacts (underscore = one-off, workspace convention): never publish
+_*

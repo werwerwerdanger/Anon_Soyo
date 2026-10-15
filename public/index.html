@@ -12093,6 +12093,15 @@
                                 </label>
                                 <p class="hint-text">开启后回复会带上思维链，仅调试用。</p>
                             </div>
+                            <!-- >>> show-thinking-ui patch >>> -->
+                            <div class="form-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="config-chat-show-thinking">
+                                    用括号显示思考内容
+                                </label>
+                                <p class="hint-text">开启后自己的回复末尾会多一段「（思考：…）」。样式/长度/作用域在 config.json 的 chat.showThinking 里调，也可以直接发 /思考 开 临时打开。</p>
+                            </div>
+                            <!-- <<< show-thinking-ui patch <<< -->
                         </div>
                     </div>
                     <div class="config-subsection">
@@ -21423,6 +21432,9 @@ ${items.length > 0 ? items.slice(0, 8).map((rule) => `- [${badge}] ${rule.name |
                 document.getElementById('config-chat-emoji-reaction').checked = currentConfig.chat?.emojiReaction === true;
                 document.getElementById('config-chat-emoji-reaction-id').value = currentConfig.chat?.emojiReactionId || '289';
                 document.getElementById('config-chat-send-reasoning-to-qq').checked = currentConfig.chat?.sendReasoningToQQ === true;
+                // >>> show-thinking-ui patch >>>
+                document.getElementById('config-chat-show-thinking').checked = currentConfig.chat?.showThinking?.enabled === true;
+                // <<< show-thinking-ui patch <<<
                 document.getElementById('config-chat-group-repeat-enabled').checked = currentConfig.chat?.groupRepeat?.enabled === true;
                 document.getElementById('config-chat-group-repeat-cooldown-minutes').value = Math.max(1, Math.round((currentConfig.chat?.groupRepeat?.cooldownMs ?? 180000) / 60000));
                 updateGroupRepeatFields();
@@ -21897,6 +21909,14 @@ ${escapeHtml(regexWarnings)}` : ''}</div>`;
                     emojiReaction: document.getElementById('config-chat-emoji-reaction').checked,
                     emojiReactionId: document.getElementById('config-chat-emoji-reaction-id').value.trim() || '289',
                     sendReasoningToQQ: document.getElementById('config-chat-send-reasoning-to-qq').checked,
+                    // >>> show-thinking-ui patch >>>
+                    // 只写 enabled：format/label/maxChars/position/scope 面板上没有控件，
+                    // 必须原样带回，否则一次「保存」就会把用户手写的配置抹成默认值。
+                    showThinking: {
+                        ...(currentConfig.chat?.showThinking || {}),
+                        enabled: document.getElementById('config-chat-show-thinking').checked
+                    },
+                    // <<< show-thinking-ui patch <<<
                     groupRepeat: {
                         enabled: document.getElementById('config-chat-group-repeat-enabled').checked,
                         triggerCount: 2,

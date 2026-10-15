@@ -6,6 +6,8 @@
 import { buildInputGuardrail } from './security.js';
 import { buildCurrentMessageFocus, formatCurrentMessageFocus } from './current-message-focus.js';
 import { createRuntimeSource, compactRuntimeSources } from './runtime/prompt-registry.js';
+import { stripStructuredEnvelope } from './structured-envelope.js';
+import { buildStickerHint } from './sticker-library.js';
 
 function createNoopLogger() {
     return {
@@ -14,6 +16,119 @@ function createNoopLogger() {
         warn() {},
         error() {}
     };
+}
+
+/**
+ * 「这段对话的形状」—— **纯计算，零 LLM 调用**。
+ *
+ * 起因（2026-10-13 用户）：他观察到 WorkBuddy 的 agent 能从日志里看出
+ * 「这不像在测机器人」，而机器人看不出来。查证后的根因：
+ * 她 prompt 里的【会话感知】只有 4 个字段（会话ID/类型/聚合数/触发原因）——
+ * 🔴 **完全没有"形状"**。她只看得到"这一句"，看不到"这个人已经连着说了四十分钟、
+ * 同一句话说了 5 遍、现在是凌晨三点"。
+ * 而"这像不像在测试"恰恰是从**形状**里读出来的，不是从某一句话里。
+ *
+ * 🔑 **只喂事实，不喂结论**：给「深夜」「同一句出现 5 次」这种可核对的观察，
+ * 让她自己去推"这人不对劲"。**不要**直接写"对方情绪不稳定"——
+ * 那是替她下判断，她推错的代价比她没察觉更大（而且是不可核对的）。
+ *
+ * 数据来源：`recentMessages` 每条都带 `{role, content, timestamp}`（`session.js` 的行映射），
+ * 所以这里不需要任何额外查询。
+ */
+export function buildConversationShape(messages = [], now = Date.now()) {
+    const rows = (Array.isArray(messages) ? messages : [])
+        .map((m) => ({
+            role: m && m.role === 'assistant' ? 'assistant' : 'user',
+            content: String((m && m.content) || ''),
+            ts: Number(m && m.timestamp) || 0
+        }))
+        .filter((m) => m.content && m.ts > 0);
+    if (rows.length < 3) {
+        return [];
+    }
+
+    const out = [];
+
+    // ① 只算**最近这一段连续对话**：往前直到出现一个超过 30 分钟的间隔就断开。
+    //    否则会把昨天的事和今天的事混在一起算时长。
+    const BREAK_MS = 30 * 60 * 1000;
+    let start = rows.length - 1;
+    for (let i = rows.length - 1; i > 0; i--) {
+        if (rows[i].ts - rows[i - 1].ts > BREAK_MS) {
+            break;
+        }
+        start = i - 1;
+    }
+    const seg = rows.slice(start);
+    if (seg.length < 3) {
+        return out;
+    }
+
+    const minutes = Math.max(1, Math.round((seg[seg.length - 1].ts - seg[0].ts) / 60000));
+    const them = seg.filter((m) => m.role === 'user').length;
+    const me = seg.filter((m) => m.role === 'assistant').length;
+    if (minutes >= 5) {
+        out.push(`最近 ${minutes} 分钟里：对方说了 ${them} 句，你说了 ${me} 句`);
+    }
+
+    // ② 同一件事反复出现（字符 bigram 重叠 ≥2 就算同一件，≥3 次才报）。
+    //    ⚠ 不追求精确聚类 —— 只要"反复"这个信号够明显，就够了。
+    const bigrams = (s) => {
+        const set = new Set();
+        for (let i = 0; i + 1 < s.length; i++) {
+            set.add(s.slice(i, i + 2));
+        }
+        return set;
+    };
+    const theirs = seg
+        .filter((m) => m.role === 'user')
+        // 🔴 2026-10-13 修：必须先剥**结构化信封**，否则"反复出现的话"**每次都命中信封前缀**。
+        //    原因：这里的 content 是带信封的 `[私聊|QQ:…|昵称:…|…|messageSegments:[{…}]] 正文`，
+        //    任意两条信封的字符 bigram 必然大量重叠 ⇒ 恒定报
+        //      「对方反复在说同一件事：「[私聊|QQ:2063362809|昵称:wer」（出现 12 次）」
+        //    实测每轮都注入这句乱码，就压在「注意:」行前面（位置很显眼）。
+        //    ⚠ 只剥信封还不够：`[图片]` 这类占位也要去掉（下面那句 replace 保留）。
+        .map((m) => stripStructuredEnvelope(m.content).replace(/\[[^\]]{0,12}\]/g, '').trim())
+        .filter((t) => t.length >= 4)
+        // 压平换行：这条事实会被塞进提示词，带原始换行会让它变成好几行（看起来像好几条指令）
+        .map((t) => ({ t: t.replace(/\s+/g, ' '), g: bigrams(t.replace(/\s+/g, ' ')) }));
+    let best = null;
+    for (let i = 0; i < theirs.length; i++) {
+        let near = 0;
+        for (let j = 0; j < theirs.length; j++) {
+            if (i === j) {
+                continue;
+            }
+            let shared = 0;
+            for (const b of theirs[i].g) {
+                if (theirs[j].g.has(b)) {
+                    shared += 1;
+                    if (shared >= 2) {
+                        break;
+                    }
+                }
+            }
+            if (shared >= 2) {
+                near += 1;
+            }
+        }
+        const count = near + 1;
+        if (count >= 3 && (!best || theirs[i].t.length > best.t.length)) {
+            best = { t: theirs[i].t, count };
+        }
+    }
+    if (best) {
+        out.push(`对方反复在说同一件事：「${best.t.slice(0, 24)}」（出现 ${best.count} 次）`);
+    }
+
+    // ③ 时间点的人话 —— ⚠ **只在"不正常的时间"才加**（她本来就有【当前时间】，
+    //    正常工作时间的重复没有信息量，白占 token）。
+    const hour = new Date(now).getHours();
+    const odd = hour < 5 ? '凌晨' : (hour < 8 ? '一大早' : (hour >= 23 ? '深夜' : ''));
+    if (odd) {
+        out.push(`现在是${odd}（${hour} 点）`);
+    }
+    return out;
 }
 
 export class PromptBuilder {
@@ -924,8 +1039,12 @@ const compactHistoryUser = (content) => {
         }
         out = out.slice(0, start) + tag + out.slice(end + 1);
     }
-    // 引用前缀 [回复上文|…] 在历史轮次里也只是噪音
-    out = out.replace(/\[回复上文\|[^\]]*\]\s*/g, '');
+    // 引用前缀 [回复上文|…] 在历史轮次里也只是噪音。
+    // 🔴 2026-10-14 修：原来写 `[^\]]*`，会在**第一个** `]` 就停 ——
+    //   而信封里可能嵌套方括号（`内容:[图片:[动画表情]]]`），于是删完还剩一截 `]]`
+    //   留在历史正文里（实测真的渲染出 `[白(1000000004) 10:45:24] ]]` 这种行）。
+    //   改成共用 `stripStructuredEnvelope`（括号配平，且只留一份实现）。
+    out = stripStructuredEnvelope(out);
     return out.replace(/[ \t]{2,}/g, ' ').replace(/\n{2,}/g, '\n').trim();
 };
 // <<< compact-history-user patch <<<
@@ -1000,9 +1119,20 @@ const compactHistoryUser = (content) => {
             // 范句随角色走：anon 和 soyo 的语气是反的，不能共用一句
             styleAnchor: (this.chatConfig || {}).styleAnchor,
             // >>> human-shape patch >>>
-            humanShapeHint: (this.chatConfig || {}).humanShapeHint
+            humanShapeHint: (this.chatConfig || {}).humanShapeHint,
             // <<< human-shape patch <<<
             // <<< style-anchor-config patch <<<
+            // >>> participant-roster patch >>>
+            // 对方提到的人正好在联系人名单里时，那句提示要落在「注意:」行（最后读到的位置）。
+            // ⚠ 必须是**消息级**才知道的，所以从 runtimeContext 带过来，不在本文件算。
+            participantRosterMention: runtimeContext.participantRosterMention || '',
+            // <<< participant-roster patch <<<
+            // >>> sticker-send patch >>>
+            // 她能**发**表情包：告诉她标记怎么写 + 本地库里有哪些类别。
+            // 类别名是由**目录里真实存在的子目录**算出来的，所以用户往 data/stickers/ 丢图后
+            // 不用重启（库内部有 30s TTL 的扫描缓存）。
+            stickerHint: buildStickerHint(this.chatConfig || {})
+            // <<< sticker-send patch <<<
         }));
         const currentMessageFocusSegment = PromptBuilder.createRuntimeSegment({
             id: 'current-message-focus',
@@ -1110,6 +1240,12 @@ const compactHistoryUser = (content) => {
                 participantCount: Array.isArray(runtimeContext?.participants) ? runtimeContext.participants.length : 0,
                 hasReplyReference: !!runtimeContext?.replyReference,
                 hasCurrentSpeakerProfile: !!runtimeContext?.currentSpeakerProfile?.content,
+                // >>> participant-roster patch >>>
+                // 每轮把名册长度打进 `[Prompt] 开始构建` 这条 DEBUG 日志。
+                // 这是唯一能从日志确认"名册到底进没进这一轮的提示词"的地方 ——
+                // 主提示词的 contentPreview 只留前 120 字，靠它是看不出来的。
+                participantRosterLength: String(runtimeContext?.participantRoster || '').length,
+                // <<< participant-roster patch <<<
                 injectionRiskLevel: runtimeContext?.injectionRisk?.level || ''
             }
         });
@@ -1300,13 +1436,31 @@ const compactHistoryUser = (content) => {
                 facts.push(`触发原因: ${runtimeContext.triggerReason}`);
             }
             if (facts.length > 0) {
-                sections.push(`【会话感知】\n${facts.join(' | ')}`);
+                // 「这段对话的形状」：时长/双方句数、反复出现的话、不正常的时间点。
+                // 纯计算，零 LLM 调用。加这行的起因见 buildConversationShape 的注释。
+                const shape = buildConversationShape(context && context.recentMessages, Date.now());
+                sections.push(`【会话感知】\n${[facts.join(' | '), ...shape].join('\n')}`);
             }
         }
 
         if (this.contextConfig.includeParticipants && Array.isArray(runtimeContext.participants) && runtimeContext.participants.length > 0) {
             sections.push(`【参与者】\n${runtimeContext.participants.join(' | ')}`);
         }
+
+        // >>> participant-roster patch >>>
+        // 跨会话身份名册。文本由 index.js 的 buildParticipantRosterText() 生成
+        // （未启用/无联系人时是空串）。放在【参与者】旁边，因为两者都是"现场有谁"级别的
+        // 身份信息；但它覆盖的是**别的会话**里的人，所以必须显式区别于【当前发言人画像】。
+        //
+        // ⚠ 这里必须留一行日志。原因：主提示词在日志里的 `contentPreview` 只留前 ~120 字，
+        // 情境段永远看不到 ⇒ 没法从日志判断这东西到底进没进 prompt（styleAnchor 已经
+        // 让这个坑浪费过一整轮排查）。和上面「注入示例对话」用同一种写法。
+        if (runtimeContext.participantRoster) {
+            const rosterText = String(runtimeContext.participantRoster).trim();
+            this.logger?.debug?.(`[提示词] 注入身份名册 ${rosterText.length} 字`);
+            sections.push(rosterText);
+        }
+        // <<< participant-roster patch <<<
 
         if (runtimeContext.currentSpeakerProfile?.content) {
             const profileText = runtimeContext.currentSpeakerProfile.content.trim();
@@ -1322,6 +1476,12 @@ const compactHistoryUser = (content) => {
         if (this.contextConfig.includeRecentUserIntent) {
             const recentUserMessages = context.recentMessages
                 .filter((message) => message.role === 'user')
+                // >>> passive-store patch >>>
+                // 群里**没触发她**的消息也会入库（给她群上下文，见 index.js 的
+                // maybeStoreUntriggeredMessage），但它们不是"用户意图" ——
+                // 不过滤的话，真正在跟她说话的那几句会被群里的闲话挤出这三条。
+                .filter((message) => !message?.metadata?.passive)
+                // <<< passive-store patch <<<
                 .slice(-3)
                 .map((message) => message.content);
             if (recentUserMessages.length > 0) {

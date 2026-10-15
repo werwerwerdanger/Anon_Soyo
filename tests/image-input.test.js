@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
     DEFAULT_IMAGE_CAPTION_PROMPT,
     DEFAULT_TRUSTED_IMAGE_HOSTS,
@@ -543,4 +544,80 @@ test('转发图片超出单轮上限时截断并给出提示，而不是整轮�
     assert.equal(result.imageCount, IMAGE_INPUT_LIMITS.maxImages);
     assert.equal(result.warnings.length, 1);
     assert.match(result.warnings[0], /另有 3 张图片超出单轮/);
+});
+
+// ---------------------------------------------------------------------------
+// 2026-10-13「读不了图」事故的回归闸门
+//
+// 现象：用户发图后**连一句回复都没有**（不是"不描述图"，是整条消息被丢掉）。
+// 链路：gchat.qpic.cn 的下载链接对 rkey 失效的请求**一律回 400**（实测连不带参数、
+//       换 POST 都回 400）⇒ 本地下载失败 ⇒ 旧代码无条件把**同一个坏链接**交给模型供应商读
+//       ⇒ 供应商也读不到 ⇒ DeepSeek 把**整个请求**判 400
+//       （`.messages[175].image[0]: Failed to download image from https://gchat.qpic.cn/...`）
+//       ⇒ 该轮无回复。
+// 实测成功数：10-09 68/69、10-10 7/7、10-11 29/30、10-12 14/14、10-13 **0/3**。
+// 修法：4xx（CDN 明确拒绝）⇒ 丢掉这张图、按"看不到图"处理；
+//       5xx/网络类 ⇒ 保留原来的供应商回退（那种情况下供应商那侧可能读得到）。
+const deadLinkResponse = (status) => new Response(null, { status });
+
+test('🔴 图片链接 4xx 失效时丢掉图、走占位提示，绝不把坏链接交给供应商', async () => {
+    const url = 'https://gchat.qpic.cn/download?appid=1406&fileid=x&rkey=dead&spec=0';
+    const result = await withFetch(async () => deadLinkResponse(400), () => prepareImageInput({
+        items: items(image({ url })),
+        config: config(), aiClient: noopClient, resolveHost: trustedHostResolver
+    }));
+    // 关键：一个 image_url 段都不许带出去（带出去 = 供应商 400 = 整轮无回复）
+    assert.deepEqual(result.imageParts, []);
+    assert.equal(result.mode, 'placeholder');
+    assert.equal(result.imageCount, 1);
+    assert.match(result.captionText || '', new RegExp(IMAGE_CAPTION_FAILED_TEXT));
+    assert.ok(result.warnings.some((w) => w.includes('链接已失效')), JSON.stringify(result.warnings));
+    assert.ok(result.warnings.some((w) => w.includes('看不到图')), JSON.stringify(result.warnings));
+    // 不变量：任何情况下都不许把原始 http 链接再交给供应商（那是本次事故的成因）
+    assert.ok(!result.imageParts.some((p) => /^https?:/.test(String(p.image_url?.url || ''))));
+});
+
+test('图片服务端 5xx 时保留"交给供应商读取"的回退（不能一刀切掉）', async () => {
+    const url = 'https://multimedia.nt.qq.com.cn/download?file=abc&rkey=1';
+    const result = await withFetch(async () => deadLinkResponse(503), () => prepareImageInput({
+        items: items(image({ url })),
+        config: config(), aiClient: noopClient, resolveHost: trustedHostResolver
+    }));
+    assert.equal(result.mode, 'direct');
+    assert.equal(result.imageParts[0].image_url.url, url);
+    assert.ok(result.warnings.some((w) => w.includes('交给模型供应商读取')), JSON.stringify(result.warnings));
+});
+
+test('多图里只有一张失效时，只丢那一张，其余照常内联', async () => {
+    const ok = 'https://multimedia.nt.qq.com.cn/download?file=ok&rkey=1';
+    const dead = 'https://gchat.qpic.cn/download?appid=1406&fileid=x&rkey=dead&spec=0';
+    let call = 0;
+    const result = await withFetch(async (url) => {
+        call += 1;
+        if (String(url).includes('dead')) return deadLinkResponse(400);
+        return pngResponse();
+    }, () => prepareImageInput({
+        items: items(image({ url: dead }), image({ url: ok })),
+        config: config(), aiClient: noopClient, resolveHost: trustedHostResolver
+    }));
+    assert.equal(call, 2);
+    assert.equal(result.mode, 'direct');
+    assert.equal(result.imageParts.length, 1);
+    assert.match(result.imageParts[0].image_url.url, /^data:image\/png;base64,/);
+    assert.ok(result.warnings.some((w) => w.includes('链接已失效')), JSON.stringify(result.warnings));
+});
+
+test('🔴 「全丢」分支必须排在 getImageCaptionOverrides 的 early-return 之前', () => {
+    // 位置错了就静默失效：imageCaptionModel 为空时下面那个 early-return 会先返回 'direct'，
+    // 占位分支永远走不到 —— 而那正是线上配置（imageCaptionModel 为空）。
+    const src = readFileSync(new URL('../src/image-input.js', import.meta.url), 'utf8');
+    const guard = src.indexOf('imageParts.length === 0 && imageCount > 0 && droppedImages > 0');
+    const earlyDirect = src.indexOf("if (!overrides) return { mode: 'direct'");
+    const skipCaption = src.indexOf('if (overrides && shouldSkipImageCaption(config))');
+    assert.ok(guard > 0, '找不到「全丢」闸门');
+    assert.ok(earlyDirect > 0 && skipCaption > 0, '找不到 early-return');
+    assert.ok(guard < earlyDirect && guard < skipCaption,
+        `闸门(${guard}) 必须排在两个 early-return(${skipCaption}, ${earlyDirect}) 之前`);
+    // 4xx 判定本身也要在（别退化成无条件回退）
+    assert.match(src, /status >= 400 && status < 500/);
 });

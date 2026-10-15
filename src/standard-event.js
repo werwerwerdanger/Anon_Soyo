@@ -1,3 +1,9 @@
+// >>> qq-face-names patch >>>
+// 渲染 `face` 段时需要把 id 查成中文名（segment 自带的 name 常为空）。
+// qq-interactions.js 自身没有任何 import，不会成环。
+import { resolveQqFaceName } from './qq-interactions.js';
+// <<< qq-face-names patch <<<
+
 function cleanText(value) {
     return String(value ?? '').replace(/\r/g, '').trim();
 }
@@ -27,9 +33,14 @@ function buildSegmentReadableText(segment = {}, botSelfId = '') {
         return segment.id ? `引用消息:${segment.id}` : '引用消息';
     }
     if (type === 'face') {
-        const name = compactText(segment.name || segment.summary || segment.text, 40);
+        // >>> qq-face-names patch >>>
+        // face 段的 `name` 经常是空串，只靠它就只剩 `QQ表情|id=66` —— 模型不认识数字。
+        // 查 QQ 内置表情表补名字；查不到就照旧只留 id。
         const id = cleanText(segment.id);
+        const name = compactText(segment.name || segment.summary || segment.text, 40)
+            || resolveQqFaceName(id);
         return `QQ表情${name ? `:${name}` : ''}${id ? `|id=${id}` : ''}`;
+        // <<< qq-face-names patch <<<
     }
     if (type === 'mface') {
         const summary = compactText(segment.summary || segment.name || segment.text, 40);

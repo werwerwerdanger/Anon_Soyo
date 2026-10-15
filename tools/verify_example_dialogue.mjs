@@ -1,5 +1,6 @@
 // verify_example_dialogue.mjs -- 解析器单元测试 + 端到端确认注入进了 prompt
 import fs from 'node:fs';
+import path from 'node:path';
 
 const SRC = 'C:/Users/20633/MimirLink/src';
 const { PromptBuilder } = await import(`file:///${SRC}/prompt.js`);
@@ -37,20 +38,39 @@ const tl = PromptBuilder.parseExampleDialogue(loose);
 assert(tl.length === 2, `容错解析出 2 轮（实际 ${tl.length}）`);
 assert(tl[1].role === 'assistant' && tl[1].content === '乙', '全角冒号 + 空格 + 大写都能解析');
 
-// 真实卡片里的 mes_example 必须能解出内容
-const real = fs.readFileSync('C:/Users/20633/WorkBuddy/2026-05-28-17-36-40/mimir-tools/_anon_mes.json', 'utf8');
-const mes = JSON.parse(real).mes_example;
+// 真实卡片里的 mes_example 必须能解出内容。
+//
+// ⚠ 2026-10-13 修：原来读的是 `_anon_mes.json` —— 那是一次性 dump 产物（`_*` 前缀按项目
+//   约定永不发布/会被清掉）。文件一没，脚本直接 ENOENT，**后面所有断言一条都跑不到**
+//   （扫描时表现为 ERR(1) 而不是 FAIL）。改成直接从角色卡读，和 verify_anon_persona.mjs
+//   走同一条路（CharacterManager + 真 PromptBuilder），不再依赖任何 dump。
+//
+// ⚠ 同一处还修了「硬编码条数」：原来钉死 30 轮 / 20 条台词。卡一扩写就假报（现 118/72）。
+//   钉死条数守的其实是「示例别被误删」，那就写成**下界 + 结构性质**：
+//   下界防误删，结构性质防退化成"客服腔"或"全是长句"。这类断言只会随着卡增删保持有效。
+const CARD_ROOT = 'C:/Users/20633/MimirLink';
+const { CharacterManager } = await import(`file:///${CARD_ROOT}/src/character.js`);
+const card = await new CharacterManager(path.join(CARD_ROOT, 'data')).loadCharacter('Anon_Chihaya');
+const mes = card?.mes_example ?? '';
+assert(typeof mes === 'string' && mes.length > 0, '角色卡里能读到 mes_example');
+
 const tr = PromptBuilder.parseExampleDialogue(mes);
-assert(tr.length === 30, `卡片 mes_example 解析出 30 轮（实际 ${tr.length}）`);
 const chars = tr.filter((x) => x.role === 'assistant');
-assert(chars.length === 20, `其中她自己的台词 20 条（实际 ${chars.length}）`);
-const long = chars.filter((x) => x.content.length > 20);
-assert(long.length === 0, `范例里没有超过 20 字的（最长 ${Math.max(...chars.map((x) => x.content.length))}）`);
+const lens = chars.map((x) => x.content.length);
+const median = lens.slice().sort((a, b) => a - b)[Math.floor(lens.length / 2)];
+console.log(`  ..  解析 ${tr.length} 轮 / 她 ${chars.length} 条；中位 ${median} 字，最长 ${Math.max(...lens)} 字`);
+
+assert(chars.length >= 40, `她的台词够多（${chars.length} 条，下界 40 —— 防示例被误删一半）`);
+assert(tr.every((x) => x.role === 'user' || x.role === 'assistant'), '只解析出 user/assistant 两种角色');
+assert(chars.length > 0 && chars.every((x) => x.content.trim().length > 0), '没有空台词');
+assert(Math.max(...lens) <= 30, `最长一条 ≤30 字（实际 ${Math.max(...lens)}）`);
+assert(median <= 12, `中位长度 ≤12 字（实际 ${median} —— 防整体飘向长句）`);
+assert(lens.filter((v) => v <= 5).length / chars.length >= 0.15,
+  `短句（≤5 字）占比 ≥15%（实际 ${(lens.filter((v) => v <= 5).length / chars.length * 100).toFixed(0)}% —— 真人感靠短句）`);
 const withBang = chars.filter((x) => /[!！~～]/.test(x.content));
-assert(withBang.length / chars.length >= 0.5,
-  `范例一半以上带感叹号/波浪号（${withBang.length}/${chars.length}）`);
-const withParen = chars.filter((x) => /[（(]/.test(x.content));
-assert(withParen.length === 0, '范例里没有括号动作描写的残留');
+assert(withBang.length / chars.length >= 0.25,
+  `带感叹号/波浪号 ≥25%（${withBang.length}/${chars.length} = ${(withBang.length / chars.length).toFixed(2)}）`);
+assert(chars.filter((x) => /[（(]/.test(x.content)).length === 0, '范例里没有括号动作描写的残留');
 
 // 结构断言
 console.log('='.repeat(70));

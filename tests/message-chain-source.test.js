@@ -55,11 +55,14 @@ test('real chat path keeps reasoning available but does not send it to QQ by def
     assert.ok(source.includes('【思维链】'));
     assert.ok(source.includes('【正文】'));
     assert.ok(source.includes('const sendReasoningToQQ = config.chat?.sendReasoningToQQ === true;'));
-    assert.ok(source.includes('const replyToSend = sendReasoningToQQ && reasoningContent'));
+    // 思考显示改成"配置 + /思考 热开关"两路合流后，判定收敛到 reasoningIncluded。
+    // 默认仍然不带：chat.showThinking.enabled=false 且没有热开关覆盖时 reasoningIncluded 恒为 false。
+    assert.ok(source.includes('const reasoningIncluded = reasoningDisplay !== \'none\' && !!reasoningContent;'));
     assert.ok(source.includes('reasoningAvailable: !!reasoningContent'));
-    assert.ok(source.includes('sendReplyIncludesReasoning: sendReasoningToQQ && !!reasoningContent'));
-    assert.ok(source.includes('includeReasoningContent: sendReasoningToQQ && !!reasoningContent'));
-    assert.ok(source.includes('await dispatchReply(event, replyToSend, { forceSingleMessage: sendReasoningToQQ && !!reasoningContent })'));
+    assert.ok(source.includes('sendReplyIncludesReasoning: reasoningIncluded'));
+    assert.ok(source.includes('includeReasoningContent: reasoningIncluded'));
+    assert.ok(source.includes('await dispatchReply(event, replyToSend, {'));
+    assert.ok(source.includes('forceSingleMessage: reasoningIncluded,'));
     assert.ok(source.includes('dispatchReplyWithDeps(event, processedReply, options'));
     assert.ok(replyDispatcherSource.includes('const splitMessage = options.forceSingleMessage ? false : config.chat.splitMessage !== false;'));
 });
@@ -75,7 +78,7 @@ test('real chat path sends voice records instead of full text when TTS is enable
 
 test('real chat path preserves mention-only and other-user mentions for AI context', () => {
     assert.ok(source.includes("promptText: '[@全体成员] '"));
-    assert.ok(source.includes("`[@${name ? `${name}|` : ''}QQ:${qq}] `"));
+    assert.ok(source.includes("`[@${mentionName}|QQ:${qq}] `"));
     assert.ok(source.includes("? '[@bot] '"));
     assert.ok(source.includes('const onlyAtBot = isAtMe'));
     assert.ok(source.includes('只@了bot，没有附加文字'));

@@ -328,6 +328,82 @@ Claude Code 挂载（`.claude/settings.json`，配置了令牌时需带 Authoriz
 - 管理员可使用 `/戳一戳 @某人` 让 bot 对目标连续戳一戳 5 下，命令文本和次数可在 `chat.commands.adminPoke` 中配置
 - 配置开关：`chat.emojiReaction` / `chat.pokeReaction` / `chat.commands.adminPoke.enabled`
 
+### 人物类管理指令（管理员）
+
+三个指令都只对 `chat.adminUsers` 生效；命令文本可在 `chat.commands.*.command` 里改。
+
+- **`/名册`** —— 列出"她认识谁"。输出形态是 **`QQ号：别称、别称`**（当前昵称在最前，曾用名跟在后面）。
+  只列 QQ 是因为昵称做不了键：实测同一个 QQ 出现过两个昵称，两个不同 QQ 又叫过同一个昵称。
+  数据来自持久表 `participant_contacts`（与 `messages` 的摘要清理解耦，被摘要删掉的历史不会让人从名单里消失）。
+  - `/名册 <关键词>` 按 QQ 或别称过滤（大小写不敏感）
+  - `chat.commands.roster.maxEntries`（默认 100）截断时正文里会写明还有多少人没列
+  - `chat.commands.roster.maxAliases`（默认 8）控制每人显示几个别称
+- **`/忘记 <昵称|QQ>`**（也支持 `/忘记 @某人`）—— 让她不再认得这个人。删两处：
+  `participant_contacts` 那一行，以及 `memory_entries` 里他署名过的副本。
+  **不删 `messages`**（群历史是批量合并存的，一条里混着好几个人的发言，按作者删会连累别人），
+  **也不删 `summaries`**（摘要里混着多人的事，且会随时间自然滚掉）——回执里会写清这一点。
+  - 昵称撞车时会列出候选并要求改用 QQ 号，不会自作主张挑一个删
+  - 开关：`chat.commands.roster` / `chat.commands.forget`
+
+### 用括号显示思考内容
+
+把模型返回的 `reasoning_content` 用括号附在回复后面，调试用（默认关）。
+
+- 形态：`正文\n（思考：<reasoning>）`。`chat.showThinking.label` 写成 `""` 会去掉"思考："，
+  变成纯括号的心理活动式；`position: "before"` 可把思考放到正文前面。
+- `chat.showThinking` 字段：`enabled` / `format`（`paren` 括号｜`debug` 旧分节格式）/
+  `label` / `maxChars`（0 = 不截断）/ `position` / `scope`（`all`｜`private`｜`group`）。
+- 面板上有「用括号显示思考内容」勾选框；也可以直接发 **`/思考 开`** 临时打开
+  （`/思考 关` 关闭、`/思考 配置` 回到配置默认、不带参数查当前状态）。
+  热开关只存在内存里，重启后回到配置默认值。
+- 旧的 `chat.sendReasoningToQQ`（`【思维链】/【正文】` 分节格式）仍然保留，优先级更高。
+- 两种格式都会强制单条发送（`forceSingleMessage`），否则括号会被 `splitMessage` 拆到两条消息里。
+
+### 指令清单 `/帮助`
+
+管理员发 `/帮助` 看全部指令，普通用户看到的是精简版（只列自己能用的）。
+带关键词只看相关几条：`/帮助 点歌`、`/帮助 名册`。
+
+- **指令在群聊里需要 @ 机器人**才会执行（私聊直接发即可）。指令是绕过触发规则的
+  （它们在 `buildRoutingDecision` 之前），所以单独设了一道 `commandGate`；
+  否则任何群友随手打一个 `/帮助` 都能让它开口。
+- ⚠ 实现上注意：群里 @ 之后 `plainText` 会以 `[@bot] ` 开头，指令匹配用的是
+  **剥掉开头 @ 标记**的 `commandInput`（`stripLeadingAtMarkers()`）——
+  否则"必须 @"和"@ 了匹配不上"会互相打架，结果是群里指令一次都不响应。
+  `/llm`、点歌以及所有管理指令都走这个口径。
+- **指令名和开关都是从 `config` 实时解析的**，不写死在文本里 —— 你把 `/名册` 改成
+  `/花名册`、或者把 `chat.music.enabled` 关掉，帮助文本会跟着变。写死字符串的帮助
+  一定会腐烂，而且没人会记得去同步。
+- 关掉的指令**照样列出但标注「未启用」**，不会藏起来（藏起来会让人以为功能没了）。
+- 「触发方式」那一节也是现算的：按 `chat.requireAtInGroup` / `chat.triggerKeywords` /
+  `chat.replyWindow` 拼出当前实际口径，省得猜为什么群里说话它不理。
+- 帮助面向所有人，所以和点歌一样**过访问控制**；未授权的群/人**静默返回**，
+  不回「你没权限」（那本身就是信息泄露）。
+- 开关：`chat.commands.help` / `chat.commands.help.enabled`。
+
+### OJ 反馈轮询转发
+
+把 OJ 首页「提交建议 / 提交错误」的新反馈拉到 QQ：**原文 + 角色补一句话**。默认关闭。
+
+- 走 OJ 现成的管理端接口 `GET /api/admin/feedback`，**本机主动拉**，所以不需要任何入站可达性
+  （不用开隧道、不用让服务器推过来）。轮询间隔 `intervalMs`，默认 60s。
+- 配置在顶层 `ojFeedback`：`enabled` / `baseUrl` / `username` / `password` / `intervalMs` /
+  `timeoutMs` / `notifyPrivate` / `notifyGroups` / `aiComment` / `maxPerPoll` /
+  `maxContentChars` / `stateFile`。
+- 接口要求管理员身份，所以账号必须有 `is_admin`。**别用 ROOT**：建一个专用账号
+  （可以只给 `is_admin`、不给 `is_super_admin`），吊销时删账号/改密码即可，
+  不用碰 `SECRET_KEY` 或别人的密码。密码放在 `config.json`（该文件不进 git、
+  发布管线也不会带上它）；`config.example.json` / `configs/*.json` 里必须留空。
+- 通知目标：私聊取 `chat.adminUsers` 里的所有人（`notifyPrivate`），群取 `notifyGroups`。
+- **首次运行不会回补**：状态文件不存在时把游标直接对齐到当前最大 id，一条都不发 ——
+  否则一启用就会把历史反馈一次性糊到群里。游标存在 `stateFile`（默认
+  `data/oj-feedback-state.json`，已在 `.gitignore` 里）。
+- 转发失败的那条**不推进游标**，下一轮重试；单轮最多发 `maxPerPoll` 条，剩下的留到下一轮。
+- 补话失败（模型超时等）会退化成**只发原文**，不会因为补话失败把整条通知拦下来。
+- 管理员可以发 **`/反馈`** 看状态（开关 / 游标 / 上次成功 / 最近错误 / 通知目标），
+  **`/反馈 拉`** 立刻拉一次并转发。
+- 开关：`ojFeedback.enabled` / `chat.commands.ojFeedback.enabled`。
+
 ### 靶场伪造记忆
 - 工具面板粘贴对话历史，模拟继承记忆测试
 - MCP `range_test` 支持 `fakeHistory` 参数

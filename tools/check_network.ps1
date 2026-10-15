@@ -3,7 +3,7 @@
 # WHY THIS EXISTS:
 #   Reachability tests run from inside the AI sandbox are UNRELIABLE.
 #   The sandbox forces all outbound HTTP through a local proxy
-#   (HTTP_PROXY=http://127.0.0.1:52512). In direct mode the sandbox blocks
+#   (HTTP_PROXY=http://127.0.0.1:<port>). In direct mode the sandbox blocks
 #   everything, including github.com. So "public SearXNG instances time out"
 #   measured in the sandbox may simply be proxy policy, not your real ISP.
 #

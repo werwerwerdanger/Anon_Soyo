@@ -1,3 +1,8 @@
+// >>> builtin-face-split patch >>>
+// `face` 段的 name 常为空，需要 id→中文名。qq-interactions.js 零依赖，不会成环。
+import { resolveQqFaceName } from './qq-interactions.js';
+// <<< builtin-face-split patch <<<
+
 function cleanText(value) {
     return String(value ?? '').replace(/\r/g, '').trim();
 }
@@ -34,15 +39,46 @@ function getSegmentTypes(event = {}) {
         .filter(Boolean);
 }
 
+// >>> builtin-face-split patch >>>
+// 2026-10-11 用户：「把内置表情从『默认无视表情包』里摘出来」。
+// 起因：连发两个爱心，她只回「来了来了」「怎么了~」。
+// 分两类（之前是一视同仁的）：
+//   - **真·表情包** = 自制的图片/大表情/动画表情（`image`/`mface`/`marketface`）
+//     ⇒ 保持 2026-10-10 的规则：默认无视、走 `chat.stickerReplyChance` 低意愿。
+//   - **QQ 自带表情** = `face`（爱心/赞/心碎…）—— 它有**确定语义**，
+//     和一张自制表情包不是一回事 ⇒ 当成"短的、有意义的一句话"对待。
+//     ⚠ 光有名字还不够：`face` 段的 `name` 常常是空串（实测
+//     `{"type":"face","id":"66","name":""}`），得靠 qq-interactions.js 的
+//     `resolveQqFaceName()` 把 id 翻成中文名（同日已修）。
+const STICKER_SEG_TYPES = ['image', 'mface', 'marketface'];
+const BUILTIN_FACE_SEG_TYPES = ['face'];
+
 function hasEmojiSegment(event = {}) {
     // >>> image-as-sticker patch (managed by patch_image_as_sticker.py) >>>
     // QQ 的表情包/动画表情在 OneBot 里是 image 段（summary: [动画表情]），
     // 不是 face/mface/marketface。只认后三个会让「收图」这条路径完全不生效：
     // emoji_reaction 意图不触发 ⇒ 对应策略和警告都不会出现（2026-10-10 实测踩到）。
-    return getSegmentTypes(event).some((type) =>
-        ['face', 'mface', 'marketface', 'image'].includes(type));
+    return getSegmentTypes(event).some((type) => STICKER_SEG_TYPES.includes(type));
     // <<< image-as-sticker patch <<<
 }
+
+function hasBuiltinFaceSegment(event = {}) {
+    return getSegmentTypes(event).some((type) => BUILTIN_FACE_SEG_TYPES.includes(type));
+}
+
+/** 这条消息里的 QQ 自带表情叫什么（查 id→中文名；查不到就不提名字，绝不瞎猜）。 */
+function getBuiltinFaceNames(event = {}) {
+    const out = [];
+    for (const segment of Array.isArray(event.segments) ? event.segments : []) {
+        if (cleanText(segment?.type) !== 'face') continue;
+        const explicit = cleanText(segment?.name || segment?.summary || segment?.text);
+        const name = explicit || resolveQqFaceName(segment?.id ?? segment?.data?.id);
+        if (name && !out.includes(name)) out.push(name);
+    }
+    return out;
+}
+// <<< builtin-face-split patch <<<
+
 
 function hasOnlyNonTextSegments(event = {}) {
     const segments = Array.isArray(event.segments) ? event.segments : [];
@@ -78,6 +114,13 @@ function detectIntent({ event, text }) {
     if (event?.reply?.toBot === true) return 'reply_to_bot';
     if (isCallOut(text)) return 'call_out';
     if (hasEmojiSegment(event)) return 'emoji_reaction';
+    // >>> builtin-face-split patch >>>
+    // QQ 自带表情（爱心/赞/心碎…）**且整条没有文字** ⇒ 当成"有意义的一小句"。
+    // ⚠ 必须要求 hasOnlyNonTextSegments：文字里夹个爱心（"在吗[爱心]"）就是普通消息，
+    //   不该走这条。
+    // ⚠ 放在 hasEmojiSegment **之后**：图 + 爱心混着发时，图的规则优先。
+    if (hasBuiltinFaceSegment(event) && hasOnlyNonTextSegments(event)) return 'builtin_face';
+    // <<< builtin-face-split patch <<<
     if (isTopicShift(text)) return 'topic_shift';
     if (looksLowInformation(text, event)) return 'low_information';
     if (/[?？]$/.test(normalizeText(text))) return 'question';
@@ -115,6 +158,13 @@ function buildStrategies({ event, text, intent, routing }) {
         // <<< sticker-strategy-ignore patch <<<
     }
     // <<< sticker-react patch <<<
+    // >>> builtin-face-split patch >>>
+    // 策略名是**原样喂给模型**的，所以名字本身就是指令。
+    // 这里刻意不写 'ignore_...' —— 内置表情是要回应的。
+    if (intent === 'builtin_face') {
+        strategies.push('respond_to_builtin_face_in_character');
+    }
+    // <<< builtin-face-split patch <<<
     if (intent === 'low_information' || intent === 'call_out') {
         strategies.push('give_short_acknowledgement');
         strategies.push('avoid_question_as_crutch');
@@ -131,7 +181,7 @@ function buildStrategies({ event, text, intent, routing }) {
     return [...new Set(strategies)];
 }
 
-function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '' }) {
+function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '', participantRosterMention = '', stickerHint = '' }) {
     const warnings = [];
     if (event?.reply?.fetchStatus === 'failed') {
         warnings.push(`引用消息获取失败: ${event.reply.fetchReason || 'unknown'}`);
@@ -168,6 +218,14 @@ function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanSh
     if (shapeText) warnings.push(shapeText);
     // <<< human-shape patch <<<
     // <<< style-anchor-config patch <<<
+    // >>> sticker-send patch >>>
+    // 放在语气/长度锚点**之后**、意图类警告**之前**：
+    // 它是"能力说明 + 格式要求"，要看得见，但不该挤掉长度锚点"最后读到"的位置。
+    {
+        const hintText = typeof stickerHint === 'string' ? stickerHint.trim() : '';
+        if (hintText) warnings.push(hintText);
+    }
+    // <<< sticker-send patch <<<
     // >>> sticker-react patch (managed by patch_sticker_react.py) >>>
     if (intent === 'emoji_reaction') {
         // >>> sticker-default-ignore patch >>>
@@ -184,7 +242,25 @@ function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanSh
         // <<< sticker-default-ignore patch <<<
     }
     // <<< sticker-react patch <<<
+    // >>> builtin-face-split patch >>>
+    // QQ 自带表情要说清"它是有意思的"，否则容易像表情包一样被无视/被描述。
+    // ⚠ 用肯定式；⛔ 不写"别忽略它"（否定句 = 二次 priming）。
+    // ⚠ 不给照样句（本项目规律：给引号例句会被逐字搬用）。
+    if (hasBuiltinFaceSegment(event)) {
+        const names = getBuiltinFaceNames(event);
+        warnings.push('QQ 自带表情是有意思的'
+            + `${names.length ? `（这里的是「${names.join('、')}」）` : ''}`
+            + ' —— 按它的意思接话就行，不用描述它长什么样。');
+    }
+    // <<< builtin-face-split patch <<<
     // <<< length-anchor patch <<<
+    // >>> participant-roster patch >>>
+    // 放在**最后**：这一行是模型产出回复前读到的最后一段 system 文本（杠杆最高）。
+    // 触发条件很窄 —— 只有"对方提到的人正好在你联系人名单里"时才出现，没命中不注入。
+    if (participantRosterMention) {
+        warnings.push(participantRosterMention);
+    }
+    // <<< participant-roster patch <<<
     return warnings;
 }
 
@@ -232,9 +308,17 @@ export function buildCurrentMessageFocus(runtimeContext = {}, options = {}) {
             // >>> style-anchor-config patch <<<
             styleAnchor: options.styleAnchor || '',
             // >>> human-shape patch >>>
-            humanShapeHint: options.humanShapeHint || ''
+            humanShapeHint: options.humanShapeHint || '',
             // <<< human-shape patch <<<
             // <<< style-anchor-config patch <<<
+            // >>> participant-roster patch >>>
+            participantRosterMention: options.participantRosterMention || '',
+            // <<< participant-roster patch <<<
+            // >>> sticker-send patch >>>
+            // 她能**发**表情包了：这里告诉她标记怎么写 + 库里有哪几个类别。
+            // 只在库非空时才有内容（空库还教她发就是让她写一个发不出去的标记）。
+            stickerHint: options.stickerHint || ''
+            // <<< sticker-send patch <<<
         })
     };
 

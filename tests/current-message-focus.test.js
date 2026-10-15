@@ -90,7 +90,25 @@ test('focus detects QQ emoji-only style inputs', () => {
 
     assert.equal(focus.intent, 'emoji_reaction');
     assert.equal(focus.isEmojiOnly, true);
-    assert.ok(focus.strategies.includes('describe_visible_emoji_or_mood'));
+    // 2026-10-11 语义变更：真·表情包（mface/marketface/image）改成「默认无视、继续聊文字」，
+    // 策略名由 describe_visible_emoji_or_mood 换成了 ignore_sticker_keep_talking_about_text。
+    assert.ok(focus.strategies.includes('ignore_sticker_keep_talking_about_text'));
+    assert.ok(!focus.strategies.includes('describe_visible_emoji_or_mood'));
+});
+
+test('focus treats built-in QQ faces as their own intent (not a sticker)', () => {
+    const focus = buildCurrentMessageFocus({
+        primaryStandardEvent: baseEvent({
+            contentText: '[QQ表情:爱心]',
+            segments: [{ type: 'face', id: '66', name: '' }],
+            routing: { shouldRespond: true, triggerReason: 'at', skipReason: '' }
+        })
+    });
+
+    assert.equal(focus.intent, 'builtin_face');
+    assert.ok(focus.strategies.includes('respond_to_builtin_face_in_character'));
+    // 自带表情不被"表情包低意愿"那套策略管
+    assert.ok(!focus.strategies.includes('ignore_sticker_keep_talking_about_text'));
 });
 
 test('focus releases old topic on explicit topic shift', () => {

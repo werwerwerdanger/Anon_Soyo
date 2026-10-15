@@ -70,10 +70,22 @@ for (const [inst, label] of CASES) {
         extractFunction(src, 'toComparableId'),
         extractFunction(src, 'isAllowed'),
         extractFunction(src, 'isTriggerUser'),
+        // 🔴 2026-10-13 补：`accept()` 里调了 coBotYieldMarkSpoken / coBotYieldNoteCoBot，
+        //    它们又依赖 coBotYieldState(Map) —— 以前这些都没进求值环境，脚本一起跑就 ReferenceError。
+        'const coBotYieldState = new Map();',
+        extractFunction(src, 'coBotYieldNoteCoBot'),
+        extractFunction(src, 'coBotYieldDecision'),
+        extractFunction(src, 'coBotYieldMarkSpoken'),
         extractFunction(src, 'buildRoutingDecision'),
         'return { buildRoutingDecision };',
     ].join('\n');
-    const { buildRoutingDecision } = new Function(code)();
+    // 🔴 2026-10-13 修：`buildRoutingDecision` 里调了 `isNapcatNoise`（napcat-output-ignore patch），
+    //    而它是 `import` 进来的 —— `new Function` 的环境里没有 import ⇒ **ReferenceError**。
+    //    也就是说：**这个脚本自 napcat 补丁之后一直是坏的**，一直没真正跑过
+    //    （它可是"群聊触发口径的唯一可信验证"，坏了就意味着那段逻辑一直没被回归）。
+    //    修法：把真函数当参数注入，别用 stub（stub 会让相关用例永远假通过）。
+    const { isNapcatNoise } = await import(`file:///${ROOT}/src/napcat-output.js`);
+    const { buildRoutingDecision } = new Function('isNapcatNoise', code)(isNapcatNoise);
 
     const kw = config.chat.triggerKeywords[0];
     // 表情包断言按概率 ⇒ 测试里必须把概率钉死，否则会飘
@@ -81,7 +93,12 @@ for (const [inst, label] of CASES) {
     cfgStickerOn.chat.stickerReplyChance = 1;
     const cfgStickerOff = JSON.parse(JSON.stringify(config));
     cfgStickerOff.chat.stickerReplyChance = 0;
-    const seg = (t) => [{ type: t }];
+    // ⚠ 2026-10-13 修：原来这里只造 `{ type: t }`，**造不出表情包**。
+    //    `isStickerImageSegment()` 认 `summary`（如「[动画表情]」）或 `subType=1`，
+    //    两者都没有 ⇒ 判成"上传的图" ⇒ `isStickerOnlyMessage()` 返回 false。
+    //    后果：**所有名叫 sticker 的用例其实一直在测"上传的图"**，
+    //    表情包低意愿那段逻辑一次都没被跑到（长期 FAIL 的 `sticker chance=0 (私聊)` 就是它）。
+    const seg = (t) => [{ type: t, summary: '[动画表情]' }];
     const scenarios = [
         ['group  @bot                 ', { message_type: 'group', group_id: 1, user_id: 2 }, 'hi', true, {}, true],
         [`group  mentions "${kw}"        `, { message_type: 'group', group_id: 1, user_id: 2 }, `你们觉得${kw}怎么样`, false, {}, true],
@@ -150,6 +167,42 @@ for (const [inst, label] of CASES) {
     // group-repeat suppression: the SAME line said twice in one group must not trigger
     // twice, even when it contains a trigger keyword (that is the whole point -- before
     // this check sat after the keyword branch and therefore never fired).
+    // 🔄 2026-10-13 新增：回复窗口 × 纯表情包（chat.replyWindow.stickersTrigger）
+    // 起因：群里连着聊时窗口一直开着，用户发个动画表情她也回，看起来像"不描述表情包"失效。
+    // 真相是窗口在表情包检查**之前**就 accept 了（原意是"聊到一半发个表情包不该被概率掐掉"）。
+    // 现在 stickersTrigger=false ⇒ 窗口只对"带真文字"的消息生效。
+    const cfgWinStickerOff = JSON.parse(JSON.stringify(config));
+    cfgWinStickerOff.chat.replyWindow = { ...(cfgWinStickerOff.chat.replyWindow || {}), stickersTrigger: false };
+    cfgWinStickerOff.chat.stickerReplyChance = 0;   // 钉死概率，否则结果会飘
+    const cfgWinStickerOn = JSON.parse(JSON.stringify(cfgWinStickerOff));
+    cfgWinStickerOn.chat.replyWindow.stickersTrigger = true;
+    const winCases = [
+        // ⚠ 三个坑，都在我第一版用例里踩过：
+        //  1) 必须用**群聊** —— 私聊有独立的 accept 分支（reason=private）无条件放行，
+        //     走不到窗口/表情包这段（事故也发生在群里）。
+        //  2) `hints` 是**第 6 个参数**（第 5 个是 messageInfo）！传错位置 ⇒
+        //     `hints.replyWindowOpen` 恒为 undefined ⇒ 窗口分支永不进入（假失败）。
+        //  3) 每个用例要换**不同的群号 + 文本** —— 同群同样的话说第二遍会被复读闸门
+        //     挡成 `repeated_text`，污染结果。
+        ['窗口开 + stickersTrigger=false + 纯表情包 → 不回', cfgWinStickerOff, 9001, PLACEHOLDER,
+            { messageSegments: [...txtSeg(PLACEHOLDER), ...seg('image')] }, true, false],
+        ['窗口开 + stickersTrigger=false + 带文字   → 回', cfgWinStickerOff, 9002, '在吗在吗',
+            { messageSegments: txtSeg('在吗在吗') }, true, true],
+        ['窗口开 + stickersTrigger=true(旧行为) 表情包 → 回', cfgWinStickerOn, 9003, PLACEHOLDER,
+            { messageSegments: [...txtSeg(PLACEHOLDER), ...seg('image')] }, true, true],
+        ['窗口开 + 被明确回复时表情包仍回（关着也回）', cfgWinStickerOff, 9004, PLACEHOLDER,
+            { replyToBot: true, messageSegments: [...txtSeg(PLACEHOLDER), ...seg('image')] }, true, true],
+        ['没窗口 + sticker 关着 + 群纯表情包 → 不回(基线)', cfgWinStickerOff, 9005, PLACEHOLDER,
+            { messageSegments: [...txtSeg(PLACEHOLDER), ...seg('image')] }, false, false],
+    ];
+    for (const [label2, cfg, gid, text, msgInfo, winOpen, expected] of winCases) {
+        const d = buildRoutingDecision(cfg, { message_type: 'group', group_id: gid, user_id: 878787 },
+            text, false, msgInfo, { replyWindowOpen: winOpen });
+        const ok = d.shouldRespond === expected;
+        if (!ok) failed++;
+        console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label2} respond=${String(d.shouldRespond).padEnd(5)} reason=${(d.triggerReason || d.skipReason)}`);
+    }
+
     const repeatText = `${kw} ${kw}`;
     const ev1 = { message_type: 'group', group_id: 555, user_id: 11 };
     const ev2 = { message_type: 'group', group_id: 555, user_id: 22 };

@@ -20,26 +20,93 @@
 
 const sessions = new Map();
 
-/** 某会话上一轮的静默窗口还没到就又有新消息进来了 */
-export function noteInbound(sessionKey) {
+/**
+ * 归一化：去掉占位文本（[图片]/[动画表情]）、空白、标点，小写。
+ * 只用于**词面**比较，不假装懂语义。
+ */
+function normalizeForCompare(text) {
+    return String(text || '')
+        .replace(/\[[^\]]{0,12}\]/g, ' ')
+        .replace(/[\s\p{P}\p{S}]/gu, '')
+        .toLowerCase();
+}
+
+function bigrams(s) {
+    const out = new Set();
+    for (let i = 0; i + 1 < s.length; i++) {
+        out.add(s.slice(i, i + 2));
+    }
+    return out;
+}
+
+/**
+ * 新消息是不是**换了话题**（用来决定要不要作废在途回复）。
+ *
+ * 🔴 为什么这么保守（2026-10-13）：
+ * 原来的逻辑是「只要有新消息就作废在途回复」，用户实测**私聊被作废 17 次** ——
+ * 连打时每来一句就吃掉上一句已经生成好的回复，用户看到的是**漏答 + 跳答**
+ * （他自己发了「你是不是又死了」）。所以改成：
+ *   - **判不出来 = 当作"接着说" = 不作废**（宁可多发一句同话题的，也别漏答）；
+ *   - 只有「新消息够长 **且** 与本轮目标文本**词面零重叠**」才判换话题。
+ *
+ * ⚠ 局限（必须承认）：同一件事可以零词面重叠（「室友问了句 are you ok」→「但是我没有朋友啊」），
+ *   这种会被误判成"换话题"而作废。**词面判语义本来就不可靠**，所以阈值取得保守：
+ *   宁可在"真换话题"时偶尔多发一句旧话题，也不要常态漏答。
+ *   短句（< minChars）一律当"接着说" —— 「嗯」「不知道」这类本来就没话题信息。
+ */
+export function isTopicSwitch(roundText, newText, { minChars = 8 } = {}) {
+    const n = normalizeForCompare(newText);
+    if (n.length < minChars) return false;
+    const r = normalizeForCompare(roundText);
+    if (!r) return false;
+    const rb = bigrams(r);
+    for (const g of bigrams(n)) {
+        if (rb.has(g)) return false;      // 有任何重叠 ⇒ 接着说
+    }
+    return true;                          // 够长 + 零重叠 ⇒ 换话题
+}
+
+/**
+ * 某会话来了一条新消息。
+ * @param {string} sessionKey
+ * @param {string} newText 新消息文本（用于判有没有换话题；缺省时按"接着说"处理，即不作废）
+ */
+export function noteInbound(sessionKey, newText = '') {
     if (!sessionKey) return;
     const state = sessions.get(sessionKey) || {};
     state.lastInboundAt = Date.now();
-    // 已经有在途回复 ⇒ 作废它（它生的是上一轮的内容，不能再发）
+    // 已经有在途回复 ⇒ 只有**换了话题**才作废它。
+    // 原来是无条件作废；改成条件作废后，连打时不再吃掉上一句的回复（用户 2026-10-13 要求）。
     if (state.active) {
-        state.superseded = true;
+        if (isTopicSwitch(state.roundText, newText)) {
+            state.superseded = true;
+            state.supersededReason = 'topic_switch';
+        } else {
+            state.supersededReason = 'related_keep';
+        }
     }
     sessions.set(sessionKey, state);
 }
 
-/** 一轮回复开始（无论是提前 flush 还是正常 flush） */
-export function beginReply(sessionKey, holdUntilTs) {
+/**
+ * 一轮回复开始（无论是提前 flush 还是正常 flush）
+ * @param {string} roundText 本轮正在回的那些消息的文本（用于跟新消息比"是否换话题"）
+ */
+export function beginReply(sessionKey, holdUntilTs, roundText = '') {
     if (!sessionKey) return;
     const state = sessions.get(sessionKey) || {};
     state.active = true;
     state.superseded = false;
+    state.supersededReason = '';
+    state.roundText = String(roundText || '');
     state.holdUntil = Math.max(0, Number(holdUntilTs) || 0);
     sessions.set(sessionKey, state);
+}
+
+/** 供日志用：为什么没作废 / 为什么作废 */
+export function getSupersededReason(sessionKey) {
+    const state = sessionKey ? sessions.get(sessionKey) : null;
+    return state ? (state.supersededReason || '') : '';
 }
 
 export function endReply(sessionKey) {

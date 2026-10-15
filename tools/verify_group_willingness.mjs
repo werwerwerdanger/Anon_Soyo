@@ -36,15 +36,34 @@ for (const SRC of DIRS) {
   // ⇒ 不能当单一表达式求值，要当函数体跑，再 return 出来。
   const isStickerOnlyMessage = new Function(`${helper}\nreturn isStickerOnlyMessage;`)();
 
+  // ⚠ 2026-10-13 修：这组夹具写在两个改动**之前**，四处期望值已经和现行口径相反：
+  //   ① 夹具用 `{ type: 'image' }`（**没有 summary**）来表示"表情包"——
+  //      但 sticker-vs-image patch 之后，`summary` 为空 + 没有 `subType` 意味着
+  //      **用户上传的图/截图**，不是表情包 ⇒ 整条不该算"纯表情包"。
+  //      夹具要写真表情包就得带上 `summary: '[动画表情]'`（实测的真实形状）。
+  //   ② `face`（小黄脸）期望 true —— 但 builtin-face-split patch 之后 `face` 已被
+  //      **故意**移出 `STICKER_SEG_TYPES`（2026-10-11 用户：「把内置表情从『默认无视
+  //      表情包』里摘出来」）⇒ 内置表情不该吃 stickerReplyChance 低意愿，期望 false。
+  //   顺带补上这次改动的**真事故**回归：舞萌成绩截图（summary 空）曾被判成表情包、
+  //   20% 概率丢掉、连库都没入 ⇒ 表现成"她不认识我朋友的成绩"。
   const cases = [
     ['纯动画表情', [{ type: 'image', summary: '[动画表情]' }], true],
-    ['图 + 占位文字[图片]', [{ type: 'image' }, { type: 'text', text: '[图片]' }], true],
-    ['小黄脸', [{ type: 'face' }], true],
-    ['图 + 真文字', [{ type: 'image' }, { type: 'text', text: '你看这张' }], false],
+    ['动画表情 + 占位文字[图片]',
+      [{ type: 'image', summary: '[动画表情]' }, { type: 'text', text: '[图片]' }], true],
+    ['mface（自制大表情）', [{ type: 'mface' }], true],
+    ['marketface（商店表情）', [{ type: 'marketface' }], true],
+    ['小黄脸（QQ 内置表情）——已被故意移出表情包集合', [{ type: 'face' }], false],
+    ['动画表情 + 真文字',
+      [{ type: 'image', summary: '[动画表情]' }, { type: 'text', text: '你看这张' }], false],
     ['纯文字', [{ type: 'text', text: '在吗' }], false],
     ['空段', [], false],
-    ['图 + 引用段', [{ type: 'reply' }, { type: 'image' }], true],
-    ['图 + at', [{ type: 'at' }, { type: 'image' }], true],
+    ['动画表情 + 引用段', [{ type: 'reply' }, { type: 'image', summary: '[动画表情]' }], true],
+    ['动画表情 + at', [{ type: 'at' }, { type: 'image', summary: '[动画表情]' }], true],
+    // 🔴 真事故回归：上传的图（summary 为空）不是表情包
+    ['上传的图（summary 空）', [{ type: 'image' }], false],
+    ['上传的成绩截图 + 真文字', [{ type: 'image' }, { type: 'text', text: '你看我成绩' }], false],
+    ['老客户端用 subType=1 标表情包', [{ type: 'image', subType: 1 }], true],
+    ['subType=0 ⇒ 上传的图', [{ type: 'image', subType: 0 }], false],
   ];
   for (const [label, segs, want] of cases) {
     const got = isStickerOnlyMessage({ messageSegments: segs });

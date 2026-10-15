@@ -1848,7 +1848,8 @@ test('message runtime handles participant profile admin manual command before no
     assert.ok(source.includes('user_id: speakerIdentity.participantId'));
     assert.ok(source.includes("triggeredBy: 'admin_command'"));
     assert.ok(source.includes('await dispatchReply(event, `已手动分析人物档案：'));
-    assert.ok(source.includes('if (await handleParticipantProfileManualCommand(event, plainText)) {'));
+    // 2026-10-12：同上，调用点改成 commandGate + commandInput
+    assert.ok(source.includes('if (await handleParticipantProfileManualCommand(event, commandInput)) {'));
 });
 
 test('message runtime handles admin proactive mention commands before normal trigger checks', () => {
@@ -1874,7 +1875,8 @@ test('message runtime handles admin proactive mention commands before normal tri
     assert.ok(source.includes("throw new Error('AI 未生成可发送内容');"));
     assert.ok(source.includes("await sendFailureMessage(event, `主动 @ 生成失败: ${error.message}`);"));
     assert.ok(source.includes('await bot.sendGroupMessage(event.group_id, buildMentionMessage(mentionedParticipant.participantId, messageText));'));
-    assert.ok(source.includes('if (await handleAdminMentionCommand(event, plainText)) {'));
+    // 2026-10-12：指令派发加了群聊 @ 闸门，实参换成 commandInput
+    assert.ok(source.includes('if (await handleAdminMentionCommand(event, commandInput)) {'));
 });
 
 test('message dispatch adds configurable CQ mention and skips quote reply for split group replies', () => {

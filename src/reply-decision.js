@@ -22,7 +22,8 @@ NO  = 不回
 
 默认是 NO。宁可少说一句，也不要为了刷存在感硬接一句。
 只有下面这些才回 YES：
-- 有人直接点了你的名字、@ 了你、或者直接问你；
+- 有人直接点了你的名字、@ 了你、或者直接问你 —— **这一条最优先**：只要这条成立就回 YES，
+  哪怕这件事你刚才已经答过、哪怕那句话很短、哪怕你觉得自己没什么新话可说；
 - 有人在跟你说话，是接着你上一条在说；
 - 话题就是你 —— 在议论你、夸你、损你、拿你开玩笑；
 - 你被挑衅、被骂，或者你该替谁出面（有人被欺负了）。
@@ -99,23 +100,55 @@ function decisionContentText(value) {
  * 「这一轮结束了没 / 换话题了没」是**序列判断** —— 没有历史就只能瞎猜，
  * 所以这里必须带上下文，并且标出说话人。
  */
+// >>> decision-at-marker patch >>>
+/**
+ * 这一条有没有直接 @ 到 bot。
+ *
+ * ⚠ 必须在 `stripStructuredHeader` **之前**判 —— 它会把 `[...]` 整段删掉，
+ * 而 @ 的标记有两种写法，**两种都会被吃掉**：
+ *   - 结构化头里的 `isAtBot:true`
+ *   - 正文前的 `[@bot]`（standard-event 的 readableText）
+ * 2026-10-11 实测事故：有人 @ 了爱音问一句话，决策层看到的只有
+ * `【刚进来的这条】werwer: 你觉得…怎么样`，**完全不知道被 @ 了**，
+ * 于是按提示词里那句「默认是 NO」判了 NO —— 被直接点名却不回。
+ * @ 是显式召唤，所以这个标记必须活到决策层看见。
+ */
+export function detectAtBot(raw) {
+    const s = text(raw);
+    if (!s) return false;
+    if (/isAtBot\s*:\s*true/i.test(s)) return true;
+    if (/\[@bot\]/.test(s)) return true;
+    // ⚠ 刻意**不认** `[CQ:at,qq=123]`：这里拿不到 bot 自己的 QQ，
+    //   认了就等于"群里 @ 谁都算 @ 了我"（会让她对每条 @别人的消息都插嘴）。
+    //   上面两个标记都是本 pipeline 权威产出的：
+    //   `isAtBot` 由 buildStructuredMessage 算，`[@bot]` 由 standard-event
+    //   在 `segment.isBot || qq === botSelfId` 时才写。
+    return false;
+}
+// <<< decision-at-marker patch <<<
+
 export function buildDecisionContext(recentMessages = [], plainText = '', limit = 10) {
     const lines = [];
     const list = Array.isArray(recentMessages) ? recentMessages : [];
     for (const message of list.slice(-limit)) {
         const raw = text(decisionContentText(message?.content));
         if (!raw) continue;
+        const atMe = detectAtBot(raw) ? '（@了我）' : '';
         const body = stripStructuredHeader(raw).slice(0, 160);
-        if (!body) continue;
+        // 纯 @ 没文字的也要留一行 —— 那也是"在叫你"
+        if (!body && !atMe) continue;
         if (message?.role === 'assistant') {
             lines.push(`我: ${body}`);
         } else {
-            lines.push(`${decisionSpeakerName(raw) || '某人'}: ${body}`);
+            lines.push(`${decisionSpeakerName(raw) || '某人'}${atMe}: ${body || '（只有 @，没有文字）'}`);
         }
     }
-    const now = stripStructuredHeader(plainText).slice(0, 300);
-    if (now) {
-        lines.push(`【刚进来的这条】${decisionSpeakerName(plainText) || '某人'}: ${now}`);
+    const nowRaw = text(plainText);
+    const nowAtMe = detectAtBot(nowRaw) ? '（@了我）' : '';
+    const now = stripStructuredHeader(nowRaw).slice(0, 300);
+    if (now || nowAtMe) {
+        lines.push(`【刚进来的这条】${decisionSpeakerName(nowRaw) || '某人'}${nowAtMe}: `
+            + `${now || '（只有 @，没有文字）'}`);
     }
     return lines.join('\n');
 }
@@ -192,11 +225,20 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
         // <<< decision-timeout patch <<<
         const raw = text(aiClient.getVisibleResponseContent(result));
         const verdict = parseDecision(raw);
+        const atBot = detectAtBot(plainText);
+        // 🔴 把"这条 @ 了我没有"打进日志：这次事故从日志上完全看不出来
+        //    （只看到 raw=NO，看不出它根本不知道被 @ 了）。
+        logger.info?.('[决策] 裁决', {
+            messageType: isPrivateChat ? 'private' : 'group',
+            raw,
+            atBot,
+            preview: stripStructuredHeader(plainText).slice(0, 60)
+        });
         if (verdict === null) {
             logger.warn?.(`[决策] 无法解析，按"回"处理: ${JSON.stringify(raw.slice(0, 40))}`);
-            return { skip: false, reason: 'unparsed', raw };
+            return { skip: false, reason: 'unparsed', raw, atBot };
         }
-        return { skip: verdict === false, reason: verdict ? 'yes' : 'no', raw };
+        return { skip: verdict === false, reason: verdict ? 'yes' : 'no', raw, atBot };
     } catch (error) {
         // 失败一律放行 —— 决策层绝不能成为"回复凭空消失"的原因
         const reason = String(error?.message || '') === 'AI_TIMEOUT' ? 'timeout' : 'error';

@@ -28,7 +28,8 @@ test('emoji reaction requires explicit config true and uses a shared sender', ()
     assert.ok(source.includes('bot.setMsgEmojiLike(event.message_id, emojiId)'));
     assert.ok(participantHandler.includes('sendEmojiReactionForEvent(event);'));
     assert.ok(mentionHandler.includes('sendEmojiReactionForEvent(event);'));
-    assert.ok(handleMessage.includes("plainText.trim() === '/llm'"));
+    // 2026-10-12：/llm 的匹配改用剥掉 @ 标记的 commandInput（群里 @ 之后 plainText 带前缀）
+    assert.ok(handleMessage.includes("commandInput.trim() === '/llm'"));
     assert.ok(handleMessage.includes('sendEmojiReactionForEvent(event);'));
     assert.ok(handleMessage.includes('if (routingDecision.shouldRespond) {'));
 });
