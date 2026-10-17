@@ -133,6 +133,19 @@ const HELP_ENTRIES = [
         usage: (cmd) => `${cmd} @某人`,
         desc: (config) => `连续戳一戳，共 ${config.chat?.commands?.adminPoke?.repeatCount ?? 5} 次`
     },
+    // >>> profile-view-command patch >>>
+    {
+        id: 'profileView',
+        section: 'admin',
+        adminOnly: true,
+        resolve: (config) => ({
+            command: cleanText(config.chat?.commands?.profileView?.command) || '/画像',
+            enabled: config.chat?.commands?.profileView?.enabled !== false
+        }),
+        usage: (cmd) => `${cmd} [@某人|昵称|QQ号]`,
+        desc: '查看她把某人记成了什么样；不带参数则列出全部画像'
+    },
+    // <<< profile-view-command patch <<<
     {
         id: 'adminMention',
         section: 'admin',

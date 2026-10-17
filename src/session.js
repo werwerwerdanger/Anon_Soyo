@@ -9,6 +9,17 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { getParticipantProfileConfig } from './participant-profile-config.js';
 import { chatScopePullLimit, filterMessagesForChat } from './chat-scope.js';
+// >>> recall-dedupe patch >>>
+// 剥信封只有一份实现（structured-envelope.js）。这里要用它算「用户发言指纹」，
+// 所以 import 而不是重写 —— 本项目已有过"同一规则两份实现漂移"的教训。
+// >>> admin-cross-read patch >>>
+// 采集「本人原话」时要判"剥干净了没"：实测有**超长消息的记忆条目在写入时被截断**，
+// 信封的收尾 `]]` 一起丢掉 ⇒ `stripStructuredEnvelope` 数括号配不平、保守放弃
+// ⇒ 整条消息带着 `[私聊|QQ:…|昵称:…]` 留在正文里。
+// 那种条目一律**不采**（宁可少一条，也不能把元数据喂给模型）。
+import { stripStructuredEnvelope, hasStructuredEnvelope } from './structured-envelope.js';
+// <<< admin-cross-read patch <<<
+// <<< recall-dedupe patch <<<
 // >>> participant-roster patch >>>
 // 身份名册的解析规则只有一份（`昵称(QQ)` 的切法、通知文本过滤、曾用名合并），
 // 写库（本文件）和渲染（participant-roster.js）必须用同一套，所以从那里 import。
@@ -2041,6 +2052,238 @@ export class SessionManager {
         }));
     }
 
+    // >>> self-query patch >>>
+    /**
+     * 「她自己查」用的历史检索（2026-10-17，L3）。
+     *
+     * 为什么要给她这个口子：实测她的"我记得你问过"来自召回片段 + 印象，事实可能对
+     * 但**计数不准、说不出时间、来源不可追溯**（2026-10-17「又问啊」案例）。
+     * 与其让她猜，不如让她能查。
+     *
+     * 边界（隐私 + 防回声）：
+     *  - 只在**给定命名空间**里查（调用方传当前会话）；不跨私聊、不跨群。
+     *  - 只统计/返回**指定发言人**说过的话：`|QQ:<id>|` 署名过滤 + 剥信封后比对
+     *    （群聊里同一条 memory_entry 可能混着好几个人的发言）。
+     *  - 🔴 **绝不返回 Bot 自己的回答**。返回旧输出 = 又一次记忆回声，
+     *    正好抵消 `patch_recall_dedupe.py`。样本里只有用户发言指纹。
+     *
+     * @returns {{
+     *   keyword: string, participantId: string, scopeKey: string,
+     *   hits: number, occurrences: number, distinctUtterances: number,
+     *   firstAt: number|null, lastAt: number|null,
+     *   samples: Array<{ at: number, text: string }>
+     * }}
+     *
+     * ⚠ 三个数字别混（2026-10-17 实测踩过）：
+     *   - `hits`               = 命中的原始条目数。同一句话问 6 次是 **12**，
+     *                            因为每轮写 2 条（「纯提问」+「提问+回答」）。
+     *   - `distinctUtterances` = 不同**措辞**数。同一句话问 6 次只有 **1**。
+     *   - `occurrences`        = 按**录入时间聚类**的事件数 = **"问过几次"**，即 **6**。
+     *   要回答"你问过几遍"必须用 `occurrences`。
+     */
+    searchConversationHistory(namespaceOptions, participantId, keyword, options = {}) {
+        const kw = String(keyword || '').trim();
+        const pid = String(participantId || '').trim();
+        const scopeType = String(namespaceOptions?.scopeType || '');
+        const scopeKey = String(namespaceOptions?.scopeKey || '');
+        const sampleLimit = Math.min(Math.max(Number(options.sampleLimit) || 5, 1), 10);
+        const empty = {
+            keyword: kw,
+            participantId: pid,
+            scopeKey,
+            hits: 0,
+            occurrences: 0,
+            distinctUtterances: 0,
+            firstAt: null,
+            lastAt: null,
+            samples: []
+        };
+        if (!kw || !scopeType || !scopeKey) {
+            return empty;
+        }
+
+        let rows = [];
+        try {
+            rows = this.db.prepare(`
+                SELECT me.id, me.content, me.created_at
+                FROM memory_entries me
+                INNER JOIN memory_namespaces ns ON ns.id = me.namespace_id
+                WHERE me.entry_type = 'conversation'
+                  AND ns.scope_type = @scopeType
+                  AND ns.scope_key = @scopeKey
+                  AND me.content LIKE @like
+                ORDER BY me.created_at ASC
+                LIMIT 400
+            `).all({ scopeType, scopeKey, like: `%${kw}%` });
+        } catch (error) {
+            this.logger?.warn?.('[自查询] 历史检索失败', { keyword: kw, error: error.message });
+            return empty;
+        }
+
+        const seen = new Set();
+        const utterances = [];
+        let hits = 0;
+        // 🔴 「问过几次」的正确算法（2026-10-17 实测踩过一次）。
+        //    同一句话问 6 次：按**措辞**去重只有 1 种，按**条目**数是 12（每轮写 2 条）。
+        //    都不是"次数"。真次数要按**录入时间聚类** —— 同一次交互的两条在几秒内写完，
+        //    不同次之间隔着几小时。实测案例各组内间隔 4~14 秒、组间 ≥ 9 分钟，
+        //    5 分钟窗口能干净分开。
+        const OCCURRENCE_GAP_MS = 5 * 60 * 1000;
+        let occurrences = 0;
+        let lastOccurrenceAt = 0;
+        let firstAt = null;
+        let lastAt = null;
+        const kwLower = kw.toLowerCase();
+
+        for (const row of rows) {
+            const content = String(row.content || '');
+            // 只认这个人署名的条目
+            if (pid && !content.includes(`|QQ:${pid}|`)) {
+                continue;
+            }
+            // 用指纹只取"用户说的那一句"，顺带把 assistant 的回答排除在匹配之外
+            const key = this.buildRecallUtteranceKey(content);
+            if (!key || !key.includes(kwLower)) {
+                continue;
+            }
+            hits += 1;
+            const at = Number(row.created_at) || 0;
+            if (at) {
+                if (firstAt === null || at < firstAt) firstAt = at;
+                if (lastAt === null || at > lastAt) lastAt = at;
+                if (lastOccurrenceAt === 0 || at - lastOccurrenceAt > OCCURRENCE_GAP_MS) {
+                    occurrences += 1;
+                    lastOccurrenceAt = at;
+                }
+            }
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            utterances.push({ at, text: key.slice(0, 200) });
+        }
+
+        return {
+            keyword: kw,
+            participantId: pid,
+            scopeKey,
+            hits,
+            occurrences,
+            distinctUtterances: seen.size,
+            firstAt,
+            lastAt,
+            samples: utterances.slice(-sampleLimit)
+        };
+    }
+    // <<< self-query patch <<<
+
+    // >>> admin-cross-read patch >>>
+    /**
+     * 采集「这个人自己说过的话」（2026-10-17，**管理员越界查询专用**）。
+     *
+     * 场景：管理员在他自己的私聊里问「XX 是谁」。这条路此前走不通 —— 目标人物的画像
+     * 里写着「无足够信息」，召回里 0 条描述他，因为**唯一能勾勒他的素材是他跟 Bot 的私聊**，
+     * 被 `memory.crossScope.includeOthersPrivate=false` 挡在外面。
+     *
+     * 边界（只到这里，不再往外）：
+     *  - 🔴 **只读 `private:<participantId>` 这一个命名空间**，不读别的群、不读第三人的私聊；
+     *  - 🔴 只取**他本人**署名（`|QQ:<id>|`）的条目，且只留「用户:」那一段
+     *    ⇒ **Bot 自己的回复一个字都不进来**（那正是「又问啊」的病根）；
+     *  - 过滤纯媒体条目（`[图片]` / `[动画表情]` 这类剥完什么都不剩的）；
+     *  - 🔴 丢弃**剥不干净**的条目（超长消息被写入截断 ⇒ 信封配不平 ⇒ 原样带信封）；
+     *  - 去重（每轮写 2 条：「纯提问」+「提问与回答」，指纹相同 ⇒ 36 条去重成 17 条）。
+     *
+     * ⚠ 权限判断**不在这里**：闸门在 `index.js` 的 `profileResolver`
+     *   （管理员 + 他自己的私聊 + 问的是别人）。本方法只负责取数据。
+     *
+     * @returns {{ scopeKey: string, count: number, distinctTotal: number,
+     *             droppedUnstripped: number,
+     *             utterances: Array<{ at: number, atText: string, text: string }> }}
+     */
+    collectParticipantOwnUtterances(namespaceOptions, participantId, options = {}) {
+        const pid = String(participantId || '').trim();
+        const characterName = namespaceOptions?.characterName || null;
+        const limit = Math.min(Math.max(Number(options.limit) || 12, 1), 40);
+        const perText = Math.min(Math.max(Number(options.perText) || 120, 20), 400);
+        const scopeKey = pid ? `private:${pid}` : '';
+        const empty = { scopeKey, count: 0, distinctTotal: 0, droppedUnstripped: 0, utterances: [] };
+        if (!pid) {
+            return empty;
+        }
+        const fmt = (ms) => {
+            const n = Number(ms) || 0;
+            if (!n) {
+                return '';
+            }
+            const d = new Date(n);
+            const pad = (num) => String(num).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+                + `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        };
+        let rows = [];
+        try {
+            rows = this.db.prepare(`
+                SELECT me.content, me.created_at
+                FROM memory_entries me
+                INNER JOIN memory_namespaces ns ON ns.id = me.namespace_id
+                WHERE me.entry_type = 'conversation'
+                  AND ns.scope_type = 'private_user'
+                  AND ns.scope_key = @scopeKey
+                  AND IFNULL(ns.character_name, '') = IFNULL(@characterName, '')
+                ORDER BY me.created_at DESC
+                LIMIT 400
+            `).all({ scopeKey, characterName });
+        } catch (error) {
+            this.logger?.warn?.('[自查询] 采集本人发言失败', { participantId: pid, error: error.message });
+            return empty;
+        }
+
+        const seen = new Set();
+        const collected = [];
+        let droppedUnstripped = 0;
+        for (const row of rows) {
+            const content = String(row.content || '');
+            // 只认这个人自己署名的条目
+            if (!content.includes(`|QQ:${pid}|`)) {
+                continue;
+            }
+            // 剥信封 + 砍掉「助手:」之后的一切 ⇒ 只剩他本人说的
+            const text = this.extractRecallUtterance(content);
+            if (!text) {
+                continue;
+            }
+            // 🔴 剥不干净的一律丢弃（超长消息被写入截断 ⇒ 信封配不平 ⇒ 原样留着）。
+            //    把 `[私聊|QQ:…|昵称:…]` 这种元数据递给模型，比少给一条素材糟得多。
+            if (hasStructuredEnvelope(text)) {
+                droppedUnstripped += 1;
+                continue;
+            }
+            // 纯媒体 / 纯标点（`[图片]`、`[动画表情]`、一串符号）不算"他说的话"
+            const meaningful = text
+                .replace(/\[[^\]]*\]/g, ' ')
+                .replace(/[\s\p{P}\p{S}]/gu, '');
+            if (meaningful.length < 2) {
+                continue;
+            }
+            const key = text.toLowerCase();
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            collected.push({ at: Number(row.created_at) || 0, text: text.slice(0, perText) });
+        }
+        // 取**最近** limit 条，再翻成时间正序（模型读起来顺）
+        const picked = collected.slice(0, limit).reverse();
+        return {
+            scopeKey,
+            count: picked.length,
+            distinctTotal: seen.size,
+            droppedUnstripped,
+            utterances: picked.map((item) => ({ at: item.at, atText: fmt(item.at), text: item.text }))
+        };
+    }
+    // <<< admin-cross-read patch <<<
+
     listParticipantIdentitySources(participantId, limit = 10) {
         const normalizedLimit = Math.min(Math.max(Number(limit) || 10, 1), 50);
         const rows = this.statements.listParticipantIdentitySources.all(String(participantId), normalizedLimit);
@@ -2081,6 +2324,67 @@ export class SessionManager {
         );
         return row ? mapParticipantProfileRow(row) : null;
     }
+
+    // >>> profile-global-fallback patch >>>
+    /**
+     * 带兜底的画像读取（2026-10-17）。
+     *
+     * 为什么需要它：`getParticipantProfile` 的 WHERE 是 scope_type+scope_key 精确匹配，
+     * 而启动回填 `backfillParticipantProfilesFromHistory`（index.js）把画像**写死**到
+     * `global_shared/global_shared_memory`，运行时自动分析却写**当前会话** —— 写和读
+     * 用的不是同一个命名空间。实测群聊里画像可见率只有 anon 6/36=17%、soyo 2/18=11%，
+     * 表现就是"她想不起来这个人"。
+     *
+     * 读取优先级：当前会话（保留原行为）→ global_shared（补缺口）。
+     * 实测所有有画像的人（anon 30/30、soyo 13/13）在 global_shared 都有一份，
+     * 所以**不**再往"别的群/私聊"兜底 —— 那会把私聊里的画像带进群。
+     * 需要时传 `{ includeOtherScopes: true }` 显式开口。
+     *
+     * ⚠ 刻意不改 `getParticipantProfile`：启动回填的去重检查、面板/MCP 都依赖它的精确语义。
+     */
+    resolveParticipantProfile(namespaceOptions, participantId, options = {}) {
+        const pid = String(participantId ?? '').trim();
+        if (!pid) {
+            return null;
+        }
+        const includeOtherScopes = options?.includeOtherScopes === true;
+        const row = this.db.prepare(`
+            SELECT me.id, me.namespace_id, me.entry_type, me.title, me.content, me.tags_json, me.metadata_json,
+                   me.source_session_id, me.source_message_id, me.created_at, me.updated_at,
+                   ns.scope_type, ns.scope_key, ns.character_name, ns.preset_name,
+                   CASE
+                       WHEN ns.scope_type = @scopeType AND ns.scope_key = @scopeKey THEN 0
+                       WHEN ns.scope_type = 'global_shared' THEN 1
+                       ELSE 2
+                   END AS scope_priority
+            FROM memory_entries me
+            INNER JOIN memory_namespaces ns ON ns.id = me.namespace_id
+            WHERE me.entry_type = 'participant_profile'
+              AND IFNULL(ns.character_name, '') = IFNULL(@characterName, '')
+              AND CAST(json_extract(me.metadata_json, '$.participantId') AS TEXT) = @participantId
+              AND (
+                    @includeOtherScopes = 1
+                 OR ns.scope_type = 'global_shared'
+                 OR (ns.scope_type = @scopeType AND ns.scope_key = @scopeKey)
+              )
+            ORDER BY scope_priority ASC, me.updated_at DESC, me.rowid DESC
+            LIMIT 1
+        `).get({
+            scopeType: namespaceOptions?.scopeType ?? null,
+            scopeKey: namespaceOptions?.scopeKey ?? null,
+            characterName: namespaceOptions?.characterName || null,
+            participantId: pid,
+            includeOtherScopes: includeOtherScopes ? 1 : 0
+        });
+        if (!row) {
+            return null;
+        }
+        const profile = mapParticipantProfileRow(row);
+        profile.scopePriority = Number(row.scope_priority) || 0;
+        profile.isGlobalFallback = profile.scopePriority === 1;
+        return profile;
+    }
+    // <<< profile-global-fallback patch <<<
 
     listParticipantProfileIdentityRows(namespaceOptions, participantId) {
         return this.db.prepare(`
@@ -2936,6 +3240,26 @@ export class SessionManager {
     /** 剥掉结构化消息头 / JSON 段，只留用户真正打的字。
      *  头里嵌了 `messageSegments:[{...}]`，所以要**反复**剥最内层，不能一次正则搞定。 */
     stripStructuredHeaders(text = '') {
+        // >>> keep-segment-text patch (managed by patch_recall_segment_text.py) >>>
+        // 🔴 先"抢救"再剥（2026-10-17 实测）。正文有两种只活在信封内部的形态：
+        //     ① messageSegments:[{"type":"text","text":"看哪个顺眼买哪个"}]
+        //     ② [回复上文|发送者:π|QQ:…|内容:农贸有什么好吃的]  ← 回复类消息的 plainText 就是它
+        //   无条件剥括号会把它们一起吃掉 ⇒ 抽到 0 个关键词 ⇒ 同域关键词召回**和**跨域召回
+        //   整条路径都不跑（日志指纹：matchedCount:0 与 crossScopeCount:0 同时出现）。
+        const salvaged = [];
+        const source = String(text || '');
+        for (const seg of source.matchAll(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+            try {
+                salvaged.push(JSON.parse(`"${seg[1]}"`));
+            } catch {
+                salvaged.push(seg[1]);
+            }
+        }
+        // 第三方脱敏版信封用的是 `扣扣:`，但键名仍是 `内容:`，所以只认键名。
+        for (const quoted of source.matchAll(/内容:([^\[\]]*)/g)) {
+            salvaged.push(quoted[1]);
+        }
+        // <<< keep-segment-text patch <<<
         let s = String(text || '');
         let prev = null;
         let rounds = 0;
@@ -2944,8 +3268,44 @@ export class SessionManager {
             s = s.replace(/\[[^\[\]]*\]/g, ' ').replace(/\{[^{}]*\}/g, ' ');
             rounds += 1;
         }
-        return s.replace(/\s+/g, ' ').trim();
+        const stripped = s.replace(/\s+/g, ' ').trim();
+        const extra = salvaged.join(' ').replace(/\s+/g, ' ').trim();
+        return extra ? `${stripped} ${extra}`.trim() : stripped;
     }
+
+    // >>> recall-dedupe patch >>>
+    /**
+     * 「用户发言指纹」—— 用来识别"同一句话被反复记下来"。
+     *
+     * 🔴 为什么需要（2026-10-17 实测）：用户在私聊里把同一句话问了 6 次，
+     * 库里就有 12 条几乎相同的 conversation 条目。关键词召回把它们一起捞出来，
+     * 其中还带着 **assistant 自己的旧回答** ⇒ 模型看见"我上次说又问了一遍"，
+     * 这次就逐字复用 ⇒ 措辞一代代固化（记忆回声）。
+     *
+     * 做法：剥信封 → 只取「用户:」那一段（助手回复不参与指纹）→ 规范化空白。
+     * ⚠ 剥空（拿不到指纹）时返回空串，调用方**回退到原逻辑**，绝不把 entry 丢掉。
+     */
+    // >>> admin-cross-read patch >>>
+    /**
+     * 从一条 conversation 条目里抽出「用户说的那一句」**原文**（保留大小写）。
+     *
+     * 拆成两层是因为两处需求不同：去重指纹要**小写**，给模型看的素材要**原文**。
+     * 拆开是为了不再出现"同一规则两份实现"（本项目踩过漂移）。
+     */
+    extractRecallUtterance(content = '') {
+        const stripped = stripStructuredEnvelope(content);
+        const userPart = String(stripped || '').split(/\n\s*助手\s*[:：]/)[0] || '';
+        return userPart
+            .replace(/^\s*用户\s*[:：]\s*/, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+    // <<< admin-cross-read patch <<<
+
+    buildRecallUtteranceKey(content = '') {
+        return this.extractRecallUtterance(content).toLowerCase();
+    }
+    // <<< recall-dedupe patch <<<
 
     /** 召回关键词：剥头 -> 中文串(>8字补 2-gram) + 英文词(>=3字) -> 去数字/停用词。 */
     buildRecallKeywords(text = '', limit = 16) {
@@ -2991,7 +3351,28 @@ export class SessionManager {
                 else merged.set(entry.id, { entry, hits: 1 });
             }
         }
-        return Array.from(merged.values())
+        // >>> recall-dedupe patch >>>
+        // 同一句用户发言重复入过库时只留**最新**一条（旧回答不再被一起喂回去）。
+        // ⚠ hits 合并用 max 而不是 sum —— 用 sum 会让"重复次数多"反过来把它顶到最前。
+        const byUtterance = new Map();
+        for (const item of merged.values()) {
+            const entry = item.entry || {};
+            const key = entry.entryType === 'conversation'
+                ? this.buildRecallUtteranceKey(entry.content)
+                : '';
+            const slotKey = key || `__raw__${entry.id}`;
+            const prev = byUtterance.get(slotKey);
+            if (!prev) {
+                byUtterance.set(slotKey, item);
+                continue;
+            }
+            prev.hits = Math.max(prev.hits, item.hits);
+            if ((entry.createdAt || 0) > (prev.entry?.createdAt || 0)) {
+                prev.entry = entry;
+            }
+        }
+        // <<< recall-dedupe patch <<<
+        return Array.from(byUtterance.values())
             .sort((a, b) => (b.hits - a.hits) || ((b.entry.createdAt || 0) - (a.entry.createdAt || 0)))
             .slice(0, limit)
             .map((item) => item.entry);
@@ -3069,8 +3450,17 @@ export class SessionManager {
                 continue;
             }
 
+            // >>> recall-dedupe patch >>>
+            // conversation 条目的关键词命中**只按用户发言部分算**：
+            // 否则"她只看得见自己上一轮说了什么"也会被算成命中，等于自己给自己递回音。
+            // ⚠ 指纹为空时回退到全文，不能因为剥空就把这条判成 0 命中。
             const contentText = String(entry.content || '').toLowerCase();
-            const keywordHits = queryKeywords.filter((keyword) => contentText.includes(keyword)).length;
+            const utteranceKey = entry.entryType === 'conversation'
+                ? this.buildRecallUtteranceKey(entry.content)
+                : '';
+            const matchText = utteranceKey || contentText;
+            const keywordHits = queryKeywords.filter((keyword) => matchText.includes(keyword)).length;
+            // <<< recall-dedupe patch <<<
             const isMatched = matchedEntries.some((item) => item.id === entry.id);
             // >>> cross-scope recall patch >>>
             const isCrossScope = crossScopeEntries.some((item) => item.id === entry.id);
@@ -3116,9 +3506,30 @@ export class SessionManager {
             }
         }
 
-        const results = Array.from(dedupe.values())
-            .sort((a, b) => (b.recallScore || 0) - (a.recallScore || 0))
-            .slice(0, options.limit || 6);
+        // >>> recall-dedupe patch >>>
+        // 最后一道闸：注入的每条都是**一次强化**，同一句用户发言只留分最高的那条。
+        // 上面按指纹去重挡的是 searchMemoryEntriesByKeywords 的结果；这里挡全部来源
+        // （recent / 跨域 / 关键词）—— 6 条重复注入等于 6 倍权重。
+        const orderedEntries = Array.from(dedupe.values())
+            .sort((a, b) => (b.recallScore || 0) - (a.recallScore || 0));
+        const seenUtterance = new Set();
+        const dedupedEntries = [];
+        let droppedDuplicateCount = 0;
+        for (const entry of orderedEntries) {
+            const key = entry.entryType === 'conversation'
+                ? this.buildRecallUtteranceKey(entry.content)
+                : '';
+            if (key) {
+                if (seenUtterance.has(key)) {
+                    droppedDuplicateCount += 1;
+                    continue;
+                }
+                seenUtterance.add(key);
+            }
+            dedupedEntries.push(entry);
+        }
+        const results = dedupedEntries.slice(0, options.limit || 6);
+        // <<< recall-dedupe patch <<<
 
         this.logger.info?.('[记忆] 记忆召回完成', {
             namespace: summarizeNamespaceOptions(namespaceOptions),
@@ -3132,6 +3543,9 @@ export class SessionManager {
             fixedKnowledgeCount: fixedKnowledgeEntries.length,
             summaryCount: summaryEntries.length,
             resultCount: results.length,
+            // >>> recall-dedupe patch >>>  同一句用户发言被去重掉的条数（记忆回声的直接指标）
+            droppedDuplicateCount,
+            // <<< recall-dedupe patch <<<
             currentParticipantId,
             results: results.slice(0, 6).map((entry) => ({
                 id: entry.id,
@@ -3202,6 +3616,9 @@ export class SessionManager {
     }
 
     clearGlobalMemory() {
+        // >>> memory-clear-guard patch >>>
+        this.snapshotBeforeClear('clearGlobalMemory');
+        // <<< memory-clear-guard patch <<<
         this.db.exec('BEGIN');
         try {
             this.db.exec('DELETE FROM summary_index_entries;');
@@ -3453,6 +3870,38 @@ export class SessionManager {
         return this.dbPath;
     }
 
+    // >>> memory-clear-guard patch >>>
+    /**
+     * 清空类操作执行前的强制快照。
+     *
+     * 为什么必须：`memory_entries` 里 `entry_type='conversation'` 是**摘要压缩后的逐字副本** ——
+     * 原文早从 `messages` 删掉了，这条副本是「她说过什么」的唯一存证。
+     * `clearGlobalMemory()` / `clearAllData()` 会把它一起清掉（后者连 conversation 一起删），
+     * 而这两个函数是面板上的一键按钮。
+     *
+     * 落盘在 <db 同目录>/clear-backups/，文件名带 label 和时间戳，不参与任何自动清理。
+     * fail-open：快照失败只打 ERROR，不阻断清空（否则等于给面板加了个假故障）。
+     */
+    snapshotBeforeClear(label = 'clear') {
+        try {
+            const dir = path.join(path.dirname(this.dbPath), 'clear-backups');
+            fs.mkdirSync(dir, { recursive: true });
+            try {
+                this.checkpoint();
+            } catch {}
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const dst = path.join(dir, `before-${label}-${stamp}.sqlite`);
+            fs.copyFileSync(this.dbPath, dst);
+            const size = fs.statSync(dst).size;
+            this.logger?.warn?.(`[记忆保护] ${label} 前已快照整库`, { file: dst, size });
+            return dst;
+        } catch (error) {
+            this.logger?.error?.(`[记忆保护] ${label} 快照失败（清空继续执行）: ${error.message}`);
+            return '';
+        }
+    }
+    // <<< memory-clear-guard patch <<<
+
     // 强制 WAL checkpoint，确保所有数据写入主库文件（备份前必须调用）
     checkpoint() {
         try {
@@ -3467,6 +3916,9 @@ export class SessionManager {
     }
 
     clearAllData() {
+        // >>> memory-clear-guard patch >>>
+        this.snapshotBeforeClear('clearAllData');
+        // <<< memory-clear-guard patch <<<
         const cleared = { sessions: 0, messages: 0, summaries: 0, variables: 0, namespaces: 0, profiles: 0, knowledge: 0 };
         const dbs = [this.db];
         if (this.charDb && this.charDb !== this.db) dbs.push(this.charDb);

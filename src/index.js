@@ -74,6 +74,12 @@ import {
     MusicSessionStore,
     normalizeMusicConfig
 } from './music.js';
+// >>> profile-view-command patch >>>
+import {
+    PROFILE_VIEW_COMMAND_DEFAULTS,
+    executeProfileViewCommand
+} from './profile-view-command.js';
+// <<< profile-view-command patch <<<
 // >>> roster-commands patch >>>
 import {
     FORGET_COMMAND_DEFAULTS,
@@ -89,6 +95,9 @@ import {
 // >>> help-command patch >>>
 import { HELP_COMMAND_DEFAULTS, executeHelpCommand } from './help-command.js';
 // <<< help-command patch <<<
+// >>> send-status patch >>>
+import { getSendFailureHint } from './send-status.js';
+// <<< send-status patch <<<
 // >>> oj-feedback patch >>>
 import {
     OJ_FEEDBACK_COMMAND_DEFAULTS,
@@ -103,6 +112,9 @@ import {
 // >>> oj-ac patch >>>
 import { OjAcPoller, buildAcNotice, normalizeOjAcConfig } from './oj-ac.js';
 // <<< oj-ac patch <<<
+// >>> oj-contest patch >>>
+import { OjContestPoller, buildContestNotice, buildDailyProblemNotice, normalizeOjContestConfig } from './oj-contest.js';
+// <<< oj-contest patch >>>
 import { collectParticipantGroupIds, mergeParticipantIdentity, resolveParticipantIdentityFromOneBot } from './participant-identity.js';
 import {
     getParticipantProfileTimerKey,
@@ -594,6 +606,17 @@ function ensureCommandAndToolConfig(config) {
 
     // 思考显示：`enabled` 是配置默认值，`/思考 开|关` 的热开关在运行时覆盖它。
     config.chat.showThinking = normalizeShowThinkingConfig(showThinking);
+
+// >>> profile-view-command patch >>>
+    const profileViewCommand = config.chat.commands.profileView || {};
+    config.chat.commands.profileView = {
+        enabled: typeof profileViewCommand.enabled === 'boolean' ? profileViewCommand.enabled : PROFILE_VIEW_COMMAND_DEFAULTS.enabled,
+        command: normalizeCommandText(profileViewCommand.command, PROFILE_VIEW_COMMAND_DEFAULTS.command),
+        maxEntries: clampInteger(profileViewCommand.maxEntries, 1, 200, PROFILE_VIEW_COMMAND_DEFAULTS.maxEntries),
+        perScopeChars: clampInteger(profileViewCommand.perScopeChars, 40, 4000, PROFILE_VIEW_COMMAND_DEFAULTS.perScopeChars),
+        maxChars: clampInteger(profileViewCommand.maxChars, 100, 6000, PROFILE_VIEW_COMMAND_DEFAULTS.maxChars)
+    };
+// <<< profile-view-command patch <<<
     // <<< roster-commands patch <<<
 
     // >>> oj-feedback patch >>>
@@ -610,6 +633,10 @@ function ensureCommandAndToolConfig(config) {
     // 凭据**继承 ojFeedback**：那串密码只在 config 里存一份（理由见 oj-ac.js 文件头）
     config.ojAc = normalizeOjAcConfig(config.ojAc, config.ojFeedback);
     // <<< oj-ac patch <<<
+    // >>> oj-contest patch >>>
+    // 同理继承 ojFeedback 的地址/凭据（比赛列表接口本身是公开的，凭据可有可无）
+    config.ojContest = normalizeOjContestConfig(config.ojContest, config.ojFeedback);
+    // <<< oj-contest patch <<<
 
     // >>> help-command patch >>>
     const helpCommand = config.chat.commands.help || {};
@@ -1619,9 +1646,15 @@ async function generateContextualMentionReply({
         })
     };
     runtimeContext.currentSpeaker = currentSpeakerOverride || buildSpeakerIdentity(event);
+    // >>> profile-global-fallback patch >>>
+    // 本会话没画像时兜底到 global_shared（启动回填把画像写在那儿，见 session.js 同名补丁）
     runtimeContext.currentSpeakerProfile = runtimeContext.currentSpeaker
-        ? sessionManager.getParticipantProfile(runtimeContext.recallNamespace, runtimeContext.currentSpeaker.participantId)
+        ? sessionManager.resolveParticipantProfile(runtimeContext.recallNamespace, runtimeContext.currentSpeaker.participantId)
         : null;
+    if (runtimeContext.currentSpeakerProfile?.isGlobalFallback) {
+        logger.debug?.(`[画像] ${runtimeContext.currentSpeaker.participantName || runtimeContext.currentSpeaker.participantId} 本会话无画像，取自 global_shared（${String(runtimeContext.currentSpeakerProfile.content || '').length} 字）`);
+    }
+    // <<< profile-global-fallback patch <<<
     // >>> participant-roster patch >>>
     // 跨会话身份名册（只含 昵称/QQ/最后联系时间）。为什么不复用 currentSpeakerProfile：
     // getParticipantProfile(recallNamespace, currentSpeaker.participantId) 只认**当前发言人**，
@@ -1638,10 +1671,11 @@ async function generateContextualMentionReply({
     // <<< participant-roster patch <<<
     runtimeContext.recalledEntries = sessionManager.recallMemory(runtimeContext.recallNamespace, processedInput, {
         currentParticipantId: runtimeContext.currentSpeaker?.participantId || null,
+// >>> recall-budget patch (managed by patch_recall_segment_text.py) >>>
         recentLimit: 3,
         searchLimit: 3,
         summaryLimit: 2,
-        limit: 5
+        limit: 7
     });
 
     const { messages, worldBookCount, worldBookEntries } = await promptBuilder.build(
@@ -2042,6 +2076,73 @@ function maybeStoreUntriggeredMessage({ event, sessionKey, structuredText, plain
 }
 // <<< passive-store patch <<<
 
+// >>> caption-dropped-images patch >>>
+// 「没触发她」的消息如果带图片，**补一次转述**，把转述文字当这条消息的正文入库。
+//
+// 背景（2026-10-15，用户选方案 b：「让他能看到就行」）：soyo 私聊里她反问「刚才那张图是什么」——
+//   那张表情撞了 `sticker_low_willingness` 被**整条跳过**，连图片下载/内联都没发生，
+//   历史里只剩 `[图片:[动画表情]]` 空占位符 ⇒ 她只能诚实反问。**不是她瞎**（下一张放行的表情
+//   她在思维链里准确描述成「哭泣的小睦抱着贝斯」）。所以这里补的是"没放行那部分"。
+//
+// ⚠ 只加在**跳过路径**：正常回复路径是直传原图，清晰度更好，不动它。
+// ⚠ 转述失败/超时一律退回原文本 —— 绝不能因为转述把消息弄丢。
+// ⚠ 同一张图（url/file 相同）进程内缓存，用户连发同一表情时不重复调用。
+// ⚠ 开关：`chat.captionUntriggeredImages`（默认开；显式 false 关闭）。
+const droppedImageCaptionCache = new Map();
+const DROPPED_IMAGE_CAPTION_CACHE_MAX = 200;
+
+function droppedImageCacheKey(event) {
+    try {
+        const segments = getOneBotMessageSegments(event?.message || event?.raw_message)
+            .filter((segment) => segment?.type === 'image');
+        if (segments.length === 0) return '';
+        return segments.map((segment) => String(segment?.data?.url || segment?.data?.file || '')).join('|');
+    } catch {
+        return '';
+    }
+}
+
+async function captionDroppedImages({ event, structuredText }) {
+    if (config.chat?.captionUntriggeredImages === false) return structuredText;
+    const cacheKey = droppedImageCacheKey(event);
+    if (!cacheKey) return structuredText;      // 没有图片段，原样返回
+    if (droppedImageCaptionCache.has(cacheKey)) {
+        return `${structuredText}\n\n${droppedImageCaptionCache.get(cacheKey)}`;
+    }
+    try {
+        // 强制走转述：主模型自己能看图时默认会"直传"，而直传的图**不会被存进历史**
+        // （只留一个 `[图片标识 #hash]`）⇒ 对"不回复"的消息等于没看。
+        const captionConfig = {
+            ...config,
+            chat: {
+                ...config.chat,
+                imageCaptionModel: config.chat?.imageCaptionModel
+                    || config.chat?.model || config.ai?.model,
+                imageCaptionModelProviderId: config.chat?.imageCaptionModelProviderId
+                    || config.chat?.modelProviderId || config.ai?.activeProviderId,
+                imageCaptionSkipWhenModelSupportsImage: false
+            }
+        };
+        const result = await prepareImageInput({ items: [{ event }], config: captionConfig, bot, aiClient });
+        const captionText = String(result?.captionText || '').trim();
+        if (!captionText) return structuredText;   // 退化成 direct/没拿到文字 ⇒ 保持原样
+        const safe = sanitizeForInjection(captionText, config, event?.user_id);
+        if (droppedImageCaptionCache.size >= DROPPED_IMAGE_CAPTION_CACHE_MAX) {
+            droppedImageCaptionCache.delete(droppedImageCaptionCache.keys().next().value);
+        }
+        droppedImageCaptionCache.set(cacheKey, safe);
+        logger.info('[图片] 未触发消息补转述入库', {
+            mode: result.mode,
+            imageCount: result.imageCount
+        });
+        return `${structuredText}\n\n${safe}`;
+    } catch (error) {
+        logger.warn?.('[图片] 未触发消息补转述失败，退回原文本', { error: error?.message });
+        return structuredText;
+    }
+}
+// <<< caption-dropped-images patch <<<
+
 // >>> bot-banter-limit patch (managed by patch_bot_banter_limit.py) >>>
 // 群里两个机器人互相触发会形成循环（实测两边都能看见对方：902 / 1325 条），
 // 而且已经导致群内被禁言。
@@ -2067,7 +2168,15 @@ function botBanterDecision(config, event) {
     const maxTurns = isGroup
         ? Math.max(0, Number(config?.chat?.botBanterMaxTurns) || 0)
         : Math.max(0, Number(config?.chat?.coBotPrivateMaxTurns) || 0);
-    const windowMs = Math.max(1000, Number(config?.chat?.botBanterWindowMs) || 300000);
+    // >>> cobot-private-window patch >>>
+    // 私聊用**独立窗口**：用户 2026-10-15 要「素世和爱音的私聊打开，一小时最多三轮」。
+    // 原来窗口是群聊/私聊共用的 `botBanterWindowMs`（5 分钟）⇒ 要私聊按小时算，
+    // 只能加一个私聊专属的 `coBotPrivateWindowMs`（群聊仍按 botBanterWindowMs，互不影响）。
+    const windowMs = isGroup
+        ? Math.max(1000, Number(config?.chat?.botBanterWindowMs) || 300000)
+        : Math.max(1000, Number(config?.chat?.coBotPrivateWindowMs)
+            || Number(config?.chat?.botBanterWindowMs) || 300000);
+    // <<< cobot-private-window patch <<<
     const key = isGroup ? ('g:' + event.group_id) : ('p:' + (event.user_id ?? ''));
     const now = Date.now();
     const recent = (botBanterTurns.get(key) || []).filter((t) => now - t < windowMs);
@@ -2209,7 +2318,15 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
     // 刚跟她聊过的人再说话 ⇒ 不需要 @ / 关键词。
     // ⚠ 位置有讲究：在黑名单(access_denied) / NapCat 噪音**之后**（那两个必须优先），
     //   在表情包低意愿**之前**（聊到一半发个表情包不该被概率掐掉）。
-    if (hints.replyWindowOpen) {
+    // >>> cobot-reply-window patch >>>
+    // 🔴 2026-10-15 实测：**两个 bot 会靠这个窗口无限接嘴**——
+    //   她回一句 ⇒ 给对方开了窗口 ⇒ 对方下一句以 `reply_window` 进来 ⇒ 又回一句…
+    //   而这条路径在 `botBanterDecision`（co_bot 配额）**之前**就 return 了 ⇒ 配额形同虚设。
+    //   证据：soyo 今天 4 次群回复**全是回爱音的**，其中 2 次触发原因就是 `reply_window`。
+    // ⇒ co-bot 的发言**不放行窗口**，只能走下面那条有配额的 `co_bot` 路径
+    //   （或真的被 @/关键词点名）。**真人不受影响**（人类才需要"刚聊过就不用 @"）。
+    if (hints.replyWindowOpen && !isCoBot(config, event)) {
+        // <<< cobot-reply-window patch <<<
         // >>> reply-window-sticker patch >>>
         // chat.replyWindow.stickersTrigger=false 时，窗口**不再放行纯表情包**：
         // 那种消息落到下面的 stickerReplyChance 走低意愿。
@@ -2271,6 +2388,15 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
         }
         // <<< group-repeat-and-names patch <<<
         if (triggerMode === 'always') {
+            // >>> always-keep-reason patch >>>
+            // always = "每条都进 LLM 裁决"的总开关。原来它排在最前，会把
+            // at / prefix / keyword 的 reason 一起吞成 'always'，日志里再也看不出
+            // "她是被点名的还是自己插的话"，prompt 的【会话感知】也会写成"触发原因: always"。
+            // 所以这里先给出更具体的 reason，再兜底 always。行为不变，只保住可观测性。
+            if (hasPrefix) return accept('prefix');
+            if (hasKeyword) return accept('keyword');
+            if (isAtMe) return accept('at');
+            // <<< always-keep-reason patch <<<
             return accept('always');
         }
         if (triggerMode === 'prefix') {
@@ -3760,6 +3886,38 @@ async function handleForgetCommand(event, plainText) {
     return result.handled === true;
 }
 
+// >>> profile-view-command patch >>>
+async function handleProfileViewCommand(event, plainText) {
+    const commandConfig = config.chat?.commands?.profileView || {};
+    const mentioned = extractMentionedParticipant(event);
+    const result = await executeProfileViewCommand({
+        event,
+        plainText,
+        command: commandConfig.command || PROFILE_VIEW_COMMAND_DEFAULTS.command,
+        enabled: commandConfig.enabled !== false,
+        maxEntries: commandConfig.maxEntries ?? PROFILE_VIEW_COMMAND_DEFAULTS.maxEntries,
+        perScopeChars: commandConfig.perScopeChars ?? PROFILE_VIEW_COMMAND_DEFAULTS.perScopeChars,
+        maxChars: commandConfig.maxChars ?? PROFILE_VIEW_COMMAND_DEFAULTS.maxChars,
+        chunkDelayMs: commandConfig.chunkDelayMs ?? PROFILE_VIEW_COMMAND_DEFAULTS.chunkDelayMs,
+        isAdmin: isAdminUser(config, event.user_id),
+        sessionManager,
+        mentionedParticipantId: mentioned?.participantId || '',
+        manualCommand: config.chat?.commands?.participantProfileManual?.command || '',
+        onCommandAccepted: () => sendEmojiReactionForEvent(event),
+// >>> profile-view-command patch >>>
+        // 分条发送：第一条带引用，后面几条不带（每条都引用同一条消息很难看）。
+        // 做法是把 message_id 换成空串 —— sendQuotedStatusMessage 在 message_id
+        // 为空时会 fallback 到普通 sendGroupMessage / sendPrivateMessage。
+        sendStatusMessage: (message, meta = {}) => (meta.quote === false
+            ? sendQuotedStatusMessage({ ...event, message_id: '' }, message)
+            : sendQuotedStatusMessage(event, message)),
+// <<< profile-view-command patch <<<
+        sendFailureMessage: (message) => sendFailureMessage(event, message),
+        logger
+    });
+    return result.handled === true;
+}
+// <<< profile-view-command patch <<<
 const THINKING_COMMAND_ON = new Set(['开', '开启', 'on', 'true', '1', '打开']);
 const THINKING_COMMAND_OFF = new Set(['关', '关闭', 'off', 'false', '0', '关上']);
 const THINKING_COMMAND_RESET = new Set(['配置', '默认', 'reset', 'auto', '跟随']);
@@ -3816,6 +3974,9 @@ let ojFeedbackPoller = null;
 // >>> oj-ac patch >>>
 let ojAcPoller = null;
 // <<< oj-ac patch <<<
+// >>> oj-contest patch >>>
+let ojContestPoller = null;
+// <<< oj-contest patch >>>
 let ojCharacterNameKey = null;
 let ojCharacterNameValue = '';
 
@@ -3999,6 +4160,99 @@ function startOjAcPoller() {
     return ojAcPoller;
 }
 // <<< oj-ac patch <<<
+
+// >>> oj-contest patch >>>
+/** 比赛倒计时的发送：纯文本播报（不过 AI —— 避免为一条提醒多花一次模型调用） */
+async function notifyOjContest(contest, kind, { now = Date.now(), key = '' } = {}) {
+    const cfg = normalizeOjContestConfig(config.ojContest, config.ojFeedback);
+    const text = buildContestNotice(contest, {
+        kind,
+        now,
+        baseUrl: cfg.baseUrl,
+        seed: key || undefined
+    });
+    if (cfg.notifyGroups.length === 0) {
+        throw new Error('没有通知目标（ojContest.notifyGroups 是空的）');
+    }
+    let sent = 0;
+    const errors = [];
+    for (const groupId of cfg.notifyGroups) {
+        try {
+            await bot.sendGroupMessage(groupId, text);
+            sent += 1;
+        } catch (error) {
+            errors.push(`group:${groupId} ${error?.message}`);
+        }
+    }
+    if (sent === 0) {
+        throw new Error(`全部目标发送失败: ${errors.join('; ')}`);
+    }
+    if (errors.length > 0) {
+        logger.warn(`[比赛倒计时] ${key} 部分目标发送失败: ${errors.join('; ')}`);
+    }
+    logger.info(`[比赛倒计时] 已播报 ${key}（${sent}/${cfg.notifyGroups.length} 个群）`, {
+        contestId: contest.id,
+        title: contest.title,
+        kind,
+        text
+    });
+    return sent;
+}
+
+/** 每日一题的发送：纯文本（题号 + 标题 + 直达链接），同样不过 AI */
+async function notifyOjDailyProblem(item, { groups = [], key = '' } = {}) {
+    const cfg = normalizeOjContestConfig(config.ojContest, config.ojFeedback);
+    const targets = groups.length > 0 ? groups : cfg.notifyGroups;
+    if (targets.length === 0) {
+        throw new Error('没有通知目标（ojContest.dailyProblem.groups 与 notifyGroups 都是空的）');
+    }
+    const text = buildDailyProblemNotice(item, { baseUrl: cfg.baseUrl });
+    let sent = 0;
+    const errors = [];
+    for (const groupId of targets) {
+        try {
+            await bot.sendGroupMessage(groupId, text);
+            sent += 1;
+        } catch (error) {
+            errors.push(`group:${groupId} ${error?.message}`);
+        }
+    }
+    if (sent === 0) {
+        throw new Error(`全部目标发送失败: ${errors.join('; ')}`);
+    }
+    if (errors.length > 0) {
+        logger.warn(`[每日一题] ${key} 部分目标发送失败: ${errors.join('; ')}`);
+    }
+    logger.info(`[每日一题] 已播报（${sent}/${targets.length} 个群）`, {
+        date: item.date,
+        title: item.title,
+        link: item.link,
+        text
+    });
+    return sent;
+}
+
+function startOjContestPoller() {
+    const cfg = normalizeOjContestConfig(config.ojContest, config.ojFeedback);
+    if (!cfg.enabled) {
+        logger.info('[比赛倒计时] 未启用，跳过轮询');
+        return null;
+    }
+    // 相对路径按**实例根目录**解析（同 ojFeedback / ojAc）
+    const stateFile = isAbsolute(cfg.stateFile) ? cfg.stateFile : join(ROOT_DIR, cfg.stateFile);
+    ojContestPoller = new OjContestPoller({
+        getConfig: () => config.ojContest,
+        getFallbackConfig: () => config.ojFeedback,
+        logger,
+        stateFile,
+        onNotice: (contest, kind, meta) => notifyOjContest(contest, kind, meta),
+        // 每日一题（同一个轮询器里顺带做，9 点跟倒计时一起发）
+        onDailyProblem: (item, meta) => notifyOjDailyProblem(item, meta)
+    });
+    ojContestPoller.start();
+    return ojContestPoller;
+}
+// <<< oj-contest patch <<<
 
 /**
  * `/帮助` —— 指令清单。面向所有人（普通用户也有点歌这类指令），
@@ -4292,9 +4546,15 @@ async function processBatch(batch) {
                 injectionRisk
             };
             runtimeContext.currentSpeaker = buildSpeakerIdentity(event);
+            // >>> profile-global-fallback patch >>>
+            // 本会话没画像时兜底到 global_shared（启动回填把画像写在那儿，见 session.js 同名补丁）
             runtimeContext.currentSpeakerProfile = runtimeContext.currentSpeaker
-                ? sessionManager.getParticipantProfile(runtimeContext.recallNamespace, runtimeContext.currentSpeaker.participantId)
+                ? sessionManager.resolveParticipantProfile(runtimeContext.recallNamespace, runtimeContext.currentSpeaker.participantId)
                 : null;
+            if (runtimeContext.currentSpeakerProfile?.isGlobalFallback) {
+                logger.debug?.(`[画像] ${runtimeContext.currentSpeakerProfile.participantName || runtimeContext.currentSpeakerProfile.participantId} 本会话无画像，取自 global_shared（${String(runtimeContext.currentSpeakerProfile.content || '').length} 字）`);
+            }
+            // <<< profile-global-fallback patch <<<
             // >>> participant-roster patch >>>
             {
                 const rosterInfo = resolveParticipantRoster('main', processedInput, String(event?.user_id || ''));
@@ -4302,12 +4562,19 @@ async function processBatch(batch) {
                 runtimeContext.participantRosterMention = rosterInfo.mention;
             }
             // <<< participant-roster patch <<<
+// >>> send-status patch >>>
+            // 上一轮那条如果没送达（禁言/无权限/风控），给她一条事实，
+            // 免得她以为对方看到了（回复生成时就入库了，所以她会记得自己说过）。
+            // ⚠ getSendFailureHint 自带「只提示一次」和 TTL，见 send-status.js。
+            runtimeContext.sendFailureHint = getSendFailureHint(event);
+// <<< send-status patch <<<
             runtimeContext.recalledEntries = sessionManager.recallMemory(runtimeContext.recallNamespace, processedInput, {
                 currentParticipantId: runtimeContext.currentSpeaker?.participantId || null,
+// >>> recall-budget patch (managed by patch_recall_segment_text.py) >>>
                 recentLimit: 3,
                 searchLimit: 3,
                 summaryLimit: 2,
-                limit: 5
+                limit: 7
             });
             lastRecallSnapshot = {
                 at: Date.now(),
@@ -4549,6 +4816,147 @@ async function processBatch(batch) {
                         sendMessage: true
                     });
                 },
+                // >>> self-query patch >>>
+                // 「她自己查」（L3）：委托给 sessionManager，作用域是**当前会话**。
+                // ⚠ 隐私：查**当前发言人自己**时开 includeOtherScopes（她的角度就是"这个人"）；
+                //   查别人只用默认两层（当前会话 -> global_shared），不翻别人的私聊。
+                // ⚠ 防回声：historySearcher 只回**用户发言**的统计与样本，
+                //   不回 Bot 自己的回答（那正是"又问啊"的病根）。
+                profileResolver: async ({ query, defaultParticipantId, defaultParticipantName }) => {
+                    const raw = String(query || '').trim();
+                    const ownId = String(runtimeContext.currentSpeaker?.participantId || '');
+                    let targetId = raw;
+                    let targetName = '';
+                    if (!targetId) {
+                        targetId = ownId || String(defaultParticipantId || '');
+                        targetName = String(runtimeContext.currentSpeaker?.participantName || defaultParticipantName || '');
+                    } else if (!/^\d{5,}$/.test(targetId)) {
+                        const contacts = sessionManager.findContactsByName(targetId);
+                        if (contacts.length === 0) {
+                            return { ok: true, found: false, query: raw, message: '档案/通讯录里没有这个称呼的人。' };
+                        }
+                        targetName = String(contacts[0].displayName || targetId);
+                        targetId = String(contacts[0].participantId || '');
+                    }
+                    if (!targetId) {
+                        return { ok: true, found: false, query: raw, message: '没说要查谁。' };
+                    }
+                    const isSelfQuery = !!ownId && targetId === ownId;
+                    // >>> admin-cross-read patch >>>
+                    // 管理员越界读（2026-10-17，用户明确点头才做）。
+                    // 只有「管理员 **在他自己的私聊里** 主动问 **别人**」这一种情形才允许多看一层：
+                    // 他问的那个人（如 1000000001）唯一能勾勒他的素材就是"他跟我私聊时说过的话"，
+                    // 此前被 crossScope.includeOthersPrivate 挡着 ⇒ 画像只能写「无足够信息」。
+                    // ⛔ 群聊不行（谁都能问）⛔ 别人的私聊不行（管理员不会到场）⛔ 问自己不走这条。
+                    // ⛔ 采集只读 `private:<targetId>` 一个命名空间，且只要**他本人发言**。
+                    const scopeKeyOfChat = String(runtimeContext.recallNamespace?.scopeKey || '');
+                    const allowCrossRead = config.memory?.selfQuery?.adminCrossRead !== false
+                        && !isSelfQuery
+                        && !!ownId
+                        && scopeKeyOfChat === `private:${ownId}`
+                        && isAdminUser(config, ownId);
+                    const profile = sessionManager.resolveParticipantProfile(
+                        runtimeContext.recallNamespace,
+                        targetId,
+                        { includeOtherScopes: isSelfQuery || allowCrossRead }
+                    );
+                    const ownWords = allowCrossRead
+                        ? sessionManager.collectParticipantOwnUtterances(
+                            runtimeContext.recallNamespace,
+                            targetId,
+                            { limit: 12, perText: 120 }
+                        )
+                        : null;
+                    // 素材块**自己声明"这是什么"**（否则模型看到一堆零星短句不知道拿它干嘛）
+                    const ownWordsPayload = (ownWords && ownWords.count > 0)
+                        ? {
+                            source: ownWords.scopeKey,
+                            note: '以下是他自己发给你（在你俩的私聊里）的原话，按时间正序，'
+                                + '只有他本人说的部分。这是帮你判断"他是个什么样的人"的原始线索，'
+                                + '用你自己的话概括着说，不要把原话整段念出来。',
+                            count: ownWords.count,
+                            distinctTotal: ownWords.distinctTotal,
+                            samples: ownWords.utterances.map((item) => ({ at: item.atText, text: item.text }))
+                        }
+                        : null;
+                    const crossReadFields = {
+                        crossRead: allowCrossRead,
+                        ...(ownWordsPayload ? { hisOwnWords: ownWordsPayload } : {})
+                    };
+                    // <<< admin-cross-read patch <<<
+                    if (!profile) {
+                        return {
+                            ok: true,
+                            found: false,
+                            participantId: targetId,
+                            participantName: targetName || targetId,
+                            isSelfQuery,
+                            ...crossReadFields,
+                            message: '没有这个人的档案。'
+                        };
+                    }
+                    const content = String(profile.content || '').trim();
+                    return {
+                        ok: true,
+                        found: true,
+                        participantId: targetId,
+                        participantName: profile.participantName || targetName || targetId,
+                        isSelfQuery,
+                        ...crossReadFields,
+                        scope: `${profile.scopeType || ''}/${profile.scopeKey || ''}`,
+                        profile: content.slice(0, 2000),
+                        truncated: content.length > 2000
+                    };
+                },
+                historySearcher: async ({ keyword, query, defaultParticipantId }) => {
+                    const raw = String(query || '').trim();
+                    const ownId = String(runtimeContext.currentSpeaker?.participantId || '');
+                    let targetId = raw;
+                    if (!targetId) {
+                        targetId = ownId || String(defaultParticipantId || '');
+                    } else if (!/^\d{5,}$/.test(targetId)) {
+                        const contacts = sessionManager.findContactsByName(targetId);
+                        targetId = contacts.length > 0 ? String(contacts[0].participantId || '') : raw;
+                    }
+                    const formatTime = (ms) => {
+                        if (!ms) return '';
+                        const d = new Date(Number(ms));
+                        const pad = (n) => String(n).padStart(2, '0');
+                        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                    };
+                    const result = sessionManager.searchConversationHistory(
+                        runtimeContext.recallNamespace,
+                        targetId,
+                        keyword,
+                        { sampleLimit: 5 }
+                    );
+                    if (result.hits === 0) {
+                        return {
+                            ok: true,
+                            keyword: result.keyword,
+                            participantId: targetId,
+                            found: false,
+                            scope: '当前会话的长期记忆',
+                            message: '没查到你说过相关的话。'
+                        };
+                    }
+                    return {
+                        ok: true,
+                        found: true,
+                        keyword: result.keyword,
+                        participantId: targetId,
+                        scope: '当前会话的长期记忆',
+                        // ⚠ 要答"问过几遍"用 occurrences（按录入时间聚类），
+                        //   不是 hits（每轮写 2 条，会翻倍），也不是 distinctUtterances（同一句话只算 1）。
+                        occurrences: result.occurrences,
+                        distinctUtterances: result.distinctUtterances,
+                        hits: result.hits,
+                        firstAt: formatTime(result.firstAt),
+                        lastAt: formatTime(result.lastAt),
+                        samples: result.samples.map((item) => ({ at: formatTime(item.at), text: item.text }))
+                    };
+                },
+                // <<< self-query patch <<<
                 mcpClient
             });
             const chatAIOverrides = buildChatAIOverrides(config);
@@ -5165,6 +5573,11 @@ async function handleMessage(event) {
     if (await handleForgetCommand(event, commandInput)) {
         return;
     }
+// >>> profile-view-command patch >>>
+    if (await handleProfileViewCommand(event, commandInput)) {
+        return;
+    }
+// <<< profile-view-command patch <<<
     if (await handleThinkingCommand(event, commandInput)) {
         return;
     }
@@ -5222,7 +5635,10 @@ async function handleMessage(event) {
         maybeStoreUntriggeredMessage({
             event,
             sessionKey: lastRoutingSnapshot.sessionKey,
-            structuredText,
+            // >>> caption-dropped-images patch >>>
+            // 带图但没触发的消息：补一次转述，让她至少"看见了"（失败退回原文本）
+            structuredText: await captionDroppedImages({ event, structuredText }),
+            // <<< caption-dropped-images patch <<<
             plainText,
             skipReason: routingDecision.skipReason
         });
@@ -5356,6 +5772,10 @@ server.listen(config.server.port, config.server.host, () => {
     // 同上：首次运行会把游标对齐到当前最大提交号，一条历史都不会播
     startOjAcPoller();
     // <<< oj-ac patch <<<
+    // >>> oj-contest patch >>>
+    // 比赛倒计时：按"每日时刻 + 赛前提前量"开口，状态文件去重、每天有上限
+    startOjContestPoller();
+    // <<< oj-contest patch >>>
 
     const defaultCharacter = config.chat.defaultCharacter;
     applyMemoryBinding();

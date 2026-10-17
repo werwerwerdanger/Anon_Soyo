@@ -384,6 +384,23 @@ export function buildRosterMentionHint(entries = [], messageText = '', options =
     const who = hits
         .map((e) => (e.name ? `${e.name}(${e.participantId})` : `QQ ${e.participantId}`))
         .join('、');
+    // >>> roster-speaker-attribution patch >>>
+    // 🔴 2026-10-17：这一行原来只说"**对方**提到的那个人在名单里"，但
+    //    ① 没说"对方"是谁；② 没说被提到的是**另一个人**
+    //    ⇒ 模型把"被提到的人"直接当成了"正在说话的人"。
+    //    实测证据：用户（2063362809/werwer）问「你觉得曲奇饼干全肯定bot怎么样」，
+    //    她的 thinking 写「这个人就在联系人名单里（1000000001）」，下一句就变成
+    //    「**用户**昵称是"曲奇饼干全肯定bot"，QQ 1000000001」—— 把被提及者的昵称
+    //    安到了用户头上。名册正文里那句「现在跟你说话的就是名单里的：werwer(2063362809)」
+    //    在 prompt **中段**，而这一行在「注意:」行（最后读到、杠杆最高），反而把它盖过去了。
+    //    修法：两个角色并列 + 关系词区分。⚠ 肯定式（否定句 = 二次 priming）、不给照样句。
+    const speakerLabel = clean(options.speakerLabel);
+    if (speakerLabel) {
+        return `现在跟你说话的是 ${speakerLabel}，这条消息是他发的。`
+            + `他提到的 ${who} 是你的其他联系人，也在你的联系人名单里`
+            + ' —— 是你 QQ 上认识的人，直接照名单回答就行。';
+    }
+    // <<< roster-speaker-attribution patch <<<
     return `对方提到的那个人就在你的联系人名单里：${who}。`
         + '那是你在 QQ 上认识的人 —— 直接照名单回答就行。';
 }
@@ -461,6 +478,15 @@ export function buildParticipantRoster(sessionManager, rawConfig, options = {}) 
             + ' —— 他要是问「我是谁」「你认识我吗」，照这一行答。'
         : '';
     // <<< speaker-line patch >>>
+    // >>> roster-speaker-attribution patch >>>
+    // 「注意:」行用的发言人标签。优先用名册里的 `昵称(QQ)`（带真名更好认），
+    // 发言人不在名册里（新联系人 / 超出 maxAgeDays）时退回纯 QQ —— 总比不写强。
+    const speakerLabel = speakerId
+        ? (speakerEntry
+            ? `${speakerEntry.name || `QQ ${speakerEntry.participantId}`}(${speakerEntry.participantId})`
+            : `QQ ${speakerId}`)
+        : '';
+    // <<< roster-speaker-attribution patch <<<
 
     return {
         text: [
@@ -476,8 +502,12 @@ export function buildParticipantRoster(sessionManager, rawConfig, options = {}) 
         //    否则表越长、用户越容易问到一个"名单里明明有、但她看不见"的人（2026-10-13 实测复发）。
         // 🔴 用 stripStructuredEnvelope：别拿信封里的发送者 QQ/昵称去匹配（见该函数的注释）。
         // 🔴 传 speakerId：发言人**自己**不算"被提到的人"（群里 `小摸` 发「小摸听到了」实测踩到）。
+        // >>> roster-speaker-attribution patch >>>
+        // 「注意:」行要说清"谁在说话、提到了谁"，所以把发言人也做成 `名字(QQ)` 传进去。
+        // 名册正文里虽然有 speakerLine，但它在 prompt 中段 —— 这一行才是最后读到的位置。
         mention: buildRosterMentionHint(allEntries, stripStructuredEnvelope(options.messageText),
-            { speakerId: options.speakerId })
+            { speakerId: options.speakerId, speakerLabel })
+        // <<< roster-speaker-attribution patch <<<
     };
 }
 

@@ -2,6 +2,12 @@
  * AI API 客户端模块
  */
 import { inferModelSupportsImage } from './model-capabilities.js';
+// >>> summary-identity-scrub patch >>>
+// 摘要里的自我档案清洗（详见 summary-scrub.js 头注释）。
+// 这里用在 summarize() 喂 previousSummaries 之前 —— 否则旧摘要里的「Bot 为…人设」
+// 会被新摘要原样继承，污染永远不自愈。
+import { scrubSummaryIdentity } from './summary-scrub.js';
+// <<< summary-identity-scrub patch <<<
 
 export class AIClient {
     constructor(config, logger = console) {
@@ -183,7 +189,14 @@ export class AIClient {
         }
 
         if (typeof content === 'string') {
-            return content.slice(0, 200);
+            // >>> content-log-full patch >>>
+            // 裸 slice(0,200) 让长正文被切在任意字符处、且**不留标记**，看着像模型生成到一半挂了
+            // （2026-10-17 实测：288 字的图片转述被切成 "...像在托腮思考。\n4"，用户直接问"4 是想干嘛"）。
+            // 与 reason-log-full 同理放大上限，并显式标注截断。
+            return content.length > 3000
+                ? content.slice(0, 3000) + '…（已截断，共 ' + content.length + ' 字）'
+                : content;
+            // <<< content-log-full patch <<<
         }
 
         if (content && typeof content === 'object') {
@@ -284,7 +297,12 @@ export class AIClient {
         if (content !== null) {
             this.logPipelineStage('标准 content 提取成功', {
                 contentLength: content.length,
-                contentPreview: content.slice(0, 200)
+                // >>> content-log-full patch >>>
+                // 同 reason-log-full：200 字不够看，且截断处不留标记会被误读成"生成断了"。
+                contentPreview: content.length > 3000
+                    ? content.slice(0, 3000) + '…（已截断，共 ' + content.length + ' 字）'
+                    : content
+                // <<< content-log-full patch <<<
             });
         }
 
@@ -1278,21 +1296,47 @@ export class AIClient {
         const lines = messages.map((message) => `[${message.role}] ${message.content}`).join('\n');
         const systemPrompt = '你负责将较早的对话纪要整理为可供长期召回的高密度长期记忆总结。\n'
             + '目标：生成一条信息密度高、准确可靠的长期记忆正文，用于后续会话召回与理解。\n'
-            + '硬性长度约束：输出在 500 字以内；信息较多时优先精炼压缩，禁止扩写。\n'
+            // >>> summary-timestamp patch >>>
+            // 500 字装不下"哪天/什么场合/什么理由"，和上面那条时间锚定直接打架。
+            // 去掉硬限制，改成按内容需要写；寒暄客套照旧排除（那才是真正该砍的）。
+            + '长度：按内容需要写，时间、场合和理由写全；寒暄客套与重复拉扯照旧排除。\n'
+            // <<< summary-timestamp patch <<<
+            // >>> summary-timestamp patch >>>
+            // 每条事件都要自带「哪天」，否则「她拒绝过」会被读成「她就是这样的人」。
+            // 依据是每条消息前面的「时间」字段（结构化信封里带的）。
+            + '时间锚定：每条事件都写清发生在什么时候 —— 依据是每条消息前面的「时间」字段，换算成日期。同一天的合并写，不同天的分开写。\n'
+            + '记录方式：写谁在什么时候说了什么、做了什么；同一个人在不同时间的反应分开记，各有各的场合和理由。\n'
+            // <<< summary-timestamp patch <<<
             + '内容优先级：\n'
-            + '1. 人物关系、称呼与态度变化\n'
+            // >>> summary-timestamp patch >>>
+            // 「态度变化」这个措辞会逼模型交一句态度结论 —— 改成只写关系与称呼的变化。
+            + '1. 人物关系与称呼的变化\n'
+            // <<< summary-timestamp patch <<<
             + '2. 核心事实、关键决策与事件转折\n'
             + '3. 重要约定、承诺与未完成事项\n'
-            + '4. 关键设定、地点、时间线与未决伏笔\n'
+            + '4. 关键地点、时间线与未决伏笔\n'
             + '禁止内容：排除日常寒暄客套、重复拉扯、纯语气词；严禁编造未发生的情节；严禁进行空洞的主观总结或升华收尾。\n'
+            // >>> summary-identity-scrub patch >>>
+            // 2026-10-17：摘要里长期写着「Bot 为《…》xxx 人设(…，生日…，…)」
+            // 「助手自认 xxx：<外貌 年龄 学校 国籍>」这类第三人称自我档案。它们每轮随
+            // 【历史摘要】注入，角色于是把自己当成"别人描述的对象"，被问「你是谁」时照念档案。
+            // 角色卡里已有的自我设定不属于记忆内容，这里明确排除。
+            + '身份禁区：角色自身的设定不算记忆内容 —— 角色名、人设、外貌、年龄、学校、国籍、是否由 AI 扮演，一律不写。\n'
+            + '摘要只记发生过的事、谁说了什么、关系和约定怎么变。\n'
+            // <<< summary-identity-scrub patch <<<
             + '输出要求：只输出最终长期记忆总结正文，不要写前言、解释、Markdown 标题或列表说明。';
 
         let userContent = '';
         if (Array.isArray(previousSummaries) && previousSummaries.length > 0) {
-            const prevTexts = previousSummaries.map((s, idx) => `[前序摘要 ${idx + 1}] ${s.content || s}`).join('\n');
-            userContent = `会话ID: ${sessionId}\n\n【已有历史摘要】\n${prevTexts}\n\n【需要压缩的新增对话批次】\n${lines}\n\n请结合已有历史摘要与新增对话批次，在 500 字以内输出一条信息密度高、保持连贯的长期记忆大总结正文。只输出正文。`;
+            // >>> summary-identity-scrub patch >>>
+            // 喂给摘要模型的旧摘要也要先洗：否则「Bot 为…人设」会被原样写回新摘要，污染自我复制。
+            const prevTexts = previousSummaries
+                .map((s, idx) => `[前序摘要 ${idx + 1}] ${scrubSummaryIdentity(String(s.content || s || ''))}`)
+                .join('\n');
+            // <<< summary-identity-scrub patch <<<
+            userContent = `会话ID: ${sessionId}\n\n【已有历史摘要】\n${prevTexts}\n\n【需要压缩的新增对话批次】\n${lines}\n\n请结合已有历史摘要与新增对话批次，输出一条信息密度高、保持连贯的长期记忆大总结正文，篇幅按内容需要。只输出正文。`;
         } else {
-            userContent = `会话ID: ${sessionId}\n\n【需要压缩的对话内容】\n${lines}\n\n请在 500 字以内输出一条信息密度高、保留关键事实与关系的长期记忆大总结正文。只输出正文。`;
+            userContent = `会话ID: ${sessionId}\n\n【需要压缩的对话内容】\n${lines}\n\n请输出一条信息密度高、保留关键事实与关系的长期记忆大总结正文，篇幅按内容需要。只输出正文。`;
         }
 
         const summaryPrompt = [

@@ -1,3 +1,6 @@
+// >>> send-status patch >>>
+import { clearSendFailure, recordSendFailure } from './send-status.js';
+// <<< send-status patch <<<
 import { sessionKeyFromEvent, waitUntilSendable } from './reply-gate.js';
 import { parseVoiceTags } from './tts.js';
 import { buildVoicePrefaceText } from './tools.js';
@@ -207,6 +210,13 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
         if (gateKey) {
             const sendable = await waitUntilSendable(gateKey, sleep, logger);
             if (!sendable) {
+                // >>> group-no-supersede patch >>>
+                logger.warn?.('[闸门] 整段回复被丢弃（未发送）', {
+                    sessionKey: gateKey,
+                    droppedLength: String(content || '').length,
+                    droppedPreview: String(content || '').slice(0, 80)
+                });
+                // <<< group-no-supersede patch <<<
                 return;
             }
         }
@@ -215,6 +225,11 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
         await awaitSendSlot(config, sleep, logger, event, options.burst === true);
         // <<< send-interval patch <<<
         const message = !hasSentPrimary && mentionPrefix ? `${mentionPrefix}${content}` : content;
+// >>> send-status patch >>>
+        // 发送失败（禁言 / 无权限 / 风控）⇒ 记一笔，下一轮她会知道「那条没送达」。
+        // ⚠ 一定要重新 throw：原来的错误语义要保留给上层，这里只多记一笔。
+        try {
+// <<< send-status patch <<<
         if (event.message_type === 'group') {
             if (quoteThisReply && event.message_id && !hasSentPrimary) {
                 if (!hasSentPrimary && mentionSenderOnReply && event.user_id) {
@@ -237,6 +252,15 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
         }
 
         hasSentPrimary = true;
+// >>> send-status patch >>>
+        clearSendFailure(event);
+// <<< send-status patch <<<
+        } catch (error) {
+// >>> send-status patch >>>
+            recordSendFailure(event, error, logger);
+// <<< send-status patch <<<
+            throw error;
+        }
     };
 
     // >>> sticker-send patch >>>

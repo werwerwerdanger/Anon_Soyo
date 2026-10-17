@@ -7,6 +7,14 @@ import { buildInputGuardrail } from './security.js';
 import { buildCurrentMessageFocus, formatCurrentMessageFocus } from './current-message-focus.js';
 import { createRuntimeSource, compactRuntimeSources } from './runtime/prompt-registry.js';
 import { stripStructuredEnvelope } from './structured-envelope.js';
+// >>> summary-identity-scrub patch >>>
+// 摘要里的自我档案清洗：DB 原文不动，只在注入侧隔离（2026-10-17，见 summary-scrub.js）。
+import { scrubSummaryIdentity, hasIdentityDossier } from './summary-scrub.js';
+// <<< summary-identity-scrub patch <<<
+// >>> profile-quote-scrub patch >>>
+// 画像里的引号引语 = 台词本（2026-10-17，见 profile-scrub.js 头注释）。
+import { scrubProfileQuotes, hasQuotedScript } from './profile-scrub.js';
+// <<< profile-quote-scrub patch <<<
 import { buildStickerHint } from './sticker-library.js';
 
 function createNoopLogger() {
@@ -850,15 +858,50 @@ export class PromptBuilder {
             }
         })));
 
-        systemSegments.push(...normalizedContext.summaries.map((summary, index) => PromptBuilder.createRuntimeSegment({
-            id: `summary-${index}`,
-            kind: 'summary',
-            label: `摘要 ${index + 1}`,
-            content: `【历史摘要】\n${summary.content}`,
-            stage: 'memory',
-            order: 40 + index,
-            meta: { placement: 'system' }
-        })));
+        // >>> summary-identity-scrub patch >>>
+        // 🔴 这里必须洗：摘要里长期写着「Bot 为…人设(…，生日…)」这类第三人称自我档案，
+        // 而 index.js 的 summaryLimit=2 ⇒ 每轮都注入最近两条。不洗的话角色会照念档案
+        // （实测：被问「你是谁」答「长崎素世 / 月之森二年级的」）。
+        // >>> summary-episodic-framing patch >>>
+        // 🔴 摘要里的**定性**会变成不可动摇的人格。实测 soyo 的摘要写着
+        //    「关系：…素世底线清晰（…），对爱音仍回避…」「素世明确拒绝看」
+        //    —— 无时间、无场合、无理由，而 summaryLimit=2 ⇒ 每轮注入，
+        //    她把「某一次的拒绝」读成了「我是这种人」。
+        //
+        // 人记的是情景（那天他在上课发图，我让他好好上课），不是定性（我是拒绝派）。
+        // 这里不删摘要内容（DB 原文不动，见 §52.11 的先例），只加一句框定，
+        // 而且**只加在最后一条的末尾** —— 按 §5.1，最后读到的位置杠杆最高，
+        // 每一条都加则会注入两遍、白占 token。
+        //
+        // 文案口径：肯定式、只描述"会变化"这个情境，⛔ 不写"这不是你的立场"（否定句
+        // 会二次 priming），⛔ 不举反例（列举 ⇒ 收敛到第一个），⛔ 不规定她怎么回。
+        const episodicFraming = '\n（以上是过去几次聊天的经过记录。每一条都只是当时那一次的反应，'
+            + '会随着心情、场合和对方的态度变化。）';
+        const summaryList = Array.isArray(normalizedContext.summaries) ? normalizedContext.summaries : [];
+        systemSegments.push(...summaryList.map((summary, index) => {
+            const rawSummary = String(summary.content || '');
+            const cleanSummary = scrubSummaryIdentity(rawSummary);
+            if (cleanSummary !== rawSummary) {
+                this.logger?.debug?.('[摘要清洗] 已剥离身份档案', {
+                    index,
+                    before: rawSummary.length,
+                    after: cleanSummary.length,
+                    stillHasDossier: hasIdentityDossier(cleanSummary)
+                });
+            }
+            const framing = index === summaryList.length - 1 ? episodicFraming : '';
+            return PromptBuilder.createRuntimeSegment({
+                id: `summary-${index}`,
+                kind: 'summary',
+                label: `摘要 ${index + 1}`,
+                content: `【历史摘要】\n${cleanSummary}${framing}`,
+                stage: 'memory',
+                order: 40 + index,
+                meta: { placement: 'system' }
+            });
+        }));
+        // <<< summary-episodic-framing patch <<<
+        // <<< summary-identity-scrub patch <<<
 
         if (Array.isArray(runtimeContext.recalledEntries) && runtimeContext.recalledEntries.length > 0) {
             const fixedKnowledgeEntries = runtimeContext.recalledEntries.filter((entry) => entry?.sourceKind === 'knowledge_fixed');
@@ -1131,8 +1174,11 @@ const compactHistoryUser = (content) => {
             // 她能**发**表情包：告诉她标记怎么写 + 本地库里有哪些类别。
             // 类别名是由**目录里真实存在的子目录**算出来的，所以用户往 data/stickers/ 丢图后
             // 不用重启（库内部有 30s TTL 的扫描缓存）。
-            stickerHint: buildStickerHint(this.chatConfig || {})
+            stickerHint: buildStickerHint(this.chatConfig || {}),
             // <<< sticker-send patch <<<
+// >>> send-status patch >>>
+            sendFailureHint: runtimeContext.sendFailureHint || ''
+// <<< send-status patch <<<
         }));
         const currentMessageFocusSegment = PromptBuilder.createRuntimeSegment({
             id: 'current-message-focus',
@@ -1463,7 +1509,20 @@ const compactHistoryUser = (content) => {
         // <<< participant-roster patch <<<
 
         if (runtimeContext.currentSpeakerProfile?.content) {
-            const profileText = runtimeContext.currentSpeakerProfile.content.trim();
+            const rawProfileText = runtimeContext.currentSpeakerProfile.content.trim();
+// >>> profile-quote-scrub patch >>>
+            // 引号里的原话会被她当台词念（「哄不好了」「他们」都是这么来的），
+            // 所以注入前先换成占位符。DB 原文不动，每次渲染现算。
+            const profileText = scrubProfileQuotes(rawProfileText);
+            if (profileText !== rawProfileText) {
+                this.logger?.debug?.('[画像清洗] 已剥离引号引语', {
+                    speaker: runtimeContext.currentSpeakerProfile.participantName || '',
+                    before: rawProfileText.length,
+                    after: profileText.length,
+                    stillHasQuote: hasQuotedScript(profileText)
+                });
+            }
+// <<< profile-quote-scrub patch <<<
             if (profileText) {
                 sections.push(`【当前发言人画像】\n${profileText}`);
             }

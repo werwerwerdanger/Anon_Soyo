@@ -3,6 +3,12 @@
 import { resolveQqFaceName } from './qq-interactions.js';
 // <<< builtin-face-split patch <<<
 
+// >>> short-answer-hint patch >>>
+// 剥信封的唯一实现（零依赖叶子模块）。判断"这条消息有多短"必须看**剥完信封**的正文，
+// 否则结构化信封（`[私聊|QQ:…|昵称:…|messageSegments:[…]]`）会让每句话都显得很长。
+import { stripStructuredEnvelope } from './structured-envelope.js';
+// <<< short-answer-hint patch <<<
+
 function cleanText(value) {
     return String(value ?? '').replace(/\r/g, '').trim();
 }
@@ -181,7 +187,57 @@ function buildStrategies({ event, text, intent, routing }) {
     return [...new Set(strategies)];
 }
 
-function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '', participantRosterMention = '', stickerHint = '' }) {
+// >>> short-answer-hint patch >>>
+// 2026-10-15 实证（用户原话：「她好像没懂我在说什么」）：
+// 她刚问「你就不能多打两个字啊」，用户回「好嘛」+ 照做的「11111111111」，
+// 她当成两句没头没尾的话，答「好嘛什么 / 一串1是几个意思啊」——
+// 上下文**没丢**（她自己的问句就在紧邻上一轮），丢的是**语用**：没看出对方在回答她。
+// ⚠ 位置：落在「注意:」行**最后**（模型回复前读到的最后一段 system 文本，本项目实测杠杆最高）。
+// ⚠ 触发刻意窄（只在极短消息时出现）——「每轮都在的字段」里的常量会被显著度稀释。
+// ⚠ 只描述**情境**，不写"她该怎么回"：给引号例句会被逐字搬用（本项目已踩）。
+const SHORT_ANSWER_MAX_CHARS = 12;      // 折叠重复字后 ≤12 字，且她刚说过话（reply_window）
+const SHORT_ANSWER_ULTRA_CHARS = 6;     // 折叠后 ≤6 字：几乎必然是应答，不给窗口也认
+const SHORT_ANSWER_HINT = '对方极短的回复（好嘛/嗯/行）很可能是在回答你上一句，先按“他在回答我”理解，顺着接一句。';
+
+function isProbablyShortAnswer(text, routing) {
+    const plain = String(stripStructuredEnvelope(text) ?? '');
+    // 折叠连续重复字符：'好嘛11111111111' ⇒ '好嘛1'、'哈哈哈哈哈哈' ⇒ '哈'
+    const compact = plain.replace(/\s+/g, '').replace(/(.)\1+/g, '$1');
+    if (!compact) {
+        return false;
+    }
+    if (/[?？]/.test(compact)) {
+        return false;   // 短问句是在提问，不是在回答
+    }
+    if (compact.length <= SHORT_ANSWER_ULTRA_CHARS) {
+        return true;
+    }
+    return compact.length <= SHORT_ANSWER_MAX_CHARS
+        && String(routing?.triggerReason || '') === 'reply_window';
+}
+// <<< short-answer-hint patch <<<
+
+// >>> code-request-hint patch >>>
+// 2026-10-15 实测：用户 @ 素世「给我一份线段树板子」，她**收到了也回了**，但只回「线段树啊」——
+//   不是没理，是**没法**：提示词里长度锚点写「长的二三十个字也行」、humanShapeHint 写
+//   「一半的消息在六个字以内 / 别攒成一条二十个字的完整句子」⇒ 写 40 行板子直接违反约束，
+//   模型于是选择只回一句。修法：**明确要代码时**给一个例外（条件触发，不稀释常态）。
+// ⚠ 必须提醒用代码围栏：reply-dispatcher 的 code-safety patch 把 ``` 块**整体算一段**，
+//   否则按行拆会把一个程序拆成几十条 QQ 消息。
+const CODE_REQUEST_RE = /(?:给|发|写|来|要|求|贴)[^\n]{0,16}(?:板子|模板|代码|题解)/;
+const CODE_REQUEST_HINT = '对方明确要代码/板子/模板/题解 —— 直接把完整代码贴出来，'
+    + '用 ``` 代码块包起来（这样再长也不会被拆散），别只回一句话。';
+
+function isCodeRequest(text) {
+    const plain = String(stripStructuredEnvelope(text) ?? '');
+    return CODE_REQUEST_RE.test(plain);
+}
+// <<< code-request-hint patch <<<
+
+// >>> send-status patch >>>
+// sendFailureHint：上一轮那条没送达（禁言/无权限/风控）时的事实，放在最末尾。
+// <<< send-status patch <<<
+function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '', participantRosterMention = '', stickerHint = '', sendFailureHint = '' }) {
     const warnings = [];
     if (event?.reply?.fetchStatus === 'failed') {
         warnings.push(`引用消息获取失败: ${event.reply.fetchReason || 'unknown'}`);
@@ -261,6 +317,26 @@ function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanSh
         warnings.push(participantRosterMention);
     }
     // <<< participant-roster patch <<<
+    // >>> short-answer-hint patch >>>
+    // 放在**最末尾**：这是模型产出回复前读到的最后一句 system 文本。
+    if (isProbablyShortAnswer(text, routing)) {
+        warnings.push(SHORT_ANSWER_HINT);
+    }
+    // <<< short-answer-hint patch <<<
+    // >>> code-request-hint patch >>>
+    // 紧接着长度锚点之后，把"这次可以长"的例外讲清楚（默认长度约束见 humanShapeHint）
+    if (isCodeRequest(text)) {
+        warnings.push(CODE_REQUEST_HINT);
+    }
+    // <<< code-request-hint patch <<<
+// >>> send-status patch >>>
+    // 放在**最末尾**：这是产出回复前读到的最后一句 system 文本（杠杆最高）。
+    // 只在真的失败过、且还没提示过时才有内容 —— 去重在 send-status.js 里做，
+    // 不去重会让她对「我发不出去」复读。
+    if (sendFailureHint) {
+        warnings.push(sendFailureHint);
+    }
+// <<< send-status patch <<<
     return warnings;
 }
 
@@ -317,8 +393,11 @@ export function buildCurrentMessageFocus(runtimeContext = {}, options = {}) {
             // >>> sticker-send patch >>>
             // 她能**发**表情包了：这里告诉她标记怎么写 + 库里有哪几个类别。
             // 只在库非空时才有内容（空库还教她发就是让她写一个发不出去的标记）。
-            stickerHint: options.stickerHint || ''
+            stickerHint: options.stickerHint || '',
             // <<< sticker-send patch <<<
+// >>> send-status patch >>>
+            sendFailureHint: options.sendFailureHint || ''
+// <<< send-status patch <<<
         })
     };
 

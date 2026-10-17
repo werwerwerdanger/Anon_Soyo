@@ -125,7 +125,16 @@ export function buildParticipantProfilePrompt(source = {}, analysisMode, speaker
         '3. 标记为“引用原文”的内容只作背景，不可记为目标人物观点、口头禅、性格或行为。',
         '4. 目标人物的稳定画像与当前状态，只能依据“说话人=目标人物”的本人发言归纳。',
         '5. Bot 与第三者内容可以用于理解语境，但禁止写入成目标人物自己的表达。',
-        '6. 不要臆测未出现的信息；冲突时宁可写不确定或省略。'
+        '6. 不要臆测未出现的信息；冲突时宁可写不确定或省略。',
+        // >>> profile-no-selfref patch >>>
+        '7. 档案写的是“这个人是什么样”，不是“我们聊过什么”：对方问过哪些问题、问了几次，以及 Bot 回答了什么、用什么态度，都不属于档案内容。',
+        '8. 档案里不得出现 Bot 的发言、措辞、口吻或态度，也不要记录对话发生的次数；只保留目标人物自己的稳定特征与当前状态。',
+        // <<< profile-no-selfref patch <<<
+// >>> profile-quote-scrub patch >>>
+        // 引号引语会变成台词本：实测她照着画像里的原话念，还念出了半句没听见的话。
+        '9. 档案只描述这个人的样子，不要抄录他的原话：原话一旦带引号写进档案，就会被原样当成台词念出来。要写就转述成场合、语气和情绪，不要保留任何引文或例句。',
+        '10. 输出里不要出现引号引语。'
+// <<< profile-quote-scrub patch <<<
     ].join('\n');
 
     const scopeHint = isBotOnly
@@ -182,6 +191,13 @@ export function buildParticipantProfileMergePrompt({ participantId = '', partici
         '3. 删除重复、冲突、空泛和模型自述内容；冲突处按“新版本 > 旧档案”，无法判断时写成不确定或省略。',
         '4. 不要编造聊天记录中没有出现的信息。',
         '5. 输出纯文本人物档案，建议包含“稳定画像”和“当前状态”两段。',
+        // >>> profile-no-selfref patch >>>
+        '6. 旧档案里若混进了 Bot 的发言、Bot 的措辞口吻，或对话来往过程与问答次数的记录，直接删掉，不要保留。',
+        '7. “当前状态”只保留最近仍然成立的少量条目，不要无限追加历史事件。',
+        // <<< profile-no-selfref patch <<<
+// >>> profile-quote-scrub patch >>>
+        '8. 新版本里若带引号的原话，一律改写成转述，不要保留引文。',
+// <<< profile-quote-scrub patch <<<
         '',
         '旧档案：',
         String(oldProfile || '').trim() || '无',

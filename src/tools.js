@@ -391,6 +391,53 @@ export function buildAIToolDefinitions(config = {}, options = {}) {
         });
     }
 
+    // >>> self-query patch >>>
+    // 「她自己查」的两个工具（L3，2026-10-17）。
+    // 只在有对应回调（allowSelfQuery）时才下发 —— 光有定义没有 handler 会让模型
+    // 调用到一个必定失败的洞，比不给更糟。
+    const selfQueryConfig = config.memory?.selfQuery || {};
+    if (selfQueryConfig.enabled && options.allowSelfQuery === true) {
+        tools.push({
+            type: 'function',
+            function: {
+                name: 'get_participant_profile',
+                description: '查一个人的长期人物档案（稳定画像 + 当前状态）。想确认"这个人是谁、什么性格、最近在做什么"时用它，不要凭印象编。省略参数则查当前正在跟你说话的人。',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        participant: {
+                            type: 'string',
+                            description: '要查的人：昵称或 QQ 号。省略则查当前发言人。'
+                        }
+                    },
+                    required: []
+                }
+            }
+        });
+        tools.push({
+            type: 'function',
+            function: {
+                name: 'search_conversation_history',
+                description: '在你自己的聊天记录里核实某件事：某句话或某个话题之前说过几次、最早和最晚是什么时候。用于确认"这事以前聊过吗"，避免凭感觉判断。',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        keyword: {
+                            type: 'string',
+                            description: '要核实的关键词或短句。'
+                        },
+                        participant: {
+                            type: 'string',
+                            description: '只看谁说的：昵称或 QQ 号。省略则只看当前发言人。'
+                        }
+                    },
+                    required: ['keyword']
+                }
+            }
+        });
+    }
+    // <<< self-query patch <<<
+
     return tools;
 }
 
@@ -435,7 +482,9 @@ export function buildWebToolHint(config = {}) {
         '  · 你对答案没有把握，或该信息可能在过去几个月内发生过变化。',
         '- 自检口径：只要「可能已过期」或「我不太确定」，就是必须检索的信号；宁可多查一次，也不要凭印象作答。',
         '- 不必检索的情形：纯闲聊与情绪回应、角色扮演台词与互动、对前文的追问、稳定不变的常识、用户明确表示不需要联网。',
-        '- 检索是内部动作：用角色一贯的语气把结论自然说出来，不要提「搜索 / 联网 / 查资料」，不要罗列链接列表，除非用户就是要来源。'
+        '- 检索是内部动作：用角色一贯的语气把结论自然说出来，不要提「搜索 / 联网 / 查资料」，不要罗列链接列表，除非用户就是要来源。',
+        '- 口径要分清：只在刚刚检索时才看到的东西，用「刚看到／刚听说」这类口径讲；不要用表示「早就读过、一直记得」的讲法，别把第一次见到的东西说成旧相识。',
+        '- 检索结果不一定是对方指的那一个（标题相近、关键词撞上都会混进来）。不能确定是同一个东西时，别把它的细节当事实讲；拿不准就直说拿不准，或者请对方把原文发过来。'
     ];
     // <<< proactive-search patch <<<
     if (webSearchConfig.fetch.enabled || webSearchConfig.spice.enabled) {
@@ -503,8 +552,28 @@ export function buildMcpToolHint(definitions = []) {
     return lines.join('\n');
 }
 
+// >>> self-query patch >>>
+/** 自查段：只在启用「她自己查」时生成 */
+function buildSelfQueryToolHint(config = {}) {
+    const selfQueryConfig = config.memory?.selfQuery || {};
+    if (!selfQueryConfig.enabled) {
+        return '';
+    }
+    return [
+        '【自查能力】',
+        '- `get_participant_profile`：查一个人的长期档案。打算对某个人下判断之前先查一次，别只凭这一轮里看到的内容猜。',
+        '- `search_conversation_history`：核实某件事以前聊没聊过、聊过几次、什么时候。在下"以前聊过 / 你问过好几遍"这类判断之前，先真的查一次：查到什么就说什么，查不到就直说没查到，不要用回忆补空。',
+        '- 这两个工具查的是长期记忆，可能和这一轮你看到的东西不一致；以查出来的为准，并如实说明。'
+    ].join('\n');
+}
+// <<< self-query patch <<<
+
 function buildToolHints(config = {}) {
-    return [buildWebToolHint(config), buildMentionToolHint(config)].filter(Boolean);
+    return [
+        buildWebToolHint(config),
+        buildMentionToolHint(config),
+        buildSelfQueryToolHint(config)
+    ].filter(Boolean);
 }
 
 import { headerChatScope, isPrivateChatScope } from './chat-scope.js';
@@ -789,10 +858,14 @@ export function buildAIToolContext({
     allowSendMention = true,
     mentionGenerator = null,
     mentionOutputProcessor = null,
+    // >>> self-query patch >>>
+    profileResolver = null,
+    historySearcher = null,
+    // <<< self-query patch <<<
     mcpClient = null
 } = {}) {
     const webSearchConfig = normalizeWebSearchConfig(config.ai?.tools?.webSearch || {});
-    const tools = buildAIToolDefinitions(config, { allowSendMention });
+    const tools = buildAIToolDefinitions(config, { allowSendMention, allowSelfQuery: !!profileResolver && !!historySearcher });
     const toolHints = buildToolHints(config);
     const handlers = {};
 
@@ -1024,6 +1097,83 @@ export function buildAIToolContext({
             }
         };
     }
+
+    // >>> self-query patch >>>
+    // 两个 handler 只做"参数校验 + 记日志 + 委托"，真正的库查询在 index.js 注入的回调里
+    // （tools.js 拿不到 sessionManager，反向 import 会成环）。
+    if ((config.memory?.selfQuery || {}).enabled) {
+        handlers.get_participant_profile = async (argumentsPayload = {}) => {
+            const participant = sanitizeText(argumentsPayload.participant);
+            const startedAt = Date.now();
+            if (!profileResolver) {
+                return { ok: false, error: '人物档案查询暂不可用' };
+            }
+            try {
+                const result = await profileResolver({
+                    query: participant,
+                    defaultParticipantId: defaultTargetUserId,
+                    defaultParticipantName: defaultTargetName
+                });
+                logger?.info?.('[工具] get_participant_profile 完成', {
+                    query: participant || defaultTargetUserId || '',
+                    resolvedId: result?.participantId || '',
+                    found: result?.found === true,
+                    isSelfQuery: result?.isSelfQuery === true,
+                    scope: result?.scope || '',
+                    profileLength: result?.profile ? String(result.profile).length : 0,
+                    // >>> admin-cross-read patch >>>
+                    // 闸门开没开必须落日志 —— 新增配置项"静默失效"是本项目的常客。
+                    crossRead: result?.crossRead === true,
+                    ownWordsCount: result?.hisOwnWords?.count || 0,
+                    // <<< admin-cross-read patch <<<
+                    durationMs: Date.now() - startedAt
+                });
+                return result;
+            } catch (error) {
+                logger?.warn?.('[工具] get_participant_profile 失败', {
+                    query: participant || '',
+                    error: error.message
+                });
+                return { ok: false, error: error.message };
+            }
+        };
+
+        handlers.search_conversation_history = async (argumentsPayload = {}) => {
+            const keyword = sanitizeText(argumentsPayload.keyword);
+            const participant = sanitizeText(argumentsPayload.participant);
+            const startedAt = Date.now();
+            if (!keyword) {
+                return { ok: false, error: '关键词不能为空' };
+            }
+            if (!historySearcher) {
+                return { ok: false, error: '历史检索暂不可用' };
+            }
+            try {
+                const result = await historySearcher({
+                    keyword,
+                    query: participant,
+                    defaultParticipantId: defaultTargetUserId,
+                    defaultParticipantName: defaultTargetName
+                });
+                logger?.info?.('[工具] search_conversation_history 完成', {
+                    keyword: summarizeText(keyword),
+                    resolvedId: result?.participantId || '',
+                    hits: result?.hits || 0,
+                    occurrences: result?.occurrences || 0,
+                    distinctUtterances: result?.distinctUtterances || 0,
+                    durationMs: Date.now() - startedAt
+                });
+                return result;
+            } catch (error) {
+                logger?.warn?.('[工具] search_conversation_history 失败', {
+                    keyword: summarizeText(keyword),
+                    error: error.message
+                });
+                return { ok: false, error: error.message };
+            }
+        };
+    }
+    // <<< self-query patch <<<
 
     // 并入外部 MCP 服务器工具（由 McpClientManager 提供定义与执行）
     const mcpDefinitions = mcpClient && typeof mcpClient.getToolDefinitions === 'function'

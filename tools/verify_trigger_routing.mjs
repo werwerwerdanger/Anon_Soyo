@@ -203,6 +203,57 @@ for (const [inst, label] of CASES) {
         console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label2} respond=${String(d.shouldRespond).padEnd(5)} reason=${(d.triggerReason || d.skipReason)}`);
     }
 
+    // 🔄 2026-10-15 新增：co-bot × 回复窗口（用户报「爱音一说话 soyo 就接嘴」）
+    // 事故：soyo 当天 4 次群回复**全是回爱音的**，其中 2 次触发原因就是 `reply_window` ——
+    //   窗口分支排在 `botBanterDecision`（机器人之间唯一的限流）**之前** ⇒ 配额被绕过 ⇒ 无限接嘴。
+    // 修法（cobot-reply-window patch）：co-bot 的发言不放行窗口，只能走有配额的 co_bot 路径。
+    // ⚠ 关键用例是**配额用尽后**那条：修之前它会以 reply_window 放行（respond=true），
+    //   修之后必须是 bot_banter_limit（respond=false）—— 这才是能区分新旧行为的断言。
+    const CO_BOT = String((config.chat.coBotIds || [])[0] || '');
+    if (CO_BOT && CO_BOT !== String(config.onebot?.selfId ?? '')) {
+        const gid = 9101;
+        const ev = () => ({ message_type: 'group', group_id: gid, user_id: CO_BOT });
+        // 头两条把该群的 co_bot 配额吃掉（botBanterMaxTurns，默认 2）
+        const first = buildRoutingDecision(config, ev(), '狼来了甲', false, {}, { replyWindowOpen: true });
+        const second = buildRoutingDecision(config, ev(), '狼来了乙', false, {}, { replyWindowOpen: true });
+        const third = buildRoutingDecision(config, ev(), '狼来了丙', false, {}, { replyWindowOpen: true });
+        const cases = [
+            ['co-bot + 窗口开(配额内)  → 走 co_bot', first, true, 'co_bot'],
+            ['co-bot + 窗口开(配额内2) → 走 co_bot', second, true, 'co_bot'],
+            ['co-bot + 窗口开 + 配额尽 → 静默(限流)', third, false, 'bot_banter_limit']
+        ];
+        for (const [label2, d, expectRespond, expectReason] of cases) {
+            const ok = d.shouldRespond === expectRespond && (d.triggerReason || d.skipReason) === expectReason;
+            if (!ok) failed++;
+            console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label2} respond=${String(d.shouldRespond).padEnd(5)} `
+                + `reason=${(d.triggerReason || d.skipReason)} (expect ${expectReason})`);
+        }
+
+        // 🔄 2026-10-15 新增：co-bot **私聊**配额（chat.coBotPrivateBlock / coBotPrivateMaxTurns
+        //    + coBotPrivateWindowMs）。用户要求：私聊**打开**，但「一小时最多三轮」。
+        //   block=true  ⇒ 一律 skip('cobot_private')
+        //   block=false ⇒ 前 maxTurns 条 accept('private')，之后 skip('bot_banter_limit')
+        //                 （计数键是 p:<对方QQ>，与群聊的 g:<群号> 分开）
+        const privBlocked = config.chat.coBotPrivateBlock !== false;
+        const privMax = Math.max(0, Number(config.chat.coBotPrivateMaxTurns) || 0);
+        const attempts = privBlocked ? 2 : (privMax + 1);
+        const results = [];
+        for (let i = 0; i < attempts; i++) {
+            const d = buildRoutingDecision(config, { message_type: 'private', user_id: CO_BOT },
+                `私聊配额测试第${i + 1}条`, false, {}, { replyWindowOpen: true });
+            results.push(d.triggerReason || d.skipReason);
+        }
+        const expectedPriv = privBlocked
+            ? Array(attempts).fill('cobot_private')
+            : [...Array(privMax).fill('private'), 'bot_banter_limit'];
+        {
+            const ok = JSON.stringify(results) === JSON.stringify(expectedPriv);
+            if (!ok) failed++;
+            console.log(`  ${ok ? 'PASS' : 'FAIL'}  co-bot 私聊(block=${privBlocked}, max=${privMax}) `
+                + `${JSON.stringify(results)} (expect ${JSON.stringify(expectedPriv)})`);
+        }
+    }
+
     const repeatText = `${kw} ${kw}`;
     const ev1 = { message_type: 'group', group_id: 555, user_id: 11 };
     const ev2 = { message_type: 'group', group_id: 555, user_id: 22 };

@@ -20,6 +20,16 @@
 
 const sessions = new Map();
 
+// >>> group-no-supersede patch >>>
+// 2026-10-17：群聊「换话题就作废在途回复」被实证为**常态漏答** ——
+// 群里同一时刻本来就有好几个人说话，新消息与本轮文本「词面零重叠」几乎必然成立，
+// 于是已经生成好的整轮回复在最后一刻被静默丢掉（当日 46 轮丢 5 轮，
+// 含一份完整的 P1011 题解：算完了 / 就设第二站上下车都是 u / … 四段全丢）。
+// 新话题会自己进下一批被再答一次，所以群聊**不需要**靠作废去「避免答非所问」。
+const GROUP_SUPERSEDE_ENABLED = false;
+const PRIVATE_TOPIC_SWITCH_MIN_CHARS = 16;   // 私聊：8 -> 16，只有明显另起一段的才作废
+// <<< group-no-supersede patch <<<
+
 /**
  * 归一化：去掉占位文本（[图片]/[动画表情]）、空白、标点，小写。
  * 只用于**词面**比较，不假装懂语义。
@@ -78,12 +88,18 @@ export function noteInbound(sessionKey, newText = '') {
     // 已经有在途回复 ⇒ 只有**换了话题**才作废它。
     // 原来是无条件作废；改成条件作废后，连打时不再吃掉上一句的回复（用户 2026-10-13 要求）。
     if (state.active) {
-        if (isTopicSwitch(state.roundText, newText)) {
+        // >>> group-no-supersede patch >>>
+        const isGroupSession = String(sessionKey).startsWith('group:');
+        if (isGroupSession && !GROUP_SUPERSEDE_ENABLED) {
+            // 群聊不作废：第三人插话是常态，作废=漏答。放到下一批再答更划算。
+            state.supersededReason = 'group_keep';
+        } else if (isTopicSwitch(state.roundText, newText, { minChars: PRIVATE_TOPIC_SWITCH_MIN_CHARS })) {
             state.superseded = true;
             state.supersededReason = 'topic_switch';
         } else {
             state.supersededReason = 'related_keep';
         }
+        // <<< group-no-supersede patch <<<
     }
     sessions.set(sessionKey, state);
 }
@@ -154,7 +170,13 @@ export async function waitUntilSendable(sessionKey, sleepFn, logger = console) {
             : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         for (;;) {
             if (isSuperseded(sessionKey)) {
-                logger.info?.('[闸门] 本轮已被新消息作废，放弃发送', { sessionKey });
+                // >>> group-no-supersede patch >>>
+                // INFO 级 + 无条件打印「回复下发完成」= 日志在骗人（看日志像发了、看 QQ 像没发）
+                logger.warn?.('[闸门] 本轮已被新消息作废，放弃发送', {
+                    sessionKey,
+                    reason: getSupersededReason(sessionKey)
+                });
+                // <<< group-no-supersede patch <<<
                 return false;
             }
             const left = holdUntil - Date.now();
