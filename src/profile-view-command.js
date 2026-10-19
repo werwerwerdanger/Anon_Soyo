@@ -30,7 +30,10 @@ export const PROFILE_VIEW_COMMAND_DEFAULTS = {
     // 单条消息总长上限；超了就**分下一条继续说**，而不是截断后打一句「还有 N 份放不下」
     maxChars: 1600,
     // 分条之间的间隔（QQ 发太快会风控）
-    chunkDelayMs: 700
+    chunkDelayMs: 700,
+    forwardMinChars: 600,  // 超过这个长度（或不止一条）就改走合并转发
+    access: 'admin',       // admin | self | everyone
+    allowOthersInGroup: false
 };
 
 function cleanText(value) {
@@ -255,6 +258,8 @@ export async function executeProfileViewCommand({
     plainText = '',
     command = PROFILE_VIEW_COMMAND_DEFAULTS.command,
     enabled = true,
+    access = PROFILE_VIEW_COMMAND_DEFAULTS.access,
+    allowOthersInGroup = PROFILE_VIEW_COMMAND_DEFAULTS.allowOthersInGroup,
     maxEntries = PROFILE_VIEW_COMMAND_DEFAULTS.maxEntries,
     perScopeChars = PROFILE_VIEW_COMMAND_DEFAULTS.perScopeChars,
     maxChars = PROFILE_VIEW_COMMAND_DEFAULTS.maxChars,
@@ -265,6 +270,8 @@ export async function executeProfileViewCommand({
     manualCommand = '',
     onCommandAccepted = null,
     sendStatusMessage = null,
+    sendForwardMessage = null,
+    forwardMinChars = PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars,
     sendFailureMessage = null,
     logger = console
 } = {}) {
@@ -278,16 +285,49 @@ export async function executeProfileViewCommand({
     if (typeof onCommandAccepted === 'function') {
         onCommandAccepted();
     }
-    if (!isAdmin) {
-        if (typeof sendFailureMessage === 'function') {
-            await sendFailureMessage('只有管理员可以查看人物画像');
-        }
-        return { handled: true };
-    }
-
     const argument = parseProfileViewArgument(plainText, command);
     // @ 段在调用方已被剥掉，所以「@了谁」要靠 mentionedParticipantId 兜底
     const keyword = argument || cleanText(mentionedParticipantId);
+
+    // >>> profile-access patch >>>
+    // 2026-10-19：用户要「所有人都能查画像」。做成分级，而不是把管理员门禁直接拆掉：
+    //   admin    —— 只有 chat.adminUsers 能查
+    //   self     —— 谁都能查，但只能查自己
+    //   everyone —— 谁都能查任何人
+    // 两条防线在 everyone 下仍然生效：
+    //   ① 不带关键词的**列表模式**只给管理员 —— 否则等于把"机器人记了谁"摊开
+    //   ② 群聊里查别人默认不允许（allowOthersInGroup）—— 画像里有私聊细节，
+    //      贴进群是扩散给别人看，不属于"自己查自己"
+    const deny = async (message) => {
+        if (typeof sendFailureMessage === 'function') {
+            await sendFailureMessage(message);
+        }
+    };
+    const requesterId = cleanText(event?.user_id);
+    const selfQuery = Boolean(keyword) && keyword === requesterId;
+    const isGroupChat = String(event?.message_type || '') === 'group';
+    const accessMode = ['admin', 'self', 'everyone'].includes(String(access)) ? String(access) : 'admin';
+    if (!isAdmin) {
+        if (accessMode === 'admin') {
+            await deny('这个指令现在只有管理员能用');
+            return { handled: true };
+        }
+        if (!keyword) {
+            await deny('要查谁？发 /画像 加 QQ 号，或者 @ 一下对方');
+            return { handled: true };
+        }
+        if (!selfQuery) {
+            if (accessMode === 'self') {
+                await deny('只能查自己的画像');
+                return { handled: true };
+            }
+            if (isGroupChat && allowOthersInGroup !== true) {
+                await deny('群里只能查自己的，别人的到私聊问我');
+                return { handled: true };
+            }
+        }
+    }
+    // <<< profile-access patch <<<
 
     let rows = [];
     try {
@@ -306,14 +346,38 @@ export async function executeProfileViewCommand({
 
     const delay = Number(chunkDelayMs);
     const delayMs = Number.isFinite(delay) && delay >= 0 ? Math.floor(delay) : 0;
+    const totalLength = texts.reduce((n, t) => n + t.length, 0);
 
     logger?.info?.('[画像] 指令输出', {
         keyword,
+        requesterId,
+        selfQuery,
+        access: accessMode,
         total: rows.length,
         matched: matched.length,
         chunks: texts.length,
-        length: texts.reduce((n, t) => n + t.length, 0)
+        length: totalLength
     });
+
+    // >>> forward-msg patch >>>
+    // 2026-10-19：多份画像连发会刷屏 —— 能合并就合并成一张"聊天记录"卡片。
+    // 单条短回复仍走原来的引用发送（转发卡片带不了引用，也不值当）。
+    const forwardThresholdRaw = Number(forwardMinChars);
+    const forwardThreshold = Number.isFinite(forwardThresholdRaw) && forwardThresholdRaw > 0
+        ? Math.floor(forwardThresholdRaw) : PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars;
+    if (typeof sendForwardMessage === 'function'
+        && (texts.length > 1 || totalLength >= forwardThreshold)) {
+        try {
+            await sendForwardMessage(texts);
+            logger?.info?.('[画像] 已合并转发', { nodes: texts.length, length: totalLength });
+            return { handled: true };
+        } catch (error) {
+            // 转发失败（接口不支持 / 风控）就退回分条，别让指令变成没回复
+            logger?.warn?.('[画像] 合并转发失败，退回分条发送', { error: error?.message });
+        }
+    }
+    // <<< forward-msg patch <<<
+
     for (let i = 0; i < texts.length; i += 1) {
         if (i > 0 && delayMs > 0) {
             // QQ 连发太快会被风控；间隔可配（chunkDelayMs）

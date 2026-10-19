@@ -57,6 +57,22 @@ function summarizeOneBotParams(action, params = {}) {
         };
     }
 
+    // >>> forward-msg patch >>>
+    if (action === 'send_group_forward_msg') {
+        return {
+            groupId: params.group_id ? String(params.group_id) : '',
+            nodes: Array.isArray(params.messages) ? params.messages.length : 0
+        };
+    }
+
+    if (action === 'send_private_forward_msg') {
+        return {
+            userId: params.user_id ? String(params.user_id) : '',
+            nodes: Array.isArray(params.messages) ? params.messages.length : 0
+        };
+    }
+    // <<< forward-msg patch >>>
+
     if (action === 'get_login_info' || action === 'get_group_list' || action === 'get_friend_list') {
         return {};
     }
@@ -114,6 +130,8 @@ export class OneBotClient extends EventEmitter {
         this.logger = logger;
         this.ws = null;
         this.selfId = null;
+        // 合并转发卡片的每条要显示名字（登录昵称）
+        this.nickname = '';
         this.connected = false;
         this.pendingCalls = new Map();
         this.callId = 0;
@@ -136,6 +154,7 @@ export class OneBotClient extends EventEmitter {
             // HTTP 模式下获取登录信息
             this._call('get_login_info').then(info => {
                 this.selfId = info.user_id;
+                this.nickname = info.nickname || this.nickname || '';
                 this.logger.info(`登录账号: ${info.nickname} (${info.user_id})`);
             }).catch(err => {
                 this.logger.error(`获取登录信息失败: ${err.message}`);
@@ -157,6 +176,7 @@ export class OneBotClient extends EventEmitter {
             this._startPing();
             this._call('get_login_info').then(info => {
                 this.selfId = info.user_id;
+                this.nickname = info.nickname || this.nickname || '';
                 this.logger.info(`登录账号: ${info.nickname} (${info.user_id})`);
             }).catch(err => {
                 this.logger.error(`获取登录信息失败: ${err.message}`);
@@ -373,6 +393,33 @@ export class OneBotClient extends EventEmitter {
             message: typeof message === 'string' ? message : message
         });
     }
+
+    // >>> forward-msg patch >>>
+    // 合并转发（QQ 的"聊天记录"卡片）。OneBot 11 扩展接口。
+    // ⚠ NapCat 的 uin 要字符串；name 是卡片里每条的头像名，用登录昵称。
+    buildForwardNodes(texts = []) {
+        const name = this.nickname || 'Bot';
+        const uin = String(this.selfId || '');
+        return (Array.isArray(texts) ? texts : [texts])
+            .map((text) => String(text ?? '').trim())
+            .filter(Boolean)
+            .map((text) => ({ type: 'node', data: { name, uin, content: text } }));
+    }
+
+    async sendGroupForward(groupId, texts) {
+        return this._call('send_group_forward_msg', {
+            group_id: groupId,
+            messages: this.buildForwardNodes(texts)
+        });
+    }
+
+    async sendPrivateForward(userId, texts) {
+        return this._call('send_private_forward_msg', {
+            user_id: userId,
+            messages: this.buildForwardNodes(texts)
+        });
+    }
+    // <<< forward-msg patch <<<
 
     buildReplyMessage(messageId, content) {
         if (!messageId) {

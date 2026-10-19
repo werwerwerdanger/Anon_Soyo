@@ -875,8 +875,11 @@ export class PromptBuilder {
         //
         // 文案口径：肯定式、只描述"会变化"这个情境，⛔ 不写"这不是你的立场"（否定句
         // 会二次 priming），⛔ 不举反例（列举 ⇒ 收敛到第一个），⛔ 不规定她怎么回。
-        const episodicFraming = '\n（以上是过去几次聊天的经过记录。每一条都只是当时那一次的反应，'
-            + '会随着心情、场合和对方的态度变化。）';
+        // 只保留「这是什么」的定位，去掉「会变」的弱化 ——
+        // 「每一条都只是当时那一次的反应」会让她觉得自己的话说出来不算数，
+        // 表现就是附和、随和、没有刺（用户 2026-10-18：「私聊好像也变笨了」）。
+        // 防死板已经由「删掉摘要里的定性总评」承担，这里只需要承认分量。
+        const episodicFraming = '\n（以上是过去几次聊天里实际发生过的经过 —— 谁说了什么、谁怎么应的，都算数。）';
         const summaryList = Array.isArray(normalizedContext.summaries) ? normalizedContext.summaries : [];
         systemSegments.push(...summaryList.map((summary, index) => {
             const rawSummary = String(summary.content || '');
@@ -1111,7 +1114,10 @@ const compactHistoryUser = (content) => {
                 id: `worldbook-${index}`,
                 kind: 'worldbook_entry',
                 label: entry.key || `世界书条目 ${index + 1}`,
-                content: `【世界设定】\n${entry.content}`,
+                // 2026-10-19：「世界设定」会把她的资料读成"外部文档"——
+                // 她读到了 KMP 的说明，却在思考里写「那只是世界设定，不是爱音的知识」。
+                // 同一个词换成「记忆」的视角，让它成为她知道的事。
+                content: `【你了解的】\n${entry.content}`,
                 stage: 'worldbook',
                 order: 60 + index,
                 meta: {
@@ -1177,7 +1183,10 @@ const compactHistoryUser = (content) => {
             stickerHint: buildStickerHint(this.chatConfig || {}),
             // <<< sticker-send patch <<<
 // >>> send-status patch >>>
-            sendFailureHint: runtimeContext.sendFailureHint || ''
+            sendFailureHint: runtimeContext.sendFailureHint || '',
+            // >>> mood-carry patch >>>
+            moodHint: runtimeContext.moodHint || ''
+            // <<< mood-carry patch <<<
 // <<< send-status patch <<<
         }));
         const currentMessageFocusSegment = PromptBuilder.createRuntimeSegment({
@@ -1306,7 +1315,11 @@ const compactHistoryUser = (content) => {
         const historyText = normalizedContext.recentMessages.map((message) => message.content).join(' ');
         const summaryText = normalizedContext.summaries.map((summary) => summary.content).join(' ');
         const allText = `${historyText} ${summaryText} ${userMessage}`.trim();
-        const worldBookEntries = this.worldBookManager.matchEntries(worldBook, allText, 10, stickyKeys);
+        // 2026-10-19：10 条在活跃群里**每轮都打满**（实测 worldBookCount=10）。
+        // 原因：allText 含 historyText，角色名把 order=10 的角色条目反复命中，
+        // order=5 的知识条目（音游 / OI）永远被 slice 切掉。改成可配置，默认 12。
+        const worldBookLimit = Number((this.chatConfig || {}).worldBookMaxEntries) || 12;
+        const worldBookEntries = this.worldBookManager.matchEntries(worldBook, allText, worldBookLimit, stickyKeys);
         const activePreset = runtimeOverrides.presetConfig
             ? PromptBuilder.normalizePreset(runtimeOverrides.presetConfig)
             : this.presetConfig;

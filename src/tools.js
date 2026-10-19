@@ -9,6 +9,7 @@
  */
 
 import { buildMentionMessage } from './onebot.js';
+import { getOiwikiDb, searchOiwiki, formatOiwikiResult } from './oiwiki.js';
 import {
     runSearch,
     fetchPageContent,
@@ -270,6 +271,29 @@ function buildSearchToolDefinition(webSearchConfig) {
     };
 }
 
+// >>> oiwiki-tool patch >>>
+// 本地 OI Wiki：465 页算法资料，按需检索。
+// 不塞世界书的理由见 src/oiwiki.js 顶部。
+function buildOiwikiToolDefinition() {
+    return {
+        type: 'function',
+        function: {
+            name: 'oiwiki_search',
+            description: '查本地 OI Wiki（竞赛算法资料库，含正确性证明、复杂度、代码模板）。'
+                + '被问到算法、数据结构、OI 术语、模板写法时先查这里，比凭印象答可靠。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    query: { type: 'string', description: '要查的算法/术语，例如「树链剖分」「线段树 lazy」「WQS 二分」。' },
+                    limit: { type: 'integer', description: '最多取几条（1-5，默认 3）。' }
+                },
+                required: ['query']
+            }
+        }
+    };
+}
+// <<< oiwiki-tool patch <<<
+
 function buildFetchToolDefinition(webSearchConfig) {
     return {
         type: 'function',
@@ -362,6 +386,14 @@ export function buildAIToolDefinitions(config = {}, options = {}) {
             tools.push(buildCurrencyToolDefinition());
         }
     }
+
+    // >>> oiwiki-tool patch >>>
+    // 库不存在就不注册：列表里挂一个查不到东西的工具比没有更糟
+    // （她会一遍遍试，然后跟人说「库里没有」）。
+    if (getOiwikiDb(config.ai?.tools?.oiwiki?.dbPath)) {
+        tools.push(buildOiwikiToolDefinition());
+    }
+    // <<< oiwiki-tool patch <<<
 
     if (sendMentionConfig.enabled && allowSendMention) {
         tools.push({
@@ -872,6 +904,28 @@ export function buildAIToolContext({
     function buildSearchRunConfig() {
         return { ai: { tools: { webSearch: config.ai?.tools?.webSearch || {} } } };
     }
+
+    // >>> oiwiki-tool patch >>>
+    handlers.oiwiki_search = async (argumentsPayload = {}) => {
+        const query = sanitizeText(argumentsPayload.query);
+        const db = getOiwikiDb(config.ai?.tools?.oiwiki?.dbPath);
+        const result = searchOiwiki(db, query, {
+            limit: clampInteger(argumentsPayload.limit, 1, 5, 3),
+            maxChars: clampInteger(config.ai?.tools?.oiwiki?.maxChars, 300, 3000, 1200)
+        });
+        logger?.info?.('[OIWiki] 查询', {
+            query, keywords: result.keywords, hits: result.hits.length,
+            titles: result.hits.map((h) => h.title).slice(0, 3)
+        });
+        return {
+            ok: result.ok,
+            query,
+            hits: result.hits.map((h) => ({ title: h.title, url: h.url, chars: h.chars })),
+            text: formatOiwikiResult(result),
+            error: result.error || ''
+        };
+    };
+    // <<< oiwiki-tool patch <<<
 
     if (webSearchConfig.enabled) {
         handlers.web_search = async (argumentsPayload = {}) => {

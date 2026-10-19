@@ -51,6 +51,8 @@ import { normalizeStickerConfig } from './sticker-library.js';
 import { decideReply } from './reply-decision.js';
 // <<< reply-decision patch <<<
 import { SessionManager } from './session.js';
+import { buildMoodHint } from './chat-mood.js';
+import { ProactiveChatter } from './proactive-chat.js';
 // >>> participant-roster patch >>>
 import { buildParticipantRoster } from './participant-roster.js';
 // <<< participant-roster patch <<<
@@ -3895,6 +3897,8 @@ async function handleProfileViewCommand(event, plainText) {
         plainText,
         command: commandConfig.command || PROFILE_VIEW_COMMAND_DEFAULTS.command,
         enabled: commandConfig.enabled !== false,
+        access: commandConfig.access || PROFILE_VIEW_COMMAND_DEFAULTS.access,
+        allowOthersInGroup: commandConfig.allowOthersInGroup === true,
         maxEntries: commandConfig.maxEntries ?? PROFILE_VIEW_COMMAND_DEFAULTS.maxEntries,
         perScopeChars: commandConfig.perScopeChars ?? PROFILE_VIEW_COMMAND_DEFAULTS.perScopeChars,
         maxChars: commandConfig.maxChars ?? PROFILE_VIEW_COMMAND_DEFAULTS.maxChars,
@@ -3912,6 +3916,13 @@ async function handleProfileViewCommand(event, plainText) {
             ? sendQuotedStatusMessage({ ...event, message_id: '' }, message)
             : sendQuotedStatusMessage(event, message)),
 // <<< profile-view-command patch <<<
+        // 长内容走合并转发（QQ 聊天记录卡片）；失败由 executeProfileViewCommand 内部退回分条。
+        sendForwardMessage: commandConfig.forward === false ? null : (texts) => (
+            event.message_type === 'group'
+                ? bot.sendGroupForward(event.group_id, texts)
+                : bot.sendPrivateForward(event.user_id, texts)
+        ),
+        forwardMinChars: commandConfig.forwardMinChars ?? PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars,
         sendFailureMessage: (message) => sendFailureMessage(event, message),
         logger
     });
@@ -4568,6 +4579,16 @@ async function processBatch(batch) {
             // ⚠ getSendFailureHint 自带「只提示一次」和 TTL，见 send-status.js。
             runtimeContext.sendFailureHint = getSendFailureHint(event);
 // <<< send-status patch <<<
+            // >>> mood-carry patch >>>
+            // 情绪余温：从库里读她最后一条回复 —— 重启不丢，也天然是"她真的说过的那句"。
+            // ⚠ session key 的口径必须和入库时一致（group:/private: 两种）。
+            try {
+                const moodSessionKey = event?.group_id ? `group:${event.group_id}` : `private:${event?.user_id}`;
+                runtimeContext.moodHint = buildMoodHint(sessionManager.db, moodSessionKey);
+            } catch (e) {
+                logger.warn('[情绪] 生成提示失败: ' + (e?.message || e));
+            }
+            // <<< mood-carry patch <<<
             runtimeContext.recalledEntries = sessionManager.recallMemory(runtimeContext.recallNamespace, processedInput, {
                 currentParticipantId: runtimeContext.currentSpeaker?.participantId || null,
 // >>> recall-budget patch (managed by patch_recall_segment_text.py) >>>
@@ -5776,6 +5797,40 @@ server.listen(config.server.port, config.server.host, () => {
     // 比赛倒计时：按"每日时刻 + 赛前提前量"开口，状态文件去重、每天有上限
     startOjContestPoller();
     // <<< oj-contest patch >>>
+    // >>> proactive-chat patch >>>
+    // 主动找话题：默认关闭，靠 chat.proactiveChat.enabled 打开。
+    // 四道闸门（作息窗口 / 距上次互动时长 / 每日上限 / 概率）全过才发。
+    try {
+        // 2026-10-19：原来只传角色**名字** ⇒ 这次请求里没有任何人格约束
+        // （卡上「不要用括号写动作」失效），主动开口写成了小说旁白。
+        let proactivePersona = null;
+        try {
+            const personaName = config.chat?.defaultCharacter;
+            if (personaName && personaName !== '你的角色名') {
+                const card = characterManager.loadCharacter(personaName);
+                proactivePersona = {
+                    personality: card?.personality || card?.data?.personality || '',
+                    postHistory: card?.post_history_instructions
+                        || card?.data?.post_history_instructions || ''
+                };
+            }
+        } catch (e) {
+            logger.warn('[主动] 读取角色卡失败: ' + (e?.message || e));
+        }
+        const proactiveChatter = new ProactiveChatter({
+            db: sessionManager.db,
+            aiClient,
+            bot,
+            characterName: config.chat?.defaultCharacter || '',
+            persona: proactivePersona,
+            config: config.chat?.proactiveChat || {},
+            logger
+        });
+        proactiveChatter.start();
+    } catch (e) {
+        logger.warn('[主动] 初始化失败: ' + (e?.message || e));
+    }
+    // <<< proactive-chat patch <<<
 
     const defaultCharacter = config.chat.defaultCharacter;
     applyMemoryBinding();

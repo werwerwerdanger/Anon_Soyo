@@ -197,9 +197,40 @@ function buildStrategies({ event, text, intent, routing }) {
 // ⚠ 只描述**情境**，不写"她该怎么回"：给引号例句会被逐字搬用（本项目已踩）。
 const SHORT_ANSWER_MAX_CHARS = 12;      // 折叠重复字后 ≤12 字，且她刚说过话（reply_window）
 const SHORT_ANSWER_ULTRA_CHARS = 6;     // 折叠后 ≤6 字：几乎必然是应答，不给窗口也认
+// >>> numeric-chat-hint patch >>>
+// 2026-10-19 实测（群 15:32）：「一排16.5的AT全phi摆我脸上」→ 她回
+//   「这些数字我听着一阵头疼 / 不过一直刷老曲子 大概也难往上走」：
+//   把一句有判断的吐槽压成"数字"这个符号，再用一句空评复述回去。
+// ⚠ 判据：**有带小数的数字**（16.5 / 16.47 这种分数感写法）+ **有拉丁词**，
+//   再排除编程语境。中文闲聊的「2 点 3 分」没有小数，不算。
+const CODE_FENCE_RE = /```|`[^`]+`/;
+// 题面/评测类词汇 —— 这类消息里数字是数据范围，不是成绩
+const TECH_TALK_RE = /(数据范围|时限|复杂度|样例|输入|输出|评测|提交|编译|代码|wa|tle|mle|\bo\()/i;
+// 语气词不算“术语”
+const LATIN_STOP = new Set(['ok', 'okay', 'yes', 'no', 'hh', 'hhh', 'em', 'emm', 'www', 'lol', 'orz', 'awa', 'qwq']);
+function looksLikeNumbersTalk(text) {
+    const plain = String(stripStructuredEnvelope(text) ?? '').trim();
+    if (!plain || plain.length > 80) return false;
+    if (CODE_FENCE_RE.test(plain)) return false;
+    if (TECH_TALK_RE.test(plain)) return false;
+    if (!/\d+\.\d+/.test(plain)) return false;
+    const latin = (plain.match(/[A-Za-z]{2,6}/g) || []).filter((w) => !LATIN_STOP.has(w.toLowerCase()));
+    return latin.length >= 1;
+}
+const NUMERIC_CHAT_HINT = '他这句里满是他那个圈子的数字和缩写，那是在表态、炫耀或者吐槽；'
+    + '接的是说这话的人，数字只是他的说法。';
+// <<< numeric-chat-hint patch <<<
+
 const SHORT_ANSWER_HINT = '对方极短的回复（好嘛/嗯/行）很可能是在回答你上一句，先按“他在回答我”理解，顺着接一句。';
 
-function isProbablyShortAnswer(text, routing) {
+function isProbablyShortAnswer(text, routing, event) {
+    // 2026-10-19：群里「咬他@某人」这种 2 字指使被判成"在回答我上一句"。
+    //   判据：at 段 ≥ 2 且有一段不是机器人 ⇒ 这话冲的是别人，不是在答我。
+    const segments = Array.isArray(event?.segments) ? event.segments : [];
+    const atSegments = segments.filter((s) => String(s?.type || '') === 'at');
+    if (atSegments.length >= 2 && atSegments.some((s) => s?.isBot !== true)) {
+        return false;
+    }
     const plain = String(stripStructuredEnvelope(text) ?? '');
     // 折叠连续重复字符：'好嘛11111111111' ⇒ '好嘛1'、'哈哈哈哈哈哈' ⇒ '哈'
     const compact = plain.replace(/\s+/g, '').replace(/(.)\1+/g, '$1');
@@ -237,7 +268,7 @@ function isCodeRequest(text) {
 // >>> send-status patch >>>
 // sendFailureHint：上一轮那条没送达（禁言/无权限/风控）时的事实，放在最末尾。
 // <<< send-status patch <<<
-function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '', participantRosterMention = '', stickerHint = '', sendFailureHint = '' }) {
+function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '', participantRosterMention = '', stickerHint = '', sendFailureHint = '', moodHint = '' }) {
     const warnings = [];
     if (event?.reply?.fetchStatus === 'failed') {
         warnings.push(`引用消息获取失败: ${event.reply.fetchReason || 'unknown'}`);
@@ -319,7 +350,7 @@ function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanSh
     // <<< participant-roster patch <<<
     // >>> short-answer-hint patch >>>
     // 放在**最末尾**：这是模型产出回复前读到的最后一句 system 文本。
-    if (isProbablyShortAnswer(text, routing)) {
+    if (isProbablyShortAnswer(text, routing, event)) {
         warnings.push(SHORT_ANSWER_HINT);
     }
     // <<< short-answer-hint patch <<<
@@ -337,6 +368,22 @@ function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanSh
         warnings.push(sendFailureHint);
     }
 // <<< send-status patch <<<
+    // >>> mood-carry patch >>>
+    // 情绪余温：她上一次说的原话 + 隔了多久。放在最末尾（杠杆最高）。
+    // 不写「你该是什么情绪」—— 那句话本来带的语气，她自己读到就接得上。
+    if (moodHint) {
+        warnings.push(moodHint);
+    }
+    // <<< mood-carry patch <<<
+    // >>> numeric-chat-hint patch >>>
+    // 放在最后（模型产出回复前读到的最后几句，杠杆最高）。
+    if (String(event?.messageType || event?.message_type || '') === 'group'
+        && event?.bot?.isAtBot !== true
+        && event?.reply?.toBot !== true
+        && looksLikeNumbersTalk(text)) {
+        warnings.push(NUMERIC_CHAT_HINT);
+    }
+    // <<< numeric-chat-hint patch <<<
     return warnings;
 }
 
@@ -396,7 +443,10 @@ export function buildCurrentMessageFocus(runtimeContext = {}, options = {}) {
             stickerHint: options.stickerHint || '',
             // <<< sticker-send patch <<<
 // >>> send-status patch >>>
-            sendFailureHint: options.sendFailureHint || ''
+            sendFailureHint: options.sendFailureHint || '',
+            // >>> mood-carry patch >>>
+            moodHint: options.moodHint || ''
+            // <<< mood-carry patch <<<
 // <<< send-status patch <<<
         })
     };

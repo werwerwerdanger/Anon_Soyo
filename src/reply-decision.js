@@ -236,6 +236,13 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
         });
         if (verdict === null) {
             logger.warn?.(`[决策] 无法解析，按"回"处理: ${JSON.stringify(raw.slice(0, 40))}`);
+            // >>> reply-decision-failopen patch >>>
+            // failOpen=false ⇒ 宁可少一句，也不要多一句没头没脑的
+            if (config?.chat?.replyDecision?.failOpen === false) {
+                logger.warn?.('[决策] failOpen=false，本轮按不回处理');
+                return { skip: true, reason: 'unparsed', raw, atBot };
+            }
+            // <<< reply-decision-failopen patch <<<
             return { skip: false, reason: 'unparsed', raw, atBot };
         }
         return { skip: verdict === false, reason: verdict ? 'yes' : 'no', raw, atBot };
@@ -243,6 +250,12 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
         // 失败一律放行 —— 决策层绝不能成为"回复凭空消失"的原因
         const reason = String(error?.message || '') === 'AI_TIMEOUT' ? 'timeout' : 'error';
         logger.warn?.(`[决策] 判定失败(${reason})，按"回"处理: ${error?.message || error}`);
+        // >>> reply-decision-failopen patch >>>
+        if (config?.chat?.replyDecision?.failOpen === false) {
+            logger.warn?.('[决策] failOpen=false，本轮按不回处理');
+            return { skip: true, reason, raw: '' };
+        }
+        // <<< reply-decision-failopen patch <<<
         return { skip: false, reason, raw: '' };
     }
 }
