@@ -21,7 +21,7 @@
  */
 import {
     readDoc, updateDoc, appendEvents, readEvents, dedupeKey,
-    pairKey, otherIdFromSession, paths
+    pairKey, otherIdFromSession, paths, todayKey
 } from './store.js';
 import { buildBlock, worldLineToday } from './inject.js';
 import { captureReply, extractSentences, eventsForPair } from './capture.js';
@@ -93,6 +93,7 @@ export {
     appendEvents,
     readEvents,
     dedupeKey,
+    todayKey,
     pairKey,
     otherIdFromSession,
     paths

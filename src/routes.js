@@ -24,6 +24,10 @@ import { syncPresetFiles } from './preset-sync.js';
 import { DEFAULT_IMAGE_CAPTION_PROMPT } from './image-input.js';
 import { collectParticipantGroupIds, resolveParticipantIdentityFromOneBot } from './participant-identity.js';
 import { describeModelCapabilities, resolveModelImageSupport, findModelEntry } from './model-capabilities.js';
+// [canon] 两个实例共用的世界 / 关系 / 小插曲（面板编辑入口）
+import { normalizeConfig as normalizeCanonConfig, readDoc as readCanonDoc, updateDoc as updateCanonDoc,
+    readEvents as readCanonEvents, appendEvents as appendCanonEvents, pairKey as canonPairKey,
+    todayKey as canonTodayKey, paths as canonPaths } from './canon/index.js';
 
 function estimateTokenCount(text) {
     if (!text) return 0;
@@ -7912,6 +7916,92 @@ ${lastResultText}
 
     app.get('/api/status/llm', requireAuth, (req, res) => {
         res.json({ success: true, enabled: getLlmEnabled() });
+    });
+
+    // ==================== canon（两个实例共用的世界） ====================
+    // 用户 2026-11-23：「你先别乱注入事情，这个我来写」——所以自动生成默认关掉，
+    // 改成面板手写。这三个接口就是手写入口。
+
+    const canonCfgOf = () => normalizeCanonConfig(config.chat || {});
+
+    app.get('/api/canon', requireAuth, (req, res) => {
+        try {
+            const cc = canonCfgOf();
+            const doc = readCanonDoc(cc);
+            const events = readCanonEvents(cc);
+            const p = canonPaths(cc);
+            res.json({
+                ok: true,
+                paths: { dir: p.dir, doc: p.doc, events: p.events },
+                config: { enabled: cc.enabled, capture: cc.capture, world: cc.world, reflect: cc.reflect },
+                stage: doc.stage || '',
+                world: doc.world || null,
+                pairs: doc.pairs || {},
+                today: canonTodayKey(),
+                events: events.slice(-60)
+            });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e?.message || String(e) });
+        }
+    });
+
+    app.post('/api/canon', requireAuth, (req, res) => {
+        try {
+            const cc = canonCfgOf();
+            const body = req.body || {};
+            const worldText = typeof body.worldText === 'string' ? body.worldText.trim() : null;
+            const stage = typeof body.stage === 'string' ? body.stage.trim() : null;
+            const pairsIn = body.pairs && typeof body.pairs === 'object' ? body.pairs : null;
+
+            const okWrite = updateCanonDoc(cc, (draft) => {
+                if (stage !== null) draft.stage = stage;
+                if (worldText !== null) {
+                    const prevHistory = Array.isArray(draft.world?.history) ? draft.world.history : [];
+                    draft.world = {
+                        id: `w${Date.now().toString(36)}`,
+                        date: canonTodayKey(),
+                        at: Date.now(),
+                        text: worldText,
+                        // 手写的也进 history，自动生成时用来避开重复
+                        history: [...prevHistory, worldText].filter(Boolean).slice(-5)
+                    };
+                }
+                if (pairsIn) {
+                    draft.pairs = draft.pairs || {};
+                    for (const [key, value] of Object.entries(pairsIn)) {
+                        const note = typeof value === 'string' ? value : String(value?.note ?? '');
+                        draft.pairs[key] = { ...(draft.pairs[key] || {}), note: String(note || '').trim() };
+                    }
+                }
+            });
+            if (!okWrite) return res.status(503).json({ ok: false, error: '写锁占用，稍后再试' });
+            logger.info('[canon] 面板保存', { stageChars: stage?.length ?? null, worldChars: worldText?.length ?? null });
+            res.json({ ok: true });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e?.message || String(e) });
+        }
+    });
+
+    app.post('/api/canon/event', requireAuth, (req, res) => {
+        try {
+            const cc = canonCfgOf();
+            const text = String(req.body?.text || '').trim();
+            const pair = String(req.body?.pair || '').trim();
+            if (!text) return res.status(400).json({ ok: false, error: '内容为空' });
+            if (!pair) return res.status(400).json({ ok: false, error: '缺少 pair' });
+            const n = appendCanonEvents(cc, [{
+                id: `m${Date.now().toString(36)}`,
+                at: Date.now(),
+                by: String(req.body?.by || 'manual'),
+                pair,
+                text: text.slice(0, 200),
+                sess: 'manual'
+            }]);
+            logger.info('[canon] 面板新增小插曲', { pair, chars: text.length });
+            res.json({ ok: true, added: n });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e?.message || String(e) });
+        }
     });
 
     logger.info('API 路由已设置');

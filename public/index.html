@@ -11000,6 +11000,7 @@
                 <div class="tab" data-panel="tasks" role="button" tabindex="0">📋 任务</div>
                 <div class="tab" data-panel="characters" role="button" tabindex="0">👤 角色</div>
                 <div class="tab" data-panel="worldbooks" role="button" tabindex="0">📚 世界</div>
+                <div class="tab" data-panel="canon" role="button" tabindex="0">🌏 共用世界</div>
                 <div class="tab" data-panel="prompt-range" role="button" tabindex="0">🎯 靶场</div>
                 <div class="tab" data-panel="sessions" role="button" tabindex="0">💬 会话</div>
                 <div class="tab" data-panel="participant-profiles" role="button" tabindex="0">👥 人物档案</div>
@@ -11750,6 +11751,46 @@
                 <button class="success" onclick="saveTTSConfig()">💾 保存 TTS 配置</button>
             </div>
         </div>
+        <div class="panel" id="canon">
+            <h2>🌏 共用世界</h2>
+            <p class="hint-text">
+                爱音和素世读同一份设定文件，这里改完下一轮对话就生效。
+                <span id="canon-path" style="opacity:.7;"></span>
+            </p>
+
+            <div class="btn-group" style="margin-bottom:16px;">
+                <button onclick="loadCanon()">🔄 重新加载</button>
+                <button onclick="saveCanon()">💾 保存</button>
+                <span class="meta-inline" id="canon-status"></span>
+            </div>
+
+            <div class="card" style="margin-bottom:14px;">
+                <h3>舞台 <span class="meta-inline">所有会话都看得到</span></h3>
+                <textarea id="canon-stage" rows="6" placeholder="东京。五个人组成的乐队 MyGO!!!!!…"></textarea>
+            </div>
+
+            <div class="card" style="margin-bottom:14px;">
+                <h3>今天的事 <span class="meta-inline">只注入私聊，只在当天有效</span></h3>
+                <textarea id="canon-world" rows="2" placeholder="傍晚下了一场急雨，RiNG 门口的伞架被塞满了。"></textarea>
+                <p class="hint-text" style="margin-top:8px;">留空就不出现【今天】这一段。保存时会自动标记成当天。</p>
+            </div>
+
+            <div class="card" style="margin-bottom:14px;">
+                <h3>两个人之间 <span class="meta-inline">只在对应私聊里注入</span></h3>
+                <div id="canon-pairs"><div class="empty-state">加载中...</div></div>
+            </div>
+
+            <div class="card">
+                <h3>小插曲 <span class="meta-inline">她们说过的「上次一起…」会自动进来</span></h3>
+                <div style="display:flex;gap:8px;align-items:center;margin:10px 0;">
+                    <select id="canon-event-pair" style="max-width:260px;flex:0 0 auto;"></select>
+                    <input id="canon-event-text" placeholder="上次一起去 RiNG 旁边吃了蛋糕，你还嫌太甜">
+                    <button onclick="addCanonEvent()" style="white-space:nowrap;">添加</button>
+                </div>
+                <div class="list" id="canon-events"><div class="empty-state">加载中...</div></div>
+            </div>
+        </div>
+
         <div class="panel" id="config">
             <div class="config-page-head">
                 <h2>系统配置</h2>
@@ -13980,6 +14021,10 @@
                 loadTTSConfig();
                 return;
             }
+            if (panelId === 'canon') {
+                loadCanon();
+                return;
+            }
             if (panelId === 'config') {
                 loadConfig();
             }
@@ -13987,6 +14032,157 @@
                 loadLatestRangeSyncSnapshot();
                 loadPromptRange();
                 return;
+            }
+        }
+
+        // ==================== canon（共用世界） ====================
+        // 用户 2026-11-23：「这个我来写」—— 世界事件自动生成关掉，改成这里手写。
+        const CANON_NAMES = { '2458713318': '爱音', '3628056487': '素世', '2063362809': '你' };
+        let canonCache = null;
+
+        function canonLabel(key) {
+            return String(key || '').split(':').map((id) => CANON_NAMES[id] || id).join(' \u2194 ');
+        }
+
+        function setCanonStatus(text, tone) {
+            const el = document.getElementById('canon-status');
+            if (!el) return;
+            el.textContent = text || '';
+            el.style.color = tone === 'error' ? 'var(--danger, #c0392b)'
+                : tone === 'ok' ? 'var(--success, #2d8a5e)' : '';
+        }
+
+        function renderCanonPairs(pairs) {
+            const box = document.getElementById('canon-pairs');
+            if (!box) return;
+            box.innerHTML = '';
+            const keys = Object.keys(pairs || {});
+            if (!keys.length) {
+                box.innerHTML = '<div class="empty-state">还没有配对。她们第一次私聊之后会自动出现。</div>';
+                return;
+            }
+            keys.forEach((key) => {
+                const wrap = document.createElement('div');
+                wrap.style.marginBottom = '12px';
+                const label = document.createElement('div');
+                label.className = 'meta-inline';
+                label.style.marginBottom = '6px';
+                label.textContent = canonLabel(key) + '\uff08' + key + '\uff09';
+                const ta = document.createElement('textarea');
+                ta.rows = 4;
+                ta.dataset.canonPair = key;
+                ta.value = String((pairs[key] && pairs[key].note) || '');
+                ta.placeholder = '\u4f8b\u5982\uff1a\u961f\u53cb\uff0c\u5173\u7cfb\u5728\u4e00\u70b9\u70b9\u5f80\u524d\u632a\uff0c\u8c01\u90fd\u6ca1\u8bf4\u7834\u3002';
+                wrap.appendChild(label);
+                wrap.appendChild(ta);
+                box.appendChild(wrap);
+            });
+        }
+
+        function renderCanonEvents(events) {
+            const box = document.getElementById('canon-events');
+            if (!box) return;
+            box.innerHTML = '';
+            if (!events || !events.length) {
+                box.innerHTML = '<div class="empty-state">还没有小插曲。她们说到\u300c\u4e0a\u6b21\u4e00\u8d77\u2026\u300d\u4f1a\u81ea\u52a8\u8fdb\u6765\uff0c\u4e5f\u53ef\u4ee5\u5728\u4e0a\u9762\u624b\u52a8\u52a0\u3002</div>';
+                return;
+            }
+            events.slice().reverse().forEach((e) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:flex-start;';
+                const t = document.createElement('span');
+                t.className = 'meta-inline';
+                t.style.cssText = 'white-space:nowrap;flex:0 0 auto;';
+                const d = new Date(Number(e.at) || Date.now());
+                t.textContent = (d.getMonth() + 1) + '/' + d.getDate() + ' ' + canonLabel(e.pair);
+                const body = document.createElement('span');
+                body.textContent = String(e.text || '');
+                body.style.flex = '1';
+                row.appendChild(t);
+                row.appendChild(body);
+                box.appendChild(row);
+            });
+        }
+
+        function fillCanonPairSelect(pairs) {
+            const sel = document.getElementById('canon-event-pair');
+            if (!sel) return;
+            const keys = Object.keys(pairs || {});
+            const list = keys.length ? keys : ['2458713318:3628056487'];
+            const prev = sel.value;
+            sel.innerHTML = '';
+            list.forEach((k) => {
+                const o = document.createElement('option');
+                o.value = k;
+                o.textContent = canonLabel(k);
+                sel.appendChild(o);
+            });
+            if (list.indexOf(prev) >= 0) sel.value = prev;
+        }
+
+        async function loadCanon() {
+            setCanonStatus('\u52a0\u8f7d\u4e2d\u2026', '');
+            try {
+                const res = await fetch('/api/canon');
+                const data = await res.json();
+                if (!data.ok) throw new Error(data.error || '\u52a0\u8f7d\u5931\u8d25');
+                canonCache = data;
+                document.getElementById('canon-stage').value = data.stage || '';
+                const isToday = data.world && data.world.date === data.today;
+                document.getElementById('canon-world').value = isToday ? (data.world.text || '') : '';
+                const pathEl = document.getElementById('canon-path');
+                if (pathEl) pathEl.textContent = data.paths && data.paths.dir ? '\uff08' + data.paths.dir + '\uff09' : '';
+                renderCanonPairs(data.pairs);
+                fillCanonPairSelect(data.pairs);
+                renderCanonEvents(data.events);
+                const worldNote = data.world && data.world.date ? '\u00b7 \u6700\u8fd1\u4e16\u754c\u4e8b\u4ef6 ' + data.world.date : '\u00b7 \u65e0\u4e16\u754c\u4e8b\u4ef6';
+                setCanonStatus('\u5df2\u52a0\u8f7d \u00b7 \u4eca\u5929 ' + data.today + ' ' + worldNote, 'ok');
+            } catch (e) {
+                setCanonStatus('\u52a0\u8f7d\u5931\u8d25\uff1a' + (e && e.message ? e.message : e), 'error');
+            }
+        }
+
+        async function saveCanon() {
+            const stage = document.getElementById('canon-stage').value;
+            const worldText = document.getElementById('canon-world').value;
+            const pairs = {};
+            document.querySelectorAll('[data-canon-pair]').forEach((ta) => {
+                pairs[ta.dataset.canonPair] = ta.value;
+            });
+            setCanonStatus('\u4fdd\u5b58\u4e2d\u2026', '');
+            try {
+                const res = await fetch('/api/canon', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ stage: stage, worldText: worldText, pairs: pairs })
+                });
+                const data = await res.json();
+                if (!data.ok) throw new Error(data.error || '\u4fdd\u5b58\u5931\u8d25');
+                setCanonStatus('\u5df2\u4fdd\u5b58 \u00b7 \u4e0b\u4e00\u8f6e\u5bf9\u8bdd\u5c31\u5e26\u4e0a', 'ok');
+            } catch (e) {
+                setCanonStatus('\u4fdd\u5b58\u5931\u8d25\uff1a' + (e && e.message ? e.message : e), 'error');
+            }
+        }
+
+        async function addCanonEvent() {
+            const input = document.getElementById('canon-event-text');
+            const pairSel = document.getElementById('canon-event-pair');
+            const text = String((input && input.value) || '').trim();
+            const pair = (pairSel && pairSel.value) || '';
+            if (!text) { setCanonStatus('\u5148\u5199\u4e00\u53e5\u5185\u5bb9', 'error'); return; }
+            try {
+                const res = await fetch('/api/canon/event', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text, pair: pair })
+                });
+                const data = await res.json();
+                if (!data.ok) throw new Error(data.error || '\u6dfb\u52a0\u5931\u8d25');
+                if (input) input.value = '';
+                setCanonStatus('\u5df2\u6dfb\u52a0', 'ok');
+                await loadCanon();
+            } catch (e) {
+                setCanonStatus('\u6dfb\u52a0\u5931\u8d25\uff1a' + (e && e.message ? e.message : e), 'error');
             }
         }
 
