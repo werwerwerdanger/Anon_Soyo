@@ -13,6 +13,47 @@ import { pairKey, otherIdFromSession } from './store.js';
 
 const MAX_EVENTS_IN_PROMPT = 24;
 
+// >>> 视角转换 >>>
+// 为什么要有这一段：note 是**给面板看**的通用描述，里面必然用第三人称（"素世…爱音…"）。
+// 直接注入给她，她会把它当"别人的设定集"来读 —— 世界书那边踩过一次同样的坑
+// （注入「世界设定」，她在思考里写"那只是世界设定，不是爱音的知识"）。
+// 所以注入前把"她自己"换成"你"，其余人名保持原样。
+const ROLE_ALIASES = {
+    'Soyo_Nagasaki': ['长崎素世', '素世', 'Soyorin'],
+    'Anon_Chihaya': ['千早爱音', '爱音'],
+    'soyo': ['长崎素世', '素世'],
+    'anon': ['千早爱音', '爱音']
+};
+
+function normalizeRoleKey(value = '') {
+    return String(value || '').toLowerCase().replace(/[\s_\-]+/g, '');
+}
+
+/** 角色卡里写的是 "Anon Chihaya"，配置里写的是 "Anon_Chihaya" —— 都认。 */
+function aliasesFor(selfName = '') {
+    const key = normalizeRoleKey(selfName);
+    if (!key) return [];
+    for (const [name, list] of Object.entries(ROLE_ALIASES)) {
+        if (normalizeRoleKey(name) === key) return list;
+    }
+    if (key.includes('soyo')) return ROLE_ALIASES['Soyo_Nagasaki'];
+    if (key.includes('anon')) return ROLE_ALIASES['Anon_Chihaya'];
+    return [];
+}
+
+export function toSecondPerson(text = '', selfName = '') {
+    const aliases = aliasesFor(selfName);
+    let out = String(text || '');
+    if (!aliases.length) return out;
+    for (const alias of aliases) {
+        out = out.split(alias).join('你');
+    }
+    // "你（你）" / "你你" 这类替换残渣收敛一下
+    out = out.replace(/你[（(]你[）)]/g, '你').replace(/你+/g, '你');
+    return out;
+}
+// <<< 视角转换 <<<
+
 function md(ts) {
     const d = new Date(Number(ts) || Date.now());
     return `${d.getMonth() + 1}/${d.getDate()}`;
@@ -27,7 +68,7 @@ function todayWorld(world, now = Date.now()) {
 /**
  * 生成注入文本。没有内容就返回空串（调用方据此决定要不要 push 这段）。
  */
-export function buildBlock({ cfg = {}, isPrivate = false, sessionId = '', selfId = '', now = Date.now() } = {}) {
+export function buildBlock({ cfg = {}, isPrivate = false, sessionId = '', selfId = '', selfName = '', now = Date.now() } = {}) {
     const doc = readDoc(cfg);
     const parts = [];
 
@@ -43,7 +84,7 @@ export function buildBlock({ cfg = {}, isPrivate = false, sessionId = '', selfId
     if (!pair) return parts.join('\n\n');
 
     const note = String(doc.pairs?.[pair]?.note || '').trim();
-    if (note) parts.push(`【你们之间】\n${note}`);
+    if (note) parts.push(`【你们之间】\n${toSecondPerson(note, selfName)}`);
 
     const events = eventsForPair(cfg, pair);
     if (events.length) {

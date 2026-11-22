@@ -1171,7 +1171,10 @@ const compactHistoryUser = (content) => {
                 cfg: normalizeCanonConfig(this.chatConfig),
                 isPrivate: String(runtimeContext?.messageType || '') === 'private',
                 sessionId: String(runtimeContext?.sessionId || ''),
-                selfId: String(runtimeContext?.botSelfId || '')
+                selfId: String(runtimeContext?.botSelfId || ''),
+                // 关系描述要转成第二人称再注入，否则她会当成"别人的设定"来读。
+                // ⚠ 这段在 buildRuntimeComposition 里，没有 characterName —— 用角色卡对象。
+                selfName: String(character?.name || '')
             });
             if (canonText) {
                 systemSegments.push(PromptBuilder.createRuntimeSegment({
