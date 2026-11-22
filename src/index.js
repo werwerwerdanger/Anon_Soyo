@@ -33,6 +33,15 @@ import fs from 'fs';
 import { OneBotClient, buildMentionMessage } from './onebot.js';
 import { buildAIToolContext, appendMentionTaskToPromptMessages, generateMentionTextFromPrompt, buildToolPhaseResultMessage, buildToolPhaseMessages } from './tools.js';
 import { chatScopeKey } from './chat-scope.js';
+import { botSuffix, refreshGroupBots, shouldRequireAtInGroup, isKnownBot } from './known-bots.js';
+import { setMoodStore, moodApply, moodClassifyText, moodTickTurn } from './mood.js';
+import { shouldUseWebSearch, noteWebSearch, readSearchCount, WEB_SEARCH_TOOL } from './web-search.js';
+import { openFollow, canFollow, consumeFollow, followState } from './follow-window.js';
+import { setStyleDir, styleFileFor, loadStyle, saveStyle, buildStylePrompt, parseStyleRules, shouldRefreshStyle } from './style-learn.js';
+import { safeName } from './safe-name.js';
+import { resolveChatForSession } from './session-overrides.js';
+import { matchKeywordReply } from './keyword-replies.js';
+import { isQuestionLike, scoreFaq, buildFaqPrompt, buildFaqFullPrompt, parseFaqAnswer, shouldSkipByRepeat } from './faq-answer.js';
 // >>> napcat-output-ignore patch (managed by patch_ignore_napcat.py) >>>
 import { isNapcatNoise } from './napcat-output.js';
 // <<< napcat-output-ignore patch <<<
@@ -115,8 +124,13 @@ import {
 import { OjAcPoller, buildAcNotice, normalizeOjAcConfig } from './oj-ac.js';
 // <<< oj-ac patch <<<
 // >>> oj-contest patch >>>
-import { OjContestPoller, buildContestNotice, buildDailyProblemNotice, normalizeOjContestConfig } from './oj-contest.js';
+import { OjContestPoller, buildContestNotice, buildDailyProblemNotice, normalizeOjContestConfig,
+    fetchCalendarEvents, filterCalendarEvents, formatContestWhen, formatCountdown, parseContestList,
+    beijingParts } from './oj-contest.js';
+import { OjListWatcher, normalizeOjListConfig } from './oj-list-watch.js';
 // <<< oj-contest patch >>>
+// [canon] 两个实例共用的世界 / 关系 / 小插曲，见 src/canon/index.js。
+import { onReply as canonOnReply, tick as canonTick, normalizeConfig as normalizeCanonConfig } from './canon/index.js';
 import { collectParticipantGroupIds, mergeParticipantIdentity, resolveParticipantIdentityFromOneBot } from './participant-identity.js';
 import {
     getParticipantProfileTimerKey,
@@ -976,6 +990,28 @@ async function generateReplyWithRetry({ aiClient, messages, toolContext, chatAIO
     const chainLeakEnabled = chainLeakRetryConfig?.enabled !== false;
     const chainLeakMaxRetries = chainLeakEnabled ? Number(chainLeakRetryConfig?.maxRetries) || 0 : 0;
     const chainLeakDelayMs = Number(chainLeakRetryConfig?.delayMs) || 0;
+    // >>> web-search patch >>>
+    // DeepSeek 内置搜索（server tool，不计费只算 token），默认关闭。
+    // 只在消息里有明确的事实/时效/排障信号时才开 —— 群聊里乱搜会把她变成查资料的助手。
+    let effectiveOverrides = chatAIOverrides;
+    try {
+        const ws = shouldUseWebSearch(config, userInput || '', sessionId || '');
+        if (ws.use) {
+            effectiveOverrides = {
+                ...chatAIOverrides,
+                serverTools: [WEB_SEARCH_TOOL],
+                // 官方要求：thinking 必须 disabled 才走普通搜索（enabled 会变成最多 20 轮的深度搜索）
+                thinking: { type: 'disabled' }
+            };
+            noteWebSearch(sessionId || '');
+            logger.info('[搜索] 本轮开联网', { reason: ws.reason, session: sessionId });
+        } else if (ws.reason !== 'disabled') {
+            logger.debug?.('[搜索] 不开联网', { reason: ws.reason, session: sessionId });
+        }
+    } catch (error) {
+        logger.debug?.('[搜索] 判断失败，按不搜处理', { error: error?.message || String(error) });
+    }
+    // <<< web-search patch >>>
     let lastReplyResult = null;
     let lastReply = '';
     let attempts = 0;
@@ -993,8 +1029,17 @@ async function generateReplyWithRetry({ aiClient, messages, toolContext, chatAIO
                 }
             ]
             : messages;
-        const replyResult = await callWithTimeout(() => aiClient.chatWithTools(attemptMessages, toolContext, chatAIOverrides), timeoutMs);
+        const replyResult = await callWithTimeout(() => aiClient.chatWithTools(attemptMessages, toolContext, effectiveOverrides), timeoutMs);
         const reply = aiClient.getVisibleResponseContent(replyResult);
+        // >>> web-search patch >>>
+        // 实际搜了几次（模型可能判断不需要），只记日志，方便对账
+        try {
+            if (effectiveOverrides !== chatAIOverrides) {
+                const n = readSearchCount(replyResult);
+                logger.info('[搜索] 本轮实际搜索次数', { session: sessionId, count: n });
+            }
+        } catch { /* 读不出来不影响回复 */ }
+        // <<< web-search patch >>>
         lastReplyResult = replyResult;
         lastReply = reply;
 
@@ -1504,11 +1549,12 @@ function buildParticipants(items) {
     for (const item of items) {
         const sender = item.event.sender;
         const userId = item.event.user_id;
-        const userName = sender?.card || sender?.nickname || `QQ:${userId}`;
+        const userName = safeName(sender?.card || sender?.nickname, `QQ:${userId}`);
         const key = `${userId}:${userName}`;
         if (!seen.has(key)) {
             seen.add(key);
-            participants.push(`${userName}(${userId})`);
+            // 已知机器人（含第三方 bot）在括号后加「（机器人）」，见 known-bots.js
+            participants.push(`${userName}(${userId})${botSuffix(config, userId)}`);
         }
     }
     return participants;
@@ -1522,7 +1568,7 @@ function buildSpeakerIdentity(event, participantOverride = null) {
 
     return {
         participantId: String(targetParticipantId),
-        participantName: participantOverride?.participantName || event.sender?.card || event.sender?.nickname || String(targetParticipantId),
+        participantName: safeName(participantOverride?.participantName || event.sender?.card || event.sender?.nickname, String(targetParticipantId)),
         messageType: event.message_type,
         groupId: event.group_id ? String(event.group_id) : null
     };
@@ -1632,6 +1678,8 @@ async function generateContextualMentionReply({
     const context = sessionManager.getContext(sessionId, config.chat.historyLimit || 30, chatScopeKey({ messageType: event.message_type, groupId: event.group_id, userId: event.user_id }));
     const stickyKeys = sessionManager.getStickyEntryKeys(sessionId);
     const runtimeContext = {
+        // [canon] 算 pair 需要知道"自己是谁"
+        botSelfId: String(bot?.selfId || ''),
         sessionId,
         memoryScope,
         recallNamespace: buildRecallNamespace(config, memoryScope, currentCharacterName),
@@ -2258,11 +2306,35 @@ function coBotYieldMarkSpoken(config, event) {
 }
 // <<< cobot-yield patch <<<
 
+// >>> primary-by-trigger-rank patch >>>
+// 触发强度：数字越大越"是冲着她说的那句话"。
+// 只用于**多触发项的批次里挑主事件**，不参与闸门判定。
+const TRIGGER_STRENGTH = {
+    at: 100, admin_mention: 95, reply_to_bot: 90,
+    poke: 85, trigger_user: 55, keyword: 50, prefix: 45,
+    co_bot: 40, reply_window: 30, always: 20, private: 20
+};
+function triggerStrength(item) {
+    const reason = String(item?.routingDecision?.triggerReason || '');
+    const score = TRIGGER_STRENGTH[reason];
+    return Number.isFinite(score) ? score : 0;
+}
+// <<< primary-by-trigger-rank patch <<<
+
 function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}, hints = {}) {
-    const triggerMode = config.chat.triggerMode || 'auto';
-    const requireAtInGroup = config.chat.requireAtInGroup !== false;
-    const triggerPrefix = config.chat.triggerPrefix || '';
-    const triggerKeywords = config.chat.triggerKeywords || [];
+    // >>> routing-scoped-config patch >>>
+    // 路由参数也支持按会话覆盖：比赛群可以单独设成"必须 @"，日常群照旧。
+    // 见 session-overrides.js 的分层规则。
+    const scopeKey = event?.message_type === 'group' && event?.group_id
+        ? `group:${event.group_id}`
+        : (event?.user_id ? `private:${event.user_id}` : '');
+    const scopedChat = resolveChatForSession(config, scopeKey);
+    // <<< routing-scoped-config patch >>>
+    const triggerMode = scopedChat.triggerMode || 'auto';
+    // 小群保护：人少的时候默认要求 @（见 known-bots.js 的 shouldRequireAtInGroup）
+    const requireAtInGroup = shouldRequireAtInGroup(scopedChat, event?.group_id || '');
+    const triggerPrefix = scopedChat.triggerPrefix || '';
+    const triggerKeywords = scopedChat.triggerKeywords || [];
     // 合并转发展开内容不参与关键词/前缀命中（extractMessageInfo 提供剔除转发正文后的 triggerText）
     const routingText = typeof messageInfo.triggerText === 'string' ? messageInfo.triggerText : plainText;
     const hasPrefix = triggerPrefix ? routingText.startsWith(triggerPrefix) : false;
@@ -2327,7 +2399,13 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
     //   证据：soyo 今天 4 次群回复**全是回爱音的**，其中 2 次触发原因就是 `reply_window`。
     // ⇒ co-bot 的发言**不放行窗口**，只能走下面那条有配额的 `co_bot` 路径
     //   （或真的被 @/关键词点名）。**真人不受影响**（人类才需要"刚聊过就不用 @"）。
-    if (hints.replyWindowOpen && !isCoBot(config, event)) {
+    // >>> primary-by-trigger-rank patch >>>
+    // 被 @ 的消息不走窗口这条捷径：否则 triggerReason 会记成 'reply_window'，
+    // 下游 buildReplyTarget / current-message-focus 就不知道"这是有人点名叫她"，
+    // 回复变成接着群里闲聊说。只**减少**一条放行路径——@ 的消息继续往下必然
+    // 会命中 group 分支里的 `if (isAtMe) return accept('at')`，不放宽任何闸门。
+    if (hints.replyWindowOpen && !isCoBot(config, event) && !isAtMe) {
+    // <<< primary-by-trigger-rank patch <<<
         // <<< cobot-reply-window patch <<<
         // >>> reply-window-sticker patch >>>
         // chat.replyWindow.stickersTrigger=false 时，窗口**不再放行纯表情包**：
@@ -2358,6 +2436,28 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
     // <<< sticker-assertion patch <<<
 
     if (event.message_type === 'group') {
+        // >>> at-only patch >>>
+        // 2026-11-02 用户要求：群里**只有被 @（或有人回复她的消息）才回复**。
+        // 放在分支最前面 —— co_bot 让位、回复窗口、trigger_user、关键词、
+        // triggerMode:'always' 这些捷径一并挡掉，只留「真有人叫她」这一条。
+        // FAQ / 关键词应答在 handleMessage 里、**早于路由**，比赛群答疑不受影响。
+        // >>> follow-window patch >>>
+        // 「只有 @ 才回」有个副作用：@ 一次说一句，然后就永久闭嘴，真人不这样。
+        // 所以开一个接力窗口（默认 4 分钟 / 7 句）：被 @ 时开窗，窗口内允许她接着聊。
+        // 窗口只放行路由，决策和发言预算照旧 —— 不等于她一定会说。
+        if (requireAtInGroup) {
+            const fwKey = event.message_type === 'group' && event.group_id ? `group:${event.group_id}` : '';
+            if (isAtMe || messageInfo.replyToBot) {
+                if (fwKey) openFollow(fwKey, config);
+            } else if (!(fwKey && canFollow(fwKey, config))) {
+                return skip('group_requires_at');
+            } else {
+                // 只放行、不扣额度 —— 真说出去以后在 dispatchReply 里扣
+                logger.debug?.('[路由] 接力窗口内放行', { session: fwKey, ...followState(fwKey, config) });
+            }
+        }
+        // <<< follow-window patch >>>
+        // <<< at-only patch >>>
         // >>> bot-banter-limit patch <<<
         // 放在 replyToBot 之前 —— 否则机器人之间用"回复"接话会绕过上限（实测漏洞）。
         if (isCoBot(config, event)) {
@@ -2970,7 +3070,7 @@ function sendEmojiReactionForEvent(event) {
 }
 
 async function dispatchReply(event, processedReply, options = {}) {
-    return dispatchReplyWithDeps(event, processedReply, options, {
+    const result = await dispatchReplyWithDeps(event, processedReply, options, {
         config,
         bot,
         ttsManager,
@@ -2978,6 +3078,39 @@ async function dispatchReply(event, processedReply, options = {}) {
         recordDashboardMetric,
         sleep
     });
+    // >>> mood/follow 记账 patch >>>
+    // 真发出去了才算：① 从接力窗口额度里扣一次 ② 情绪因为"聊过一轮"往基线走一点。
+    // 失败也扣 —— 反正这轮她确实开口了。
+    try {
+        const key = event?.message_type === 'group' && event?.group_id
+            ? `group:${event.group_id}`
+            : (event?.user_id ? `private:${event.user_id}` : '');
+        if (key) {
+            consumeFollow(key, config);
+            moodTickTurn(key, 1);
+        }
+    } catch (error) {
+        logger.debug?.('[情绪] 轮次衰减失败', { error: error?.message || String(error) });
+    }
+    // <<< mood/follow 记账 patch >>>
+    // [canon] 她说过的「上次我们一起…」这类陈述句，落到两个实例共读的 canon 里。
+    try {
+        const added = canonOnReply({
+            chat: config?.chat || {},
+            event,
+            replyText: String(processedReply || ''),
+            selfId: String(bot?.selfId || event?.self_id || ''),
+            characterName: config?.chat?.defaultCharacter || '',
+            aiClient,
+            logger
+        });
+        if (added > 0) {
+            logger.info(`[canon] 记下 ${added} 条小插曲`, { session: `private:${event.user_id}` });
+        }
+    } catch (error) {
+        logger.debug?.('[canon] 捕获失败', { error: error?.message || String(error) });
+    }
+    return result;
 }
 
 function isParticipantProfileBlacklisted(participantProfileConfig, participantId) {
@@ -3906,6 +4039,11 @@ async function handleProfileViewCommand(event, plainText) {
         isAdmin: isAdminUser(config, event.user_id),
         sessionManager,
         mentionedParticipantId: mentioned?.participantId || '',
+        // >>> profile-self-query patch >>>
+        // 让 /画像 能识别「查的是 bot 自己」（2458713318=anon / 3628056487=soyo），
+        // 回一句人话而不是「没有找到」。
+        botSelfId: bot.selfId,
+        // <<< profile-self-query patch <<<
         manualCommand: config.chat?.commands?.participantProfileManual?.command || '',
         onCommandAccepted: () => sendEmojiReactionForEvent(event),
 // >>> profile-view-command patch >>>
@@ -4152,6 +4290,159 @@ async function notifyOjAc(item) {
     return sent;
 }
 
+// >>> list-watch patch >>>
+/**
+ * 题单更新监控（每天 09:00 扫一次 /api/lists/{id}）。
+ * 只在 anon 上开：soyo 的 OJ 凭据没配，而且这活儿一个人做就够了。
+ */
+let ojListWatcher = null;
+function startOjListWatch() {
+    const cfg = normalizeOjListConfig(config.ojListWatch, config.ojFeedback);
+    if (!cfg.enabled) {
+        logger.info('[题单监控] 未启用，跳过');
+        return null;
+    }
+    const stateFile = isAbsolute(cfg.stateFile) ? cfg.stateFile : join(ROOT_DIR, cfg.stateFile);
+    ojListWatcher = new OjListWatcher({
+        getConfig: () => config.ojListWatch,
+        getFallbackConfig: () => config.ojFeedback,
+        logger,
+        stateFile,
+        onUpdate: async (text, meta) => {
+            await bot.sendGroupMessage(meta.groupId, withNoticeSuffix(text, cfg));
+        }
+    });
+    ojListWatcher.start();
+    logger.info('[题单监控] 已启动', {
+        listId: cfg.listId,
+        atMinutes: cfg.atMinutes,
+        groups: cfg.notifyGroups
+    });
+    return ojListWatcher;
+}
+// <<< list-watch patch >>>
+
+// >>> daily-board patch >>>
+/**
+ * 每天固定时刻把「最近的比赛」推到固定群。
+ *
+ * 用户诉求（2026-11-19）：中午 12 点在 `1045971009`（2026cdut-acm-候选）自动发一次。
+ *
+ * 为什么不做成 `ojContest.dailyAtMinutes`：
+ *   那个是**倒计时播报**，只念"距最近一场还有几天"；这个是**赛程板**，要列全部比赛。
+ *   两者语义不同，塞在一起以后分别调参会互相干扰。
+ *
+ * 去重靠状态文件里的 `dayDate`（不能用内存）：
+ *   bot 一天重启三次就发三条 —— 和题单监控同一个坑。
+ */
+const DAILY_BOARD_DEFAULTS = Object.freeze({
+    enabled: false,
+    atMinutes: 12 * 60,
+    notifyGroups: [],
+    top: 6,
+    stateFile: 'data/oj-daily-board.json'
+});
+
+function normalizeDailyBoardConfig(src = {}) {
+    const raw = src && typeof src === 'object' ? src : {};
+    const toIntOr = (v, d) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : d);
+    return {
+        enabled: raw.enabled === true,
+        atMinutes: Math.min(23 * 60 + 59, Math.max(0, toIntOr(raw.atMinutes, DAILY_BOARD_DEFAULTS.atMinutes))),
+        notifyGroups: (Array.isArray(raw.notifyGroups) ? raw.notifyGroups : [])
+            .map((g) => String(g ?? '').trim()).filter(Boolean),
+        top: Math.max(1, toIntOr(raw.top, DAILY_BOARD_DEFAULTS.top)),
+        stateFile: String(raw.stateFile || DAILY_BOARD_DEFAULTS.stateFile)
+    };
+}
+
+let dailyBoardTimer = null;
+function startDailyContestBoard() {
+    const cfg = normalizeDailyBoardConfig(config.ojDailyBoard || {});
+    if (!cfg.enabled) {
+        logger.info('[每日赛程] 未启用，跳过');
+        return null;
+    }
+    if (cfg.notifyGroups.length === 0) {
+        logger.warn('[每日赛程] 没有目标群（ojDailyBoard.notifyGroups 是空的）');
+        return null;
+    }
+    const stateFile = isAbsolute(cfg.stateFile) ? cfg.stateFile : join(ROOT_DIR, cfg.stateFile);
+
+    const readState = () => {
+        try {
+            return JSON.parse(fs.readFileSync(stateFile, 'utf8')) || {};
+        } catch {
+            return {};
+        }
+    };
+    const writeState = (state) => {
+        try {
+            const dir = dirname(stateFile);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf8');
+        } catch (error) {
+            logger.warn?.(`[每日赛程] 状态写入失败: ${error?.message}`);
+        }
+    };
+
+    let running = false;
+    const tick = async () => {
+        if (running) return;
+        const clock = beijingParts(Date.now());
+        const nowMinutes = clock.hour * 60 + clock.minute;
+        // 只在目标时刻之后 3 小时内触发（错过就不补，免得下午突然来一条）
+        if (nowMinutes < cfg.atMinutes || nowMinutes - cfg.atMinutes > 180) return;
+        const state = readState();
+        if (state.dayDate === clock.date) return;
+
+        running = true;
+        try {
+            const ocCfg = normalizeOjContestConfig(config.ojContest, config.ojFeedback);
+            const now = Date.now();
+            const items = await collectUpcomingContests(ocCfg, now);
+            if (items.length === 0) {
+                logger.info('[每日赛程] 最近没有排期，跳过');
+            } else {
+                const text = formatUpcomingContests(items, ocCfg, now, cfg.top);
+                // 人设后缀（素世：「喵~」）单独一条发 —— 跟 /最近比赛 的观感一致：
+                // 先给赛程板，再补一句「喵~」。拼在列表末尾会粘在最后一场比赛名后面。
+                const suffix = String(ocCfg.noticeSuffix || '').trim();
+                let sent = 0;
+                for (const groupId of cfg.notifyGroups) {
+                    try {
+                        await bot.sendGroupMessage(groupId, text);
+                        sent += 1;
+                        if (suffix) {
+                            // 定时任务不走 dispatcher 的限速，自己隔一下，免得 QQ 判连发
+                            await new Promise((resolve) => setTimeout(resolve, 1200));
+                            await bot.sendGroupMessage(groupId, suffix);
+                        }
+                    } catch (error) {
+                        logger.warn?.(`[每日赛程] group:${groupId} 发送失败: ${error?.message}`);
+                    }
+                }
+                logger.info(`[每日赛程] 已播报（${sent}/${cfg.notifyGroups.length} 个群）`, { count: items.length, suffix: suffix || null });
+                if (sent === 0) throw new Error('全部目标发送失败');
+            }
+            state.dayDate = clock.date;
+            state.updatedAt = now;
+            writeState(state);
+        } catch (error) {
+            logger.warn?.(`[每日赛程] 执行失败: ${error?.message}`);
+        } finally {
+            running = false;
+        }
+    };
+
+    dailyBoardTimer = setInterval(() => { tick().catch(() => {}); }, 60 * 1000);
+    if (dailyBoardTimer.unref) dailyBoardTimer.unref();
+    tick().catch(() => {});
+    logger.info('[每日赛程] 已启动', { atMinutes: cfg.atMinutes, groups: cfg.notifyGroups, top: cfg.top });
+    return dailyBoardTimer;
+}
+// <<< daily-board patch >>>
+
 function startOjAcPoller() {
     const cfg = normalizeOjAcConfig(config.ojAc, config.ojFeedback);
     if (!cfg.enabled) {
@@ -4174,14 +4465,61 @@ function startOjAcPoller() {
 
 // >>> oj-contest patch >>>
 /** 比赛倒计时的发送：纯文本播报（不过 AI —— 避免为一条提醒多花一次模型调用） */
+// >>> notice-suffix patch >>>
+/**
+ * 播报文案的后缀（2026-11-19 用户要求：素世的所有提醒后面加"喵~"）。
+ *
+ * 为什么放在发送层而不是改 `buildContestNotice` 的模板：
+ *   模板是纯函数、两个实例共用；后缀是**人设特征**，只属于某一个实例。
+ *   放这里就只要给 soyo 的 config 加一行 `"noticeSuffix": "喵~"`，代码零分叉。
+ *
+ * 去重：如果正文已经以它结尾（模型偶尔会自己加），不重复追加。
+ */
+function withNoticeSuffix(text, cfg = {}) {
+    const body = String(text || '');
+    const suffix = String(cfg?.noticeSuffix || '').trim();
+    if (!suffix) return body;
+    const trimmed = body.trimEnd();
+    if (trimmed.endsWith(suffix)) return body;
+
+    const lines = trimmed.split('\n');
+    const hasUrl = lines.length > 1 && /^https?:\/\//i.test(lines[lines.length - 1].trim());
+    // 链接前面那一行才是"正文结尾"；没有链接就是最后一行
+    const bodyLine = hasUrl ? lines[lines.length - 2] : lines[lines.length - 1];
+
+    // 列表项（`· 后天 20:00  ABC 486`）不能直接接后缀 ——
+    // 会变成「ABC 486喵~」，读起来像比赛名字的一部分。单独起一行。
+    if (/^\s*[·•+…]/.test(bodyLine)) {
+        if (hasUrl) lines.splice(lines.length - 1, 0, suffix);
+        else lines.push(suffix);
+        return lines.join('\n');
+    }
+
+    // 叙述句（「今天 20:00 开始 · 差不多该准备了。」）接在句末。
+    // 🔴 句末**所有**语气标点先扔掉：`准备了。喵~` / `准备了！喵~` 都像两句话，
+    // `准备了喵~` 才是一句（2026-11-19 用户明确要求：句号、感叹号、问号……全扔）。
+    // 只动结尾，句子中间的标点保留。
+    const dropTailPunct = (str) => {
+        const raw = String(str);
+        const out = raw.replace(/[。！？!?；;，,、.．…~～]+$/, '');
+        return out.trim() ? out : raw.trim();   // 整行只有标点时别把它清空
+    };
+    if (hasUrl) {
+        lines[lines.length - 2] = `${dropTailPunct(bodyLine)}${suffix}`;
+        return lines.join('\n');
+    }
+    return `${dropTailPunct(trimmed)}${suffix}`;
+}
+// <<< notice-suffix patch >>>
+
 async function notifyOjContest(contest, kind, { now = Date.now(), key = '' } = {}) {
     const cfg = normalizeOjContestConfig(config.ojContest, config.ojFeedback);
-    const text = buildContestNotice(contest, {
+    const text = withNoticeSuffix(buildContestNotice(contest, {
         kind,
         now,
         baseUrl: cfg.baseUrl,
         seed: key || undefined
-    });
+    }), cfg);
     if (cfg.notifyGroups.length === 0) {
         throw new Error('没有通知目标（ojContest.notifyGroups 是空的）');
     }
@@ -4217,7 +4555,7 @@ async function notifyOjDailyProblem(item, { groups = [], key = '' } = {}) {
     if (targets.length === 0) {
         throw new Error('没有通知目标（ojContest.dailyProblem.groups 与 notifyGroups 都是空的）');
     }
-    const text = buildDailyProblemNotice(item, { baseUrl: cfg.baseUrl });
+    const text = withNoticeSuffix(buildDailyProblemNotice(item, { baseUrl: cfg.baseUrl }), cfg);
     let sent = 0;
     const errors = [];
     for (const groupId of targets) {
@@ -4379,8 +4717,26 @@ async function handleMusicCommand(event, plainText) {
 }
 
 async function processBatch(batch) {
-    const responseItem = [...batch.items].reverse().find((item) => item.routingDecision?.shouldRespond) || null;
+    // >>> primary-by-trigger-rank patch >>>
+    // 2026-10-22 实测（group:929159193 08:48:45）：批次 7 条，@ 她的是第 3 条
+    // （werwer「素素帮我打比赛获得饮料」），后面 4 条是别人的闲聊，最后一条是
+    // 渡天尘「写什么」。旧写法 `reverse().find(shouldRespond)` 取**最后一条能触发的**
+    // ⇒ primary 变成渡天尘那条：内容接的是"写什么"，发送前缀也变成
+    // `[CQ:at,qq=2323252692]`（=渡天尘）—— 群里看起来就是"@错人"。
+    // 两个症状同一个根因：谁被点名不重要，"最后一条能触发的"才重要。
+    // ⇒ 按**触发强度**选 primary，同强度取最晚（"刚说完话接着回"的直觉不变）。
+    let primaryIndex = batch.items.length - 1;
+    let responseItem = null;
+    for (let i = 0; i < batch.items.length; i++) {
+        const candidate = batch.items[i];
+        if (!candidate?.routingDecision?.shouldRespond) continue;
+        if (!responseItem || triggerStrength(candidate) >= triggerStrength(responseItem)) {
+            responseItem = candidate;
+            primaryIndex = i;
+        }
+    }
     const primary = responseItem || batch.items[batch.items.length - 1];
+    // <<< primary-by-trigger-rank patch <<<
     const event = primary.event;
     const sessionId = batch.sessionKey;
     const shouldRunLlm = Boolean(responseItem);
@@ -4469,11 +4825,35 @@ async function processBatch(batch) {
             // 「照常回复」，绝不能让决策层成为"她突然哑了"的原因。
             if (shouldRunLlm && config.chat?.replyDecision?.enabled === true) {
                 try {
+                    // >>> at-others-skip patch >>>
+                    // 这条消息 @ 了谁？—— 必须从 event.message 里取，
+                    // 原来误用了 handleMessage 里的 messageSegments（processBatch 作用域没有）
+                    // ⇒ ReferenceError ⇒ 决策层 fail-open ⇒ **每条都回**（2026-11-02 事故）。
+                    const selfQq = String(bot?.selfId || event?.self_id || '');
+                    const rawSegments = Array.isArray(event?.message)
+                        ? event.message
+                        : (Array.isArray(primary?.messageSegments) ? primary.messageSegments : []);
+                    let atOthers = false;
+                    let atSelf = false;
+                    for (const seg of rawSegments) {
+                        if (seg?.type !== 'at') continue;
+                        const qq = String(seg?.data?.qq ?? '').trim();
+                        if (!qq || qq === 'all') continue;
+                        if (selfQq && qq === selfQq) atSelf = true;
+                        else atOthers = true;
+                    }
+                    // 被点名（@ 我 / 回复我的消息）→ 不受发言预算限制
+                    const addressedHere = atSelf || primary?.isAtMe === true || primary?.replyToBot === true;
+                    // <<< at-others-skip patch >>>
                     const decision = await decideReply({
                         config,
                         aiClient,
                         logger,
                         sessionId,
+                        atOthers,
+                        addressed: addressedHere,
+                        // 接力窗口还开着 → 告诉决策层"这是刚被叫过来的场合"，否则它一律判 NO
+                        followActive: canFollow(sessionId || '', config),
                         // >>> group-reply-gate patch (managed by patch_group_reply_gate.py) >>>
                         // 原来只传当前这批、且全标成 user
                         // ⇒ 判「这轮结束没/换话题没」时看不到任何历史，等于瞎猜。
@@ -4543,6 +4923,8 @@ async function processBatch(batch) {
                 }
             }
             runtimeContext = {
+                // [canon] 算 pair 需要知道"自己是谁"
+                botSelfId: String(bot?.selfId || ''),
                 sessionId,
                 memoryScope: batch.memoryScope,
                 recallNamespace: buildRecallNamespace(config, batch.memoryScope, currentCharacterName),
@@ -4551,11 +4933,33 @@ async function processBatch(batch) {
                 participants: buildParticipants(batch.items),
                 standardEvents: batch.items.map((item) => item.standardEvent).filter(Boolean),
                 primaryStandardEvent: primary.standardEvent || null,
+                // >>> primary-by-trigger-rank patch >>>
+                primaryTriggerReason: String(primary?.triggerReason || ''),
+                trailingAfterPrimary: Math.max(0, batch.items.length - 1 - primaryIndex),
+                // <<< primary-by-trigger-rank patch <<<
                 triggerReason: primary.triggerReason,
                 routingDecisions: batch.items.map((item) => item.routingDecision).filter(Boolean),
                 replyReference: buildReplyReference(batch.items),
                 injectionRisk
             };
+            // >>> primary-by-trigger-rank patch >>>
+            // 只有"被点名，且后面还压着别人的话"才拼这一句 —— 其余情况不注入，
+            // 免得把每轮都在的字段稀释掉（显著度 ∝ 是否每轮都在）。
+            // ⚠ 肯定式 + 关系词（把"叫她的人"和"后面说话的人"掰开），
+            //   ⛔ 不写否定句、不给引号例句（本项目规律）。
+            if (responseItem
+                && primaryIndex >= 0
+                && primaryIndex < batch.items.length - 1
+                && ['at', 'admin_mention', 'reply_to_bot'].includes(String(primary.triggerReason || ''))) {
+                const senderInfo = primary.event?.sender || {};
+                const senderName = safeName(senderInfo.card || senderInfo.nickname, String(primary.event?.user_id || ''));
+                const rawLine = String(primary.plainText || '').replace(/\s+/g, ' ').trim();
+                const quotedLine = rawLine.length > 40 ? `${rawLine.slice(0, 40)}…` : rawLine;
+                const trailingCount = batch.items.length - 1 - primaryIndex;
+                runtimeContext.addressedHint = `现在跟你说话的是 ${senderName}(${primary.event?.user_id || ''})，`
+                    + `他这条「${quotedLine}」是点名在叫你；它后面那 ${trailingCount} 条是群里其他人在聊别的事。`;
+            }
+            // <<< primary-by-trigger-rank patch <<<
             runtimeContext.currentSpeaker = buildSpeakerIdentity(event);
             // >>> profile-global-fallback patch >>>
             // 本会话没画像时兜底到 global_shared（启动回填把画像写在那儿，见 session.js 同名补丁）
@@ -4652,7 +5056,7 @@ async function processBatch(batch) {
                 messageType: event.message_type,
                 userId: event.user_id,
                 groupId: event.group_id,
-                participantName: runtimeContext.currentSpeaker?.participantName || event.sender?.card || event.sender?.nickname || '',
+                participantName: safeName(runtimeContext.currentSpeaker?.participantName || event.sender?.card || event.sender?.nickname, ''),
                 mergedCount: batch.items.length,
                 triggerReason: primary.triggerReason,
                 replyToMessageId: primary.replyToMessageId || null,
@@ -5147,6 +5551,28 @@ async function processBatch(batch) {
                     logger.info(`[清洗] 标签剥离: ${beforeLen}→${processedReply.length} 字`);
                 }
             } catch (e) { logger.warn('[变量] 标签清洗失败:', e.message); }
+            // >>> ai-flavor patch >>>
+            // 出口兜「模型口癖」（总之/综上/希望对你有帮助/作为一个AI…）。
+            // 为什么不在提示词里禁止：否定句会二次 priming，本项目踩过；
+            // 这里命中即删，没命中零开销，命中会记一条日志方便回看。
+            // 配置：chat.aiFlavor = { enabled: true, mode: 'strip' | 'log' }
+            try {
+                const afCfg = resolveChatForSession(config, sessionId || '').aiFlavor || config?.chat?.aiFlavor || {};
+                if (afCfg.enabled !== false) {
+                    const { detectAiFlavor, stripAiFlavor } = await import('./ai-flavor.js');
+                    const afTiers = afCfg.tiers || {};
+                    const hits = detectAiFlavor(processedReply, { tiers: afTiers });
+                    if (hits.length > 0) {
+                        logger.info('[清洗] AI腔命中', { hits, mode: afCfg.mode || 'strip' });
+                        if (String(afCfg.mode || 'strip') !== 'log') {
+                            const beforeAf = processedReply.length;
+                            processedReply = stripAiFlavor(processedReply, { tiers: afTiers });
+                            logger.info(`[清洗] AI腔剥离: ${beforeAf}→${processedReply.length} 字`);
+                        }
+                    }
+                }
+            } catch (e) { logger.warn('[清洗] AI腔过滤失败:', e.message); }
+            // <<< ai-flavor patch <<<
             // 额外模型解析：仅当主回复没有有效 UpdateVariable 协议输出（空数组 [] 也算）时，异步调用一次
             if (varScopeOpts && !mainVariableExtraction.protocolPresent && config.ai?.variableParsing?.enabled !== false) {
                 setImmediate(async () => {
@@ -5434,7 +5860,7 @@ async function handlePokeEvent(event) {
             recordPokeRouting({ skipReason: 'poke_missing_group_id' });
             return;
         }
-        const senderName = event.sender?.nickname || event.sender?.card || '群友';
+        const senderName = safeName(event.sender?.nickname || event.sender?.card, '群友');
         const groupName = event.group_name || groupId;
         const pokeEvent = {
             ...event,
@@ -5506,6 +5932,252 @@ async function handlePokeEvent(event) {
 }
 let _lastPokeResponse = null;
 
+// >>> style-learn runtime >>>
+// 采样 + 离线提炼。
+//   · 采样：每条真人消息塞进内存缓冲（每会话最近 60 条），不查库、不额外读盘；
+//   · 提炼：攒够 40 条且距上次 >= 12 小时，才异步跑一次模型（不在回复链路上）；
+//   · 结果存 data/style/<session>.json，prompt.js 那边带 60s 缓存读取。
+const styleBuffers = new Map();
+const styleLearning = new Set();
+
+async function maybeLearnStyle(sessionKey) {
+    if (!sessionKey || styleLearning.has(sessionKey)) return;
+    const buf = styleBuffers.get(sessionKey) || [];
+    if (buf.length < 40) return;
+    const file = styleFileFor(DATA_DIR, sessionKey);
+    const meta = loadStyle(file);
+    if (!shouldRefreshStyle(meta, buf.length)) return;
+    styleLearning.add(sessionKey);
+    try {
+        const res = await aiClient.chat([{ role: 'user', content: buildStylePrompt(buf) }], {
+            maxTokens: 400,
+            temperature: 0.3,
+            thinking: { type: 'disabled' }
+        });
+        const rules = parseStyleRules(aiClient.getVisibleResponseContent(res));
+        if (rules.length > 0) {
+            saveStyle(file, rules, buf.length);
+            logger.info('[学说话] 已更新群友说话风格', { session: sessionKey, rules: rules.length });
+        } else {
+            logger.debug?.('[学说话] 提炼结果为空，保留旧规则', { session: sessionKey });
+        }
+    } catch (error) {
+        logger.debug?.('[学说话] 提炼失败', { error: error?.message || String(error) });
+    } finally {
+        styleLearning.delete(sessionKey);
+    }
+}
+
+/** 记一条样本（自己说的话不记 —— 不能自己学自己） */
+function sampleForStyleLearn(sessionKey, event, plainText) {
+    if (!sessionKey) return;
+    const text = String(plainText || '').trim();
+    if (text.length < 2 || text.length > 200) return;
+    if (/^[/／]/.test(text)) return;              // 指令不算说话风格
+    if (/\[CQ:|\[图片|图片转述|<image/.test(text)) return;
+    const name = safeName(event?.sender?.card || event?.sender?.nickname, '群友');
+    let buf = styleBuffers.get(sessionKey);
+    if (!buf) {
+        buf = [];
+        styleBuffers.set(sessionKey, buf);
+    }
+    buf.push(`[${name}] ${text.slice(0, 120)}`);
+    while (buf.length > 60) buf.shift();
+    maybeLearnStyle(sessionKey).catch(() => {});
+}
+// <<< style-learn runtime >>>
+
+// >>> recent-contests patch >>>
+/**
+ * `/最近比赛` —— 列最近的排期（本站 + AtCoder ABC + Codeforces Div）。
+ *
+ * 数据源和播报完全一致：本站 `/api/contests`，外部走 OJ 的「竞赛日历」插件。
+ * 区别只是**按需拉一次**而不是等轮询，所以复用 poller 的 requestJson（带登录态），
+ * poller 没起（比如 anon 的 ojContest 关着）就临时造一个只用来请求、不 start 的。
+ *
+ * 不加 @ 也能用（查询类命令），所以自己带 60 秒冷却，防有人连发刷屏。
+ */
+const _recentContestCooldown = new Map();     // sessionKey -> ts
+
+/**
+ * 造一个"能拉 OJ 接口"的请求器。
+ *   有正在跑的轮询器就复用它的登录态；没有（比如 anon 的 ojContest 关着）
+ *   就临时 new 一个**只调 requestJson、不 start** 的 —— 不碰状态文件、不影响播报。
+ */
+function createContestRequester(cfg = {}) {
+    if (ojContestPoller) {
+        return (pathname) => ojContestPoller.requestJson(pathname);
+    }
+    const tmp = new OjContestPoller({
+        getConfig: () => config.ojContest,
+        getFallbackConfig: () => config.ojFeedback,
+        logger,
+        stateFile: isAbsolute(cfg.stateFile) ? cfg.stateFile : join(ROOT_DIR, cfg.stateFile || 'data/oj-contest-state.json')
+    });
+    return (pathname) => tmp.requestJson(pathname);
+}
+
+/** 拉"接下来的比赛"：本站全部 + 外部 ABC/Div，按开赛时间升序。 */
+async function collectUpcomingContests(cfg = {}, now = Date.now()) {
+    const requester = createContestRequester(cfg);
+    const items = [];
+    try {
+        const payload = await requester('/api/contests?page_size=50');
+        for (const c of parseContestList(payload)) {
+            if (c.isPublic === 0) continue;
+            if (c.endMs <= now) continue;
+            items.push({ ...c, source: 'local' });
+        }
+    } catch (error) {
+        logger.debug?.('[最近比赛] 本站比赛拉取失败', { error: error?.message || String(error) });
+    }
+    try {
+        const calCfg = { ...cfg.calendar, enabled: true };
+        const events = await fetchCalendarEvents(requester, { ...cfg, calendar: calCfg }, now);
+        for (const e of filterCalendarEvents(events, calCfg)) {
+            if (e.startMs <= now) continue;      // 已经开赛的不列
+            items.push(e);
+        }
+    } catch (error) {
+        logger.debug?.('[最近比赛] 外部赛事拉取失败', { error: error?.message || String(error) });
+    }
+    items.sort((a, b) => a.startMs - b.startMs);
+    return items;
+}
+
+/** 渲染列表文案（命令和每日播报共用一套）。空列表返回 ''。 */
+function formatUpcomingContests(items = [], cfg = {}, now = Date.now(), top = 6) {
+    if (!Array.isArray(items) || items.length === 0) return '';
+    const lines = ['最近的比赛'];
+    for (const c of items.slice(0, top)) {
+        const when = formatContestWhen(c.startMs, now);
+        const name = contestShortName(c);
+        const link = contestEntryUrl(c, cfg);
+        // 24 小时内才报倒计时 —— 更远的「后天 20:00（还有 2 天）」是重复信息
+        const soon = c.startMs - now < 24 * 3600 * 1000;
+        const tail = soon ? `（${formatCountdown(c.startMs, now)}）` : '';
+        lines.push(`· ${when} ${name}${tail}${link ? ` ${link}` : ''}`);
+    }
+    if (items.length > top) lines.push(`……还有 ${items.length - top} 场`);
+    return lines.join('\n');
+}
+
+
+/** 比赛名压短：`AtCoder Beginner Contest 485` → `ABC 485`，`Codeforces Round 1136 (Div. 1)` → `CF 1136 Div.1`。 */
+function contestShortName(contest = {}) {
+    const raw = String(contest.title || '');
+    let out = raw;
+    if (contest.source === 'atcoder') {
+        out = raw.replace(/AtCoder Beginner Contest/i, 'ABC')
+            .replace(/AtCoder Regular Contest\++/i, 'ARC')
+            .replace(/AtCoder Heuristic Contest/i, 'AHC')
+            .replace(/AtCoder Weekday Contest/i, 'AWC');
+    } else if (contest.source === 'codeforces') {
+        out = raw.replace(/Codeforces Round/i, 'CF')
+            .replace(/\((Div\.\s*(\d+))\)/i, 'Div.$2');
+    } else if (contest.source === 'local') {
+        // 本站比赛名太长会顶到链接上：「第22届程协杯程序设计竞赛复现赛」→「第22届程协杯复现赛」
+        out = raw.replace(/程序设计竞赛/g, '').replace(/\s+/g, ' ').trim();
+    }
+    return out.replace(/\s+/g, ' ').trim() || raw;
+}
+
+/**
+ * 入口链接：外部站给**报名页**，本站给比赛页。
+ *   AtCoder     https://atcoder.jp/contests/<id>/register
+ *   Codeforces  https://codeforces.com/contestRegistration/<id>
+ */
+function contestEntryUrl(contest = {}, cfg = {}) {
+    const id = String(contest.id || '');
+    const extId = id.includes(':') ? id.split(':')[1] : '';
+    if (contest.source === 'atcoder') {
+        return extId ? `https://atcoder.jp/contests/${extId}/register` : String(contest.url || '');
+    }
+    if (contest.source === 'codeforces') {
+        return extId ? `https://codeforces.com/contestRegistration/${extId}` : String(contest.url || '');
+    }
+    const base = String(cfg.baseUrl || '').replace(/\/+$/, '');
+    return base && id ? `${base}/contests/${id}` : '';
+}
+
+
+async function handleRecentContestsCommand(event, commandInput) {
+    const text = String(commandInput || '').trim();
+    if (!/^[/／]最近比赛\s*$/.test(text)) return false;
+
+    const key = event.message_type === 'group' && event.group_id
+        ? `group:${event.group_id}`
+        : `private:${event.user_id}`;
+    const now = Date.now();
+    const last = _recentContestCooldown.get(key) || 0;
+    if (now - last < 60000) {
+        await dispatchReply(event, withNoticeSuffix('刚说完，一分钟后再问', normalizeOjContestConfig(config.ojContest, config.ojFeedback)));
+        return true;
+    }
+    _recentContestCooldown.set(key, now);
+
+    const cfg = normalizeOjContestConfig(config.ojContest, config.ojFeedback);
+    if (!cfg.baseUrl) {
+        await dispatchReply(event, withNoticeSuffix('OJ 地址还没配', cfg));
+        return true;
+    }
+
+    const items = await collectUpcomingContests(cfg, now);
+    if (items.length === 0) {
+        await dispatchReply(event, withNoticeSuffix('最近没有排期', cfg));
+        return true;
+    }
+
+    const TOP = 6;
+    const boardText = formatUpcomingContests(items, cfg, now, TOP);
+    logger.info('[最近比赛] 已回应', { session: key, count: items.length });
+    // 列表整条发（不按行拆）：每行自带链接，拆成 8 个气泡反而难读。
+    // 「喵~」**单独一条**（2026-11-19 用户要求）：所以这里不用 withNoticeSuffix，
+    // 否则它会因为"最后一行是列表项"而并进同一条消息里。
+    await dispatchReply(event, boardText, { noSplit: true });
+    const suffix = String(cfg.noticeSuffix || '').trim();
+    if (suffix) {
+        // forceBurst：紧跟上一条发（1.2s）；noMention：单独一句「喵~」不要再 @ 人
+        await dispatchReply(event, suffix, { noSplit: true, forceBurst: true, noMention: true });
+    }
+    return true;
+}
+// <<< recent-contests patch >>>
+
+// >>> mood-command patch >>>
+/**
+ * `/情绪` —— 看当前会话的情绪状态。只给管理员，用来验收和调参。
+ * 之所以要它：情绪只体现在语气上，不写日志（写了就刷屏），
+ * 没有这个命令就只能靠感觉判断"到底生效没"。
+ */
+async function handleMoodCommand(event, commandInput) {
+    const text = String(commandInput || '').trim();
+    if (!/^[/／]情绪\s*$/.test(text)) return false;
+    if (!isAdminUser(config, event.user_id)) {
+        await dispatchReply(event, '这个不给你看');
+        return true;
+    }
+    const key = event.message_type === 'group' && event.group_id
+        ? `group:${event.group_id}`
+        : `private:${event.user_id}`;
+    const snap = moodSnapshot(key);
+    const fmt = (x) => (x >= 0 ? '+' : '') + Number(x).toFixed(2);
+    const recent = snap.recent.length
+        ? snap.recent.map((e) => `${e.why}${e.dv >= 0 ? '+' : ''}${e.dv}`).join(' | ')
+        : '还没有波动';
+    const moodCfg = resolveChatForSession(config, key).mood || {};
+    const lines = [
+        `${key}`,
+        `v(愉悦) ${fmt(snap.v)}  a(唤醒) ${Number(snap.a).toFixed(2)}   基线 +0.10 / 0.40`,
+        `档位：愉悦 ${snap.level.bv} / 唤醒 ${snap.level.ba}（0=没波动，3=最强）`,
+        `最近：${recent}`,
+        `开关：${moodCfg.enabled === false ? '已关闭' : '开启'}`
+    ];
+    await dispatchReply(event, lines.join('\n'));
+    return true;
+}
+// <<< mood-command patch >>>
+
 async function handleMessage(event) {
     if (!event || event.post_type !== 'message') {
         return;
@@ -5526,8 +6198,141 @@ async function handleMessage(event) {
         return;
     }
     // <<< ignore-group patch <<<
+
+    // >>> observe-only patch >>>
+    // 2026-11-01：用户在音游群不是管理员，要求她「别说话」但**要继续看、继续学**群友。
+    // 所以不做硬 return（那会连消息都收不到），只在下面把路由强制判成"不回"，
+    // 消息照常解析、勾图转述、被动入库 ⇒ 画像/摘要仍然能分析这些人。
+    const observeOnlyGroups = Array.isArray(config.chat?.observeOnlyGroups)
+        ? config.chat.observeOnlyGroups.map(String)
+        : [];
+    const isObserveOnlyGroup = event.message_type === 'group'
+        && observeOnlyGroups.includes(String(event.group_id));
+    // <<< observe-only patch >>>
+    // >>> auto-detect-by-api >>>
+    // 群消息进来时（10 分钟节流一次）刷新群成员表，靠 NapCat 的 is_robot 字段
+    // 自动发现第三方 bot —— 不必每次手动报 QQ 号。失败静默，不影响本流程。
+    if (event.message_type === 'group' && event.group_id) {
+        refreshGroupBots(bot, event.group_id, logger).catch(() => {});
+    }
+    // <<< auto-detect-by-api >>>
     const messageInfo = await extractMessageInfo(config, event, bot);
     const { plainText, isAtMe, structuredText, replyToMessageId, replyToBot, replyInfo, replyImageSegments, messageSegments, standardEvent } = messageInfo;
+
+    // >>> mood patch >>>
+    // 每一条**真人**消息都会轻微推动她的情绪（本地正则，不花模型调用）。
+    // 机器人消息跳过 —— 否则跟别的 bot 对刷会把她情绪刷到极端值。
+    try {
+        const moodKey = event.message_type === 'group' && event.group_id
+            ? `group:${event.group_id}`
+            : (event.user_id ? `private:${event.user_id}` : '');
+        const fromBot = isKnownBot(config, event.user_id) || isCoBot(config, event);
+        if (moodKey && !fromBot && plainText) {
+            const sig = moodClassifyText(plainText);
+            if (sig) {
+                moodApply(moodKey, sig.dv, sig.da, {
+                    why: sig.why,
+                    isPrivate: event.message_type !== 'group'
+                });
+                // 明显的波动记 info（被骂/被夸要留痕），日常寒暄只走 debug，免得刷屏
+                if (Math.abs(sig.dv) >= 0.1) {
+                    logger.info(`[情绪] ${sig.why}（v${sig.dv >= 0 ? '+' : ''}${sig.dv.toFixed(2)} a${sig.da >= 0 ? '+' : ''}${sig.da.toFixed(2)}）`, { session: moodKey });
+                } else {
+                    logger.debug?.('[情绪] 状态微动', { session: moodKey, why: sig.why, dv: sig.dv, da: sig.da });
+                }
+            }
+            sampleForStyleLearn(moodKey, event, plainText);
+        }
+    } catch (error) {
+        logger.debug?.('[情绪] 处理失败', { error: error?.message || String(error) });
+    }
+    // <<< mood patch >>>
+
+    // >>> keyword-replies patch >>>
+    // 关键词应答：命中就直接发固定答案，不调模型。
+    // 放在指令之前会抢指令，所以这里先跳过 `/` 开头的；真正的指令分支在后面照常执行。
+    if (!/^[/／]/.test(plainText.trim())) {
+        try {
+            const kwKey = event.message_type === 'group' && event.group_id
+                ? `group:${event.group_id}`
+                : (event.user_id ? `private:${event.user_id}` : '');
+            const kwCfg = resolveChatForSession(config, kwKey);
+            const hit = matchKeywordReply(kwCfg, kwKey, plainText);
+            if (hit && hit.reply) {
+                logger.info('[关键词] 命中固定应答', { itemId: hit.itemId, session: kwKey });
+                await dispatchReply(event, hit.reply);
+                return;
+            }
+            if (hit && hit.cooled) {
+                logger.debug?.('[关键词] 命中但冷却中', { itemId: hit.itemId, session: kwKey });
+            }
+            // >>> faq-answer patch >>>
+            // 关键词没命中，但这条像"提问" ⇒ 走答疑知识库。
+            //   mode='full'（默认）：整库喂给模型，让它自己认领条目；
+            //   mode='candidates'：先打分筛候选，够像的直接答，不够像的才问模型。
+            //   两种模式下，模型答不了就回 NO_ANSWER ⇒ 静默，绝不"我也不知道"。
+            const faqCfg = kwCfg.faq || {};
+            if (faqCfg.enabled === true) {
+                const faqScopes = Array.isArray(faqCfg.scopes) ? faqCfg.scopes.map(String) : [];
+                const inScope = faqScopes.length === 0 || faqScopes.includes(kwKey);
+                const items = Array.isArray(faqCfg.items) ? faqCfg.items : [];
+                if (inScope && items.length > 0 && isQuestionLike(plainText)) {
+                    const mode = String(faqCfg.mode || 'full').toLowerCase();
+                    const askModel = async (prompt, label) => {
+                        try {
+                            const res = await aiClient.chat([{ role: 'user', content: prompt }], {
+                                maxTokens: Number(faqCfg.maxTokens ?? 200),
+                                temperature: 0.1,
+                                thinking: { type: 'disabled' }
+                            });
+                            const answer = parseFaqAnswer(aiClient.getVisibleResponseContent(res));
+                            if (answer) {
+                                // 同一句答案 3 分钟内不在同一个群重复（问的人多时只答一次）
+                                if (shouldSkipByRepeat(kwKey, answer, { cooldownMs: Number(faqCfg.repeatCooldownMs ?? 180000) })) {
+                                    logger.info('[答疑] 同一答案冷却中，跳过', { mode: label, session: kwKey });
+                                    return false;
+                                }
+                                logger.info('[答疑] 命中知识库', { mode: label, session: kwKey });
+                                await dispatchReply(event, answer);
+                                return true;
+                            }
+                            logger.info('[答疑] 知识库里没有答案，保持静默', { mode: label, session: kwKey });
+                            return false;
+                        } catch (error) {
+                            logger.warn?.('[答疑] 模型调用失败，静默处理', { error: error?.message || String(error) });
+                            return false;
+                        }
+                    };
+
+                    if (mode === 'full') {
+                        const prompt = buildFaqFullPrompt(plainText, items, {
+                            maxItems: Number(faqCfg.maxItems ?? 40),
+                            maxChars: Number(faqCfg.maxChars ?? 6000),
+                            rewrite: faqCfg.rewrite === true
+                        });
+                        if (await askModel(prompt, 'full')) return;
+                    } else {
+                        const scored = scoreFaq(plainText, items);
+                        const best = scored[0];
+                        const directThreshold = Number(faqCfg.directThreshold ?? 3);
+                        if (best && best.score >= directThreshold) {
+                            logger.info('[答疑] 知识库直答', { itemId: best.item.id, score: best.score, session: kwKey });
+                            await dispatchReply(event, String(best.item.answer));
+                            return;
+                        }
+                        if (scored.length > 0) {
+                            const prompt = buildFaqPrompt(plainText, scored, Number(faqCfg.maxCandidates ?? 4));
+                            if (await askModel(prompt, 'candidates')) return;
+                        }
+                    }
+                }
+            }
+            // <<< faq-answer patch >>>
+        } catch (error) {
+            logger.warn?.('[关键词] 匹配失败', { error: error?.message || String(error) });
+        }
+    }
+    // <<< keyword-replies patch >>>
 
     // >>> group-command-at-gate patch >>>
     // 指令匹配用**剥掉开头 @ 标记**的文本：群里 @ 之后 plainText 会以 `[@bot] ` 开头
@@ -5571,6 +6376,26 @@ async function handleMessage(event) {
         return;
     }
 
+    // >>> no-at-commands patch >>>
+    // 少数指令允许在群里**不 @ 也触发**（2026-11-19 用户要求：`/最近比赛` 是查公共赛程，
+    // 谁都能问，硬要 @ 一下反而别扭）。
+    // 用配置控制而不是写死：`chat.noAtCommands: ["/最近比赛"]`，没配的实例保持"必须 @"。
+    // 放在 commandGate 之前，且**只处理白名单里的命令**，不影响其它指令的严格性。
+    try {
+        const noAtList = Array.isArray(config.chat?.noAtCommands)
+            ? config.chat.noAtCommands.map((x) => String(x ?? '').trim()).filter(Boolean)
+            : [];
+        const cmdHead = String(commandInput || '').trim().split(/\s+/)[0] || '';
+        if (cmdHead && noAtList.includes(cmdHead)) {
+            if (await handleRecentContestsCommand(event, commandInput)) {
+                return;
+            }
+        }
+    } catch (error) {
+        logger.debug?.('[指令] 免@指令处理失败', { error: error?.message || String(error) });
+    }
+    // <<< no-at-commands patch >>>
+
     // >>> group-command-at-gate patch >>>
     // 下面这一整批都是指令：群里必须 @ 才认
     if (commandGate) {
@@ -5595,6 +6420,11 @@ async function handleMessage(event) {
         return;
     }
 // >>> profile-view-command patch >>>
+    // >>> mood-command patch >>>
+    if (await handleMoodCommand(event, commandInput)) {
+        return;
+    }
+    // <<< mood-command patch >>>
     if (await handleProfileViewCommand(event, commandInput)) {
         return;
     }
@@ -5620,6 +6450,13 @@ async function handleMessage(event) {
         replyWindowOpen: isReplyWindowOpen(routingSessionKey, event.user_id)
     });
     // <<< reply-window patch <<<
+    // >>> observe-only patch >>>
+    if (isObserveOnlyGroup && routingDecision && routingDecision.shouldRespond) {
+        routingDecision.shouldRespond = false;
+        routingDecision.skipReason = 'observe_only';
+        logger.debug?.('[群聊] 该群只观察不发言', { groupId: event.group_id });
+    }
+    // <<< observe-only patch >>>
     if (standardEvent) {
         updateStandardEventRouting(standardEvent, routingDecision);
     }
@@ -5782,6 +6619,18 @@ mcpClient.start();
 
 server.listen(config.server.port, config.server.host, () => {
     logger.info(`服务器已启动: http://${config.server.host}:${config.server.port}`);
+    // >>> mood/style store patch >>>
+    // 情绪状态与"学说话风格"各自存盘：
+    //   data/mood.json            每个会话一份 v/a
+    //   data/style/<session>.json 每个会话提炼出的「当 A 时用 B」
+    try {
+        setMoodStore(join(DATA_DIR, 'mood.json'));
+        setStyleDir(DATA_DIR);
+        logger.info('[状态] 情绪与说话风格已挂载', { dataDir: DATA_DIR });
+    } catch (error) {
+        logger.warn('[状态] 挂载失败（功能降级为纯内存）:', error?.message || error);
+    }
+    // <<< mood/style store patch >>>
     startHealthTicker();
     startParticipantProfileIntervalScheduler(sessionManager, aiClient, logger);
     probeMusicBridge();
@@ -5797,6 +6646,12 @@ server.listen(config.server.port, config.server.host, () => {
     // 比赛倒计时：按"每日时刻 + 赛前提前量"开口，状态文件去重、每天有上限
     startOjContestPoller();
     // <<< oj-contest patch >>>
+    // >>> list-watch patch >>>
+    startOjListWatch();
+    // <<< list-watch patch >>>
+    // >>> daily-board patch >>>
+    startDailyContestBoard();
+    // <<< daily-board patch >>>
     // >>> proactive-chat patch >>>
     // 主动找话题：默认关闭，靠 chat.proactiveChat.enabled 打开。
     // 四道闸门（作息窗口 / 距上次互动时长 / 每日上限 / 概率）全过才发。
@@ -5824,6 +6679,7 @@ server.listen(config.server.port, config.server.host, () => {
             characterName: config.chat?.defaultCharacter || '',
             persona: proactivePersona,
             config: config.chat?.proactiveChat || {},
+            canonCfg: normalizeCanonConfig(config.chat || {}),
             logger
         });
         proactiveChatter.start();
@@ -5831,6 +6687,18 @@ server.listen(config.server.port, config.server.host, () => {
         logger.warn('[主动] 初始化失败: ' + (e?.message || e));
     }
     // <<< proactive-chat patch <<<
+    // [canon] 世界事件：每天扔一件外部小事进来，给她们一个能聊的共同背景。
+    // 幂等靠 canon.json 里的 world.date，两个实例都跑也不会重复生成。
+    try {
+        const runCanonTick = () => canonTick({ chat: config.chat || {}, aiClient, logger })
+            .catch((e) => logger.debug?.('[canon] tick 异常', { error: e?.message || String(e) }));
+        const canonTimer = setInterval(runCanonTick, 10 * 60 * 1000);
+        if (typeof canonTimer.unref === 'function') canonTimer.unref();
+        runCanonTick();
+        logger.info('[canon] 世界事件调度已启动');
+    } catch (e) {
+        logger.warn('[canon] 初始化失败: ' + (e?.message || e));
+    }
 
     const defaultCharacter = config.chat.defaultCharacter;
     applyMemoryBinding();

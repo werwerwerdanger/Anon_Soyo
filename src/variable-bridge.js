@@ -99,6 +99,31 @@ export function stripInternalTags(text) {
     // 5. 还原 UpdateVariable
     result = result.replace(/___UV_(\d+)___/g, (_, i) => uvBlocks[parseInt(i)] || '');
 
+    // >>> meta-note-strip patch >>>
+    // 2026-10-25：她把「该不该接」的自言自语写进了正文，并且用 BBCode 的 [b] 当标记：
+    //   生成内容 = "嗯 怎么了\n\n[b]TyTs 那条是在问 anon 呢，不接"
+    // 前半句正常，后半句是给她自己看的路由备注 —— 而 [b] 在 QQ 里没有意义，
+    // 说明这是模型自己脑补的格式，不属于"要说的话"。原来的清洗只认 <thinking> 一类
+    // XML 标签，方括号标记整行漏到了群里。
+    // 规则：整行以"笔记/排版"标记开头的，判定为内部备注，整行丢掉。
+    // 只认拉丁排版标签 + 少量中文元词，避免误伤正常正文（她平时不这么写）。
+    const META_NOTE_LINE_RE = /^\[(?:\/?)(?:b|i|u|s|quote|code|思考|内心|备注|笔记|独白)\]/i;
+    result = result
+        .split(/\r?\n/)
+        .filter((line) => !META_NOTE_LINE_RE.test(line.trim()))
+        .join('\n');
+    // 行内**成对**的排版标签去掉标签保留文字；落单的 `[b]` 不动
+    // （她偶尔会在句子里引用方括号内容，落单的不该被当排版吃掉）。
+    result = result.replace(/\[(b|i|u|s|quote|code)\]([\s\S]*?)\[\/\1\]/gi, '$2');
+
+    // 2026-10-25 晚：历史署名被逐字抄进了回复。
+    // 10-23 为了让她认出"历史里哪句是自己说的"，给 assistant 轮加了 `[你 13:24:57]` 前缀；
+    // 结果她把这个格式当成说话格式抄了出来（实测两条：
+    //   群聊 `[你 19:43:20] 嗯`、私聊 `[你 12:09:52] 五十三级`，时间戳还是她自己编的）。
+    // 这里在**出口**兜住：行首的自我署名一律剥掉（正文保留）。
+    result = result.replace(/^[ \t]*\[你\s*\d{1,2}:\d{2}(?::\d{2})?\][ \t]*/gm, '');
+    // <<< meta-note-strip patch <<<
+
     return result.replace(/\n{3,}/g, '\n\n').trim();
 }
 

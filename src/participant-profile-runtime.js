@@ -110,6 +110,11 @@ export function buildParticipantProfilePrompt(source = {}, analysisMode, speaker
         participantName: targetName
     };
 
+    // 2026-10-22：【当前状态】原来没有任何时间锚点 —— 一段"最近如何"被当成永久定性，
+    // 正好踩中"episodic 被压成 semantic"那个坑。这里把今天日期喂给模型，并要求逐条标时间。
+    const nowDate = new Date();
+    const todayStamp = `${nowDate.getMonth() + 1}月${nowDate.getDate()}日`;
+
     const messages = Array.isArray(source?.messages) ? source.messages : [];
     const messageText = messages.length > 0
         ? messages.map((item) => formatParticipantProfilePromptMessage(item, identity)).join('\n')
@@ -133,7 +138,16 @@ export function buildParticipantProfilePrompt(source = {}, analysisMode, speaker
 // >>> profile-quote-scrub patch >>>
         // 引号引语会变成台词本：实测她照着画像里的原话念，还念出了半句没听见的话。
         '9. 档案只描述这个人的样子，不要抄录他的原话：原话一旦带引号写进档案，就会被原样当成台词念出来。要写就转述成场合、语气和情绪，不要保留任何引文或例句。',
-        '10. 输出里不要出现引号引语。'
+        '10. 输出里不要出现引号引语。',
+        // >>> profile-no-prescription patch >>>
+        // 2026-10-31：实测档案里长出「需要反复安抚」「倾向把对方的限制理解为针对自己」这类句子。
+        // 它们读起来是"分析用户"，实际对读者（角色）是一份**处置处方**：
+        // 她看到"需要反复安抚"就会主动哄，看到"倾向把限制理解为针对"就提前退让，
+        // 于是自我实现：她哄 → 他更像需要哄 → 下次继续写"需要反复安抚"。
+        // 档案只回答"这个人是什么样"，不回答"该怎么对待他"。
+        '11. 只写能观察到的行为：他说了什么、怎么说的、在什么场合。不要写需求或心理推断 —— 「需要被安抚」「需要反复解释」「倾向把…理解为…」「缺乏安全感」「渴望被关注」这类判断不写。',
+        '12. 不写处置建议或应对方式（「需要哄」「要慢慢引导」「别跟他硬顶」之类），也不写"他期待你如何反应"。',
+        // <<< profile-no-prescription patch >>>
 // <<< profile-quote-scrub patch <<<
     ].join('\n');
 
@@ -158,7 +172,7 @@ export function buildParticipantProfilePrompt(source = {}, analysisMode, speaker
             '',
             '输出格式：',
             '稳定画像: ...',
-            '当前状态: ...'
+            `当前状态: ...（今天是 ${todayStamp}。这一段的每一条都带上时间：哪一天、什么时段。）`
         ].join('\n');
     }
 
@@ -174,7 +188,7 @@ export function buildParticipantProfilePrompt(source = {}, analysisMode, speaker
         '',
         '输出格式：',
         '稳定画像: ...',
-        '当前状态: ...'
+        `当前状态: ...（今天是 ${todayStamp}。这一段的每一条都带上时间：哪一天、什么时段。）`
     ].join('\n');
 }
 
@@ -193,7 +207,7 @@ export function buildParticipantProfileMergePrompt({ participantId = '', partici
         '5. 输出纯文本人物档案，建议包含“稳定画像”和“当前状态”两段。',
         // >>> profile-no-selfref patch >>>
         '6. 旧档案里若混进了 Bot 的发言、Bot 的措辞口吻，或对话来往过程与问答次数的记录，直接删掉，不要保留。',
-        '7. “当前状态”只保留最近仍然成立的少量条目，不要无限追加历史事件。',
+        '7. “当前状态”只保留最近仍然成立的少量条目，不要无限追加历史事件；每一条都要带时间（哪一天、什么时段）。',
         // <<< profile-no-selfref patch <<<
 // >>> profile-quote-scrub patch >>>
         '8. 新版本里若带引号的原话，一律改写成转述，不要保留引文。',

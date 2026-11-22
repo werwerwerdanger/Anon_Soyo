@@ -33,6 +33,18 @@ export const OJ_CONTEST_DEFAULTS = Object.freeze({
     countdownDays: [7, 3, 2, 1], // ⭐ 只在「赛前 N 天」这些日子念倒计时（空数组 = 退回 countdownWindowDays 的旧行为）
     leadMinutes: [1440, 60, 10], // 赛前提醒：24h / 1h / 10min
     dailyProblem: { enabled: false, groups: [] },   // 每日一题：同一时刻发直达链接（groups 为空则用 notifyGroups）
+    // >>> calendar patch >>>
+    // 外部赛事（OJ「竞赛日历」插件提供 AtCoder / Codeforces 日程）。
+    // 只播用户关心的类型：ABC（Beginner Contest）和 Div（Div.1/2/3）。
+    // ARC / AHC / Kotlin Heroes / Weekday Contest 每天都有一堆，不播 —— 会变刷屏。
+    calendar: {
+        enabled: false,
+        sources: ['atcoder', 'codeforces'],
+        titleIncludes: ['Beginner Contest', 'Div.'],
+        leadMinutes: [120],
+        windowDays: 14
+    },
+    // <<< calendar patch >>>
     graceMs: 30 * 60 * 1000,     // 过点超过这么久就只标记不发
     maxPerDay: 3,
     timeoutMs: 15000,
@@ -89,9 +101,28 @@ export function normalizeOjContestConfig(source = {}, fallback = {}) {
                 groups: (Array.isArray(dp.groups) ? dp.groups : []).map((id) => cleanText(id)).filter(Boolean)
             };
         })(),
+        // >>> calendar patch >>>
+        calendar: (() => {
+            const cal = (src.calendar && typeof src.calendar === 'object') ? src.calendar : {};
+            const def = OJ_CONTEST_DEFAULTS.calendar;
+            return {
+                enabled: cal.enabled === true,
+                sources: (Array.isArray(cal.sources) ? cal.sources : def.sources)
+                    .map((x) => cleanText(x).toLowerCase()).filter(Boolean),
+                titleIncludes: (Array.isArray(cal.titleIncludes) ? cal.titleIncludes : def.titleIncludes)
+                    .map((x) => cleanText(x)).filter(Boolean),
+                leadMinutes: toIntArray(cal.leadMinutes, def.leadMinutes).filter((m) => m > 0),
+                windowDays: Math.max(1, toInt(cal.windowDays, def.windowDays))
+            };
+        })(),
+        // <<< calendar patch >>>
         graceMs: Math.max(60000, toInt(src.graceMs, OJ_CONTEST_DEFAULTS.graceMs)),
         maxPerDay: Math.max(0, toInt(src.maxPerDay, OJ_CONTEST_DEFAULTS.maxPerDay)),
         timeoutMs: Math.max(1000, toInt(src.timeoutMs, OJ_CONTEST_DEFAULTS.timeoutMs)),
+        // >>> notice-suffix patch >>>
+        // 人设后缀（素世："喵~"）。放在这里是为了让它跟着 cfg 一路传到发送层。
+        noticeSuffix: cleanText(src.noticeSuffix),
+        // <<< notice-suffix patch >>>
         stateFile: cleanText(src.stateFile) || OJ_CONTEST_DEFAULTS.stateFile
     };
 }
@@ -108,14 +139,25 @@ export function parseOjTime(value) {
 export function normalizeContestItem(raw = {}) {
     const startMs = parseOjTime(raw.start_time ?? raw.startTime);
     const endMs = parseOjTime(raw.end_time ?? raw.endTime);
+    // >>> external-contest patch >>>
+    // 2026-11-19：要把 OJ 竞赛日历插件里的外部比赛（AtCoder ABC / Codeforces Div）
+    // 也纳入提醒。它们的 id 是 `atcoder:abc485` 这种字符串，不是数字 ——
+    // 所以 id 允许字符串，去重键仍然直接拼字符串（pickDueNotices 天然兼容）。
+    const rawId = raw.id ?? raw.source_id ?? '';
+    const id = /^\d+$/.test(String(rawId)) ? Number(rawId) : cleanText(rawId);
+    // <<< external-contest patch >>>
     return {
-        id: toInt(raw.id, 0),
-        title: cleanText(raw.title) || `比赛 #${toInt(raw.id, 0)}`,
+        id,
+        title: cleanText(raw.title) || `比赛 #${String(rawId || '?')}`,
         startMs,
         endMs: Number.isFinite(endMs) ? endMs : startMs,
         status: cleanText(raw.status),
         isPublic: raw.is_public === undefined ? 1 : toInt(raw.is_public, 1),
-        participantCount: toInt(raw.participant_count ?? raw.participantCount, 0)
+        participantCount: toInt(raw.participant_count ?? raw.participantCount, 0),
+        // >>> external-contest patch >>>
+        source: cleanText(raw.source || raw.source_label),   // atcoder / codeforces / local
+        url: cleanText(raw.url),                             // 外部比赛用这个（本地是 /contests/7）
+        // <<< external-contest patch >>>
     };
 }
 
@@ -126,7 +168,8 @@ export function parseContestList(payload = {}) {
             : (Array.isArray(payload?.data) ? payload.data : []));
     return list
         .map(normalizeContestItem)
-        .filter((item) => item.id > 0 && Number.isFinite(item.startMs));
+        // id 可能是数字（本站）或字符串（外部，如 atcoder:abc485）—— 只要求非空
+        .filter((item) => item.id !== '' && item.id !== 0 && item.id != null && Number.isFinite(item.startMs));
 }
 
 /** 最近一场还没结束的公开比赛（进行中的也算，用于"已经开始了"那句）。 */
@@ -212,19 +255,30 @@ export function buildContestNotice(contest = {}, options = {}) {
     const when = formatContestWhen(contest.startMs, now);
     const countdown = formatCountdown(contest.startMs, now);
 
+    // >>> external-contest patch >>>
+    // 外部比赛加来源前缀，群里一眼能看出是 AtCoder 还是 CF
+    const srcTag = contest.source && contest.source !== 'local'
+        ? ({ atcoder: '[AtCoder] ', codeforces: '[CF] ', luogu: '[洛谷] ', nowcoder: '[牛客] ' }[contest.source] || '')
+        : '';
+    const displayTitle = `${srcTag}${contest.title}`;
+    // <<< external-contest patch >>>
     let head;
     if (kind === 'start') {
-        head = `【比赛】「${contest.title}」${countdown}`;
+        head = `【比赛】「${displayTitle}」${countdown}`;
     } else if (kind === 'daily') {
-        head = `【比赛倒计时】「${contest.title}」${countdown}`;
+        head = `【比赛倒计时】「${displayTitle}」${countdown}`;
     } else {
-        head = `【比赛提醒】「${contest.title}」${countdown}`;
+        head = `【比赛提醒】「${displayTitle}」${countdown}`;
     }
 
     const lines = [head, `${when} 开始 · ${pickTail(kind, seedFrom(options.seed ?? contest.id))}`];
-    if (base && contest.id) {
-        lines.push(`${base}/contests/${contest.id}`);
-    }
+    // >>> external-contest patch >>>
+    // 外部比赛（ABC / Div）给原始链接；本站比赛拼 baseUrl。
+    const link = contest.url
+        ? (/^https?:\/\//i.test(contest.url) ? contest.url : (base ? base + contest.url : ''))
+        : (base && contest.id ? `${base}/contests/${contest.id}` : '');
+    if (link) lines.push(link);
+    // <<< external-contest patch >>>
     return lines.join('\n');
 }
 
@@ -392,6 +446,84 @@ export function expiredNoticeKeys(contest = {}, now = Date.now(), state = {}, cf
 
 // ------------------------------------------------------------------ 轮询器
 
+// >>> calendar patch >>>
+/**
+ * 拉 OJ「竞赛日历」插件（contest-calendar）的外部赛事。
+ *
+ * 接口是 2026-11-19 从前端 bundle 里逆向出来的：
+ *   `sdk.request('events?from=&to=')` → 父页面代理到 `/api/plugins/contest-calendar/api/events`
+ *   需要登录（poller 的 requestJson 已经带 token）。
+ *
+ * 失败一律当"没有外部赛事"，绝不影响本站比赛的播报。
+ */
+export async function fetchCalendarEvents(requestJson, cfg, now = Date.now()) {
+    const cal = cfg.calendar || {};
+    if (!cal.enabled) return [];
+    const p2 = (n) => String(n).padStart(2, '0');
+    const dayStr = (ms) => {
+        const d = new Date(ms + BEIJING_OFFSET_MS);
+        return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`;
+    };
+    const from = dayStr(now);
+    const to = dayStr(now + (cal.windowDays || 14) * DAY_MS);
+    const payload = await requestJson(`/api/plugins/contest-calendar/api/events?from=${from}&to=${to}`);
+    const list = Array.isArray(payload)
+        ? payload
+        : (Array.isArray(payload?.items) ? payload.items : (Array.isArray(payload?.events) ? payload.events : []));
+    return list.map(normalizeContestItem).filter((e) => Number.isFinite(e.startMs));
+}
+
+/**
+ * 只保留用户关心的类型：ABC（Beginner Contest）和 Div（Div.1/2/3）。
+ * ARC / AHC / Weekday Contest / Kotlin Heroes 不播 —— 每天好几场，会变刷屏。
+ */
+export function filterCalendarEvents(events = [], cal = {}) {
+    const sources = Array.isArray(cal.sources) && cal.sources.length > 0
+        ? cal.sources.map((x) => String(x).toLowerCase())
+        : ['atcoder', 'codeforces'];
+    const includes = Array.isArray(cal.titleIncludes) && cal.titleIncludes.length > 0
+        ? cal.titleIncludes
+        : ['Beginner Contest', 'Div.'];
+    return (Array.isArray(events) ? events : []).filter((e) => {
+        if (!sources.includes(String(e.source || '').toLowerCase())) return false;
+        return includes.some((kw) => String(e.title || '').includes(kw));
+    });
+}
+
+/** 外部比赛只做赛前提醒（不做每日倒计时、不做开赛播报），否则一天能刷好几条。 */
+export function pickDueCalendarNotices(event = {}, now = Date.now(), state = {}, cal = {}) {
+    const out = [];
+    if (!event || !Number.isFinite(event.startMs)) return out;
+    const notified = state.notified || {};
+    const graceMs = Number.isFinite(Number(cal.graceMs)) ? Number(cal.graceMs) : OJ_CONTEST_DEFAULTS.graceMs;
+    const leads = Array.isArray(cal.leadMinutes) && cal.leadMinutes.length > 0 ? cal.leadMinutes : [120];
+    for (const lead of leads) {
+        const key = `${event.id}:cal:${lead}`;
+        if (notified[key]) continue;
+        const dueAt = event.startMs - lead * 60000;
+        if (now < dueAt) continue;
+        if (now >= event.startMs) continue;      // 已经开赛了就不提醒
+        if (now - dueAt > graceMs) continue;     // 过太久 ⇒ 只标记不发
+        out.push({ kind: 'soon', key });
+    }
+    return out;
+}
+
+/** 过期的外部提醒也要标记，否则每轮都要重新判定一遍。 */
+export function expiredCalendarNoticeKeys(event = {}, now = Date.now(), state = {}, cal = {}) {
+    const notified = state.notified || {};
+    const graceMs = Number.isFinite(Number(cal.graceMs)) ? Number(cal.graceMs) : OJ_CONTEST_DEFAULTS.graceMs;
+    const leads = Array.isArray(cal.leadMinutes) && cal.leadMinutes.length > 0 ? cal.leadMinutes : [120];
+    const out = [];
+    for (const lead of leads) {
+        const key = `${event.id}:cal:${lead}`;
+        if (notified[key]) continue;
+        if (now > event.startMs - lead * 60000 + graceMs) out.push(key);
+    }
+    return out;
+}
+// <<< calendar patch >>>
+
 export class OjContestPoller {
     constructor({
         getConfig,
@@ -513,6 +645,42 @@ export class OjContestPoller {
             }
         }
         // <<< 每日一题 >>>
+
+        // >>> calendar patch >>>
+        // 外部赛事（ABC / Div）。⚠ 必须放在本地比赛的 early-return **之前**：
+        // 本站没有排期的那几天，外部比赛照样要提醒。
+        if (cfg.calendar?.enabled) {
+            try {
+                const events = await fetchCalendarEvents((path) => this.requestJson(path), cfg, now);
+                const targets = filterCalendarEvents(events, cfg.calendar);
+                this.logger.debug?.(`[日历] 外部赛事 ${events.length} 场，命中类型 ${targets.length} 场`);
+                for (const ev of targets) {
+                    const calCfg = { ...cfg.calendar, graceMs: cfg.graceMs };
+                    for (const key of expiredCalendarNoticeKeys(ev, now, state, calCfg)) {
+                        state.notified[key] = now;
+                    }
+                    for (const item of pickDueCalendarNotices(ev, now, state, calCfg)) {
+                        if (cfg.maxPerDay > 0 && state.dayCount >= cfg.maxPerDay) {
+                            this.logger.warn?.(`[日历] 今天已达上限 ${cfg.maxPerDay} 条，跳过 ${item.key}`);
+                            break;
+                        }
+                        try {
+                            await this.onNotice?.(ev, item.kind, { now, key: item.key });
+                            state.notified[item.key] = now;
+                            state.dayCount += 1;
+                            sent += 1;
+                            this.logger.info?.(`[日历] 已播报 ${item.key}`, { title: ev.title, source: ev.source });
+                        } catch (error) {
+                            this.logger.warn?.(`[日历] ${item.key} 发送失败，下轮重试: ${error?.message}`);
+                        }
+                    }
+                }
+            } catch (error) {
+                // 插件没装 / 没登录 / 网络抖动都走这里 —— 绝不能因此影响本站比赛
+                this.logger.warn?.(`[日历] 拉取外部赛事失败（不影响本站比赛）: ${error?.message}`);
+            }
+        }
+        // <<< calendar patch >>>
 
         const payload = await this.requestJson('/api/contests?page_size=50');
         const contest = selectNextContest(parseContestList(payload), now);

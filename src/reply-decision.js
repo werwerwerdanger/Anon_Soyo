@@ -1,3 +1,6 @@
+import { safeName } from './safe-name.js';
+import { resolveChatForSession } from './session-overrides.js';
+import { shouldStaySilent, noteOwnReply } from './reply-budget.js';
 /**
  * Reply-decision layer: before the expensive two-call reply path runs, ask the model
  * a single question -- should this character answer this message at all?
@@ -34,10 +37,23 @@ NO  = 不回
 - **话题已经换了**：现在聊的事、聊的人跟刚才不是一拨，或者明显没你什么事。
   只要你感觉话题从你身上移开了，就立刻回 NO —— 不要接一句来留住这个话头；
 - 是别人之间的对话，只是碰巧提到了某个词；
+- 群里别人之间在商量事情（约时间、组队、开黑、走不走、还来不来、排不排），
+  没人点名问你 —— 那是在问别人；你不要替自己报名，也不要说"等我一下"这种答应的话；
+- @ 了你、但这句话本身是在对别人说（比如"没说你""我说的是他""别理它"）——
+  看这句话在对谁讲，不看有没有 @；
 - 纯表情包 / 贴图 / 复读 / 刷屏 / 广告 / 系统消息 / 机器人自己的输出 / 跟你无关的技术问答；
 - 极短、没有信息量、像打错字或随手试探（单个字、哦、？、aa、1）。
 
-拿不准就回 NO。`;
+拿不准就回 NO。
+
+【指代】（判断"在说我吗"只看这一节）
+- 「」里是发言人的**昵称**（有人昵称就叫「你」「你 耗时 已 长」），昵称里的字不是在叫你。
+- 「你」默认指**被 @ 的人、或者上一句的说话对象**，不是我。只有 @ 了我、叫了我的名字、
+  或者紧接着我说的内容时，「你」才指我。
+- 这条 @ 的是别人、也没提我的名字 → 回 NO。别回「又没人问我」这种既接话又否认的句子。
+- 【接力中】出现这个标记，说明你刚才被叫过来、正在接着聊。这时候就算没人 @ 你，
+  只要这句话跟你刚才说的、或者大家一起聊的事有关，可以回 YES（别硬接无关的）。
+- 「我」永远是我的自称；别人的「我」是别人。`;
 
 export const DEFAULT_PRIVATE_DECISION_PROMPT = `你在私聊里替一个角色决定：这一条消息，值不值得回。
 
@@ -130,6 +146,14 @@ export function detectAtBot(raw) {
 export function buildDecisionContext(recentMessages = [], plainText = '', limit = 10) {
     const lines = [];
     const list = Array.isArray(recentMessages) ? recentMessages : [];
+    // >>> speaker-quote patch >>>
+    // 2026-10-31 事故：有人群昵称就叫「你 耗时 已 长」，渲染成
+    //   `你 耗时 已 长: 你个打卡拉彼丘的傻逼`
+    // 模型把昵称里的「你」当第二人称 ⇒ 以为在骂自己 ⇒ 判 YES（判据里"被挑衅就回"）。
+    // 实测那条决策 YES 就是这么来的（19:01:37 音游群）。
+    // 现在昵称一律用「」包住，并在判据里说明「」里是昵称，不是称呼。
+    const wrap = (name) => `「${safeName(name, '某人')}」`;
+    // <<< speaker-quote patch >>>
     for (const message of list.slice(-limit)) {
         const raw = text(decisionContentText(message?.content));
         if (!raw) continue;
@@ -140,15 +164,19 @@ export function buildDecisionContext(recentMessages = [], plainText = '', limit 
         if (message?.role === 'assistant') {
             lines.push(`我: ${body}`);
         } else {
-            lines.push(`${decisionSpeakerName(raw) || '某人'}${atMe}: ${body || '（只有 @，没有文字）'}`);
+            // >>> speaker-quote patch >>>
+            lines.push(`${wrap(decisionSpeakerName(raw))}${atMe}: ${body || '（只有 @，没有文字）'}`);
+            // <<< speaker-quote patch >>>
         }
     }
     const nowRaw = text(plainText);
     const nowAtMe = detectAtBot(nowRaw) ? '（@了我）' : '';
     const now = stripStructuredHeader(nowRaw).slice(0, 300);
     if (now || nowAtMe) {
-        lines.push(`【刚进来的这条】${decisionSpeakerName(nowRaw) || '某人'}${nowAtMe}: `
+        // >>> speaker-quote patch >>>
+        lines.push(`【刚进来的这条】${wrap(decisionSpeakerName(nowRaw))}${nowAtMe}: `
             + `${now || '（只有 @，没有文字）'}`);
+        // <<< speaker-quote patch >>>
     }
     return lines.join('\n');
 }
@@ -163,13 +191,35 @@ export function parseDecision(raw) {
     return null;
 }
 
+// >>> decision-debug patch >>>
+// 2026-10-30：用户要「调试时能看到决策的思考过程」。
+// 默认关（只出 YES/NO，4 个 token，最省最快）。打开 chat.replyDecision.debug 后：
+//   · prompt 末尾追加一句「另起一行写为什么（≤20 字）」
+//   · maxTokens 放宽到 80（原上限 64 会把原因截掉）
+//   · 只解析**第一行**当裁决，后面几行进日志的 why 字段
+// 注意：这是调试专用。让模型多写一句会占输出带宽，判断质量可能略有波动，
+// 长期开着没必要，查问题的时候开。
+const DEBUG_SUFFIX = '\n\n判完之后另起一行，写一句为什么（不超过 20 字）。第一行只能有 YES 或 NO 这两个词。';
+
+function firstLine(raw) {
+    return String(raw || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] || '';
+}
+
+function restLines(raw) {
+    const lines = String(raw || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    return lines.slice(1).join(' ').slice(0, 60);
+}
+// <<< decision-debug patch <<<
+
 /**
  * @returns {Promise<{skip: boolean, reason: string, raw: string}>}
  *   skip === true  -> do not send a reply this turn
  *   anything unexpected -> { skip: false } (fail open)
  */
-export async function decideReply({ config = {}, aiClient, logger = console, recentMessages = [], plainText = '', speaker = '', messageType = '' } = {}) {
-    const cfg = config.chat?.replyDecision || {};
+export async function decideReply({ config = {}, aiClient, logger = console, recentMessages = [], plainText = '', speaker = '', messageType = '', sessionId = '', atOthers = false, addressed = false, followActive = false } = {}) {
+    // 按会话取配置：群/个人可以有自己的一套判据（见 session-overrides.js）
+    const sessionChat = resolveChatForSession(config, sessionId || '');
+    const cfg = sessionChat?.replyDecision || config.chat?.replyDecision || {};
     if (cfg.enabled !== true) return { skip: false, reason: 'disabled', raw: '' };
 
     // >>> group-reply-gate patch (managed by patch_group_reply_gate.py) >>>
@@ -182,6 +232,30 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
     if (!aiClient || typeof aiClient.chat !== 'function') {
         return { skip: false, reason: 'no-ai-client', raw: '' };
     }
+    // >>> at-others-skip patch >>>
+    // 2026-11-01 事故（757026023）：
+    //   `[@2519068029] 你现在cf多少分` —— @ 的是别人，她却回「诶 cf 是什么 又没人问我」。
+    // 这类**确定不是对我说的**，不必花一次决策调用，更不该由模型猜。
+    if (atOthers && !detectAtBot(plainText)) {
+        logger.info?.('[决策] @ 的是别人且没提我，直接不回', {
+            preview: String(plainText || '').slice(0, 50)
+        });
+        return { skip: true, reason: 'at_others', raw: '' };
+    }
+    // <<< at-others-skip patch >>>
+
+    // >>> reply-budget patch >>>
+    // 节奏控制：自己刚说完 2 分钟内不接话；10 分钟最多 4 条。被点名的永远放行。
+    const budget = shouldStaySilent(sessionId || '', {
+        addressed: addressed === true || detectAtBot(plainText),
+        cfg: cfg.budget || {}
+    });
+    if (budget.skip) {
+        logger.info?.('[决策] 发言预算，本轮闭嘴', { reason: budget.reason, session: sessionId || '' });
+        return { skip: true, reason: 'budget:' + budget.reason, raw: '' };
+    }
+    // <<< reply-budget patch >>>
+
     const minChars = clampInt(cfg.minChars, 0, 10000, 0);
     if (text(plainText).length < minChars) {
         return { skip: false, reason: 'too-short-to-judge', raw: '' };
@@ -196,13 +270,18 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
         : (text(cfg.prompt) || DEFAULT_DECISION_PROMPT);
 // <<< decision-private patch <<<
 // >>> group-reply-gate patch (managed by patch_group_reply_gate.py) >>>
-    const prompt = `${judgePrompt}\n\n【前面的对话（越靠下越新）】\n`
+    const debugReason = cfg.debug === true;
+    const judgePromptMerged = debugReason ? `${judgePrompt}${DEBUG_SUFFIX}` : judgePrompt;
+    const prompt = `${judgePromptMerged}\n\n【前面的对话（越靠下越新）】\n`
         + `${buildDecisionContext(recentMessages, plainText)}\n`
-        + `${speaker ? `\n【正在说话的人】${speaker}` : ''}`;
+        + `${speaker ? `\n【正在说话的人】${speaker}` : ''}`
+        // 接力窗口放行时告诉模型"这是我刚被叫过来的场合"，否则它按"没 @ 我"一律判 NO
+        + `${followActive ? '\n【接力中】你刚被叫过来，正在接着聊。' : ''}`;
     // <<< group-reply-gate patch <<<
 // >>> group-reply-gate patch (managed by patch_group_reply_gate.py) >>>
     const overrides = {
-        maxTokens: clampInt(cfg.maxTokens, 1, 64, 4),
+        // 调试模式要多写一行原因，4 个 token 不够；其余情况仍按精算值走。
+        maxTokens: debugReason ? Math.max(80, clampInt(cfg.maxTokens, 1, 64, 4)) : clampInt(cfg.maxTokens, 1, 64, 4),
         temperature: 0,
         allowModelFallback: false,
         // 🔴 必须关掉思维链：4 个 token 一旦被推理吃掉就拿不到 YES/NO，
@@ -224,7 +303,7 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
         ]);
         // <<< decision-timeout patch <<<
         const raw = text(aiClient.getVisibleResponseContent(result));
-        const verdict = parseDecision(raw);
+        const verdict = debugReason ? parseDecision(firstLine(raw)) : parseDecision(raw);
         const atBot = detectAtBot(plainText);
         // 🔴 把"这条 @ 了我没有"打进日志：这次事故从日志上完全看不出来
         //    （只看到 raw=NO，看不出它根本不知道被 @ 了）。
@@ -232,8 +311,15 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
             messageType: isPrivateChat ? 'private' : 'group',
             raw,
             atBot,
+            ...(debugReason ? { why: restLines(raw), promptChars: prompt.length } : {}),
             preview: stripStructuredHeader(plainText).slice(0, 60)
         });
+        // >>> decision-debug patch >>>
+        // 调试模式额外打一份**完整输入**，方便对照"它到底看到了什么"。
+        if (debugReason) {
+            logger.info?.('[决策] 输入快照', { prompt });
+        }
+        // <<< decision-debug patch <<<
         if (verdict === null) {
             logger.warn?.(`[决策] 无法解析，按"回"处理: ${JSON.stringify(raw.slice(0, 40))}`);
             // >>> reply-decision-failopen patch >>>
@@ -245,6 +331,7 @@ export async function decideReply({ config = {}, aiClient, logger = console, rec
             // <<< reply-decision-failopen patch <<<
             return { skip: false, reason: 'unparsed', raw, atBot };
         }
+        if (verdict === true) noteOwnReply(sessionId || '');
         return { skip: verdict === false, reason: verdict ? 'yes' : 'no', raw, atBot };
     } catch (error) {
         // 失败一律放行 —— 决策层绝不能成为"回复凭空消失"的原因

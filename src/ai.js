@@ -472,16 +472,33 @@ export class AIClient {
         // 只在显式要求时带上；实测 deepseek-flash 支持 {type:'disabled'} 关掉思考。
         if (options.thinking) payload.thinking = options.thinking;
         // <<< cobot-turn patch <<<
+        // >>> server-tools patch >>>
+        // DeepSeek 的 server tool（如 deepseek_web_search）：服务端执行、不计费、只算 token。
+        // 和普通 function tools 不同 —— 不需要 tool_choice，也不需要多轮循环。
+        // 见 web-search.js 顶部的说明。
+        if (Array.isArray(overrides.serverTools) && overrides.serverTools.length > 0) {
+            payload.tools = overrides.serverTools;
+        }
+        // <<< server-tools patch <<<
         return payload;
     }
 
     buildToolsChatPayload(messages, tools, overrides = {}) {
-        return {
+        const payload = {
             ...this.buildChatPayload(messages, overrides),
             tools,
             tool_choice: 'auto',
             parallel_tool_calls: false
         };
+        // >>> server-tools patch >>>
+        // server tool（deepseek_web_search）要和 function tools 并排声明：
+        // buildChatPayload 已经塞过一次，这里合并而不是覆盖，否则会丢掉搜索能力。
+        if (Array.isArray(overrides.serverTools) && overrides.serverTools.length > 0) {
+            const base = Array.isArray(payload.tools) ? payload.tools : [];
+            payload.tools = [...base, ...overrides.serverTools];
+        }
+        // <<< server-tools patch <<<
+        return payload;
     }
 
     buildNoToolsChatPayload(messages, overrides = {}) {

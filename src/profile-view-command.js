@@ -41,13 +41,35 @@ function cleanText(value) {
 }
 
 /** `/画像 涵` → `涵`；`/画像` → `''`。手打的 `@昵称` 也一并吃掉。 */
+// 2026-10-22：`/画像 @某人` 查不到人。
+// @ 段在 plainText 里长这样：`[@昵称|扣扣:123]`（sanitizeForInjection 把 QQ 换成了 扣扣），
+// 旧实现只剥 `^[\s@]+`，这串方括号就整体留下来当关键词去做 SQL LIKE ⇒ 一个人都匹配不到；
+// 而 mentionedParticipantId 明明有值，却因为"参数非空"被忽略。
+// 现在先把 @ 段整段剥掉，剥空了才回退到 mentionedParticipantId。
+const AT_MARKER_ANY_RE = /\[\s*@[^\]]*(?:扣扣|QQ)\s*[:：]\s*\d+[^\]]*\]/gi;
+const CQ_AT_RE = /\[CQ:at,[^\]]*\]/gi;
+// 2026-10-22 下午：还有第三种形态漏网 —— @ 的是 **bot 自己** 时，summarizeOneBotSegment
+// 生成的标记是 `[@bot] `（里面没有 扣扣/QQ:数字），上面的正则吃不掉它，
+// 于是 `/画像 @bot` 的 keyword 变成字面量 "[@bot]"（当天日志 13:12 / 13:19 两次实锤）。
+const BOT_AT_MARKER_RE = /\[\s*@bot\s*\]/gi;
+
+function stripAtMarkers(text) {
+    return cleanText(text)
+        .replace(CQ_AT_RE, ' ')
+        .replace(BOT_AT_MARKER_RE, ' ')
+        .replace(AT_MARKER_ANY_RE, ' ')
+        .replace(/^[\s@]+/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 export function parseProfileViewArgument(plainText, command) {
-    const text = cleanText(plainText);
+    const text = stripAtMarkers(plainText);
     const cmd = cleanText(command);
     if (!text || !cmd || !text.startsWith(cmd)) {
         return '';
     }
-    return text.slice(cmd.length).replace(/^[\s@]+/, '').trim();
+    return stripAtMarkers(text.slice(cmd.length));
 }
 
 /**
@@ -267,6 +289,7 @@ export async function executeProfileViewCommand({
     isAdmin = false,
     sessionManager = null,
     mentionedParticipantId = '',
+    botSelfId = '',
     manualCommand = '',
     onCommandAccepted = null,
     sendStatusMessage = null,
@@ -288,6 +311,21 @@ export async function executeProfileViewCommand({
     const argument = parseProfileViewArgument(plainText, command);
     // @ 段在调用方已被剥掉，所以「@了谁」要靠 mentionedParticipantId 兜底
     const keyword = argument || cleanText(mentionedParticipantId);
+
+    // >>> profile-self-query patch >>>
+    // 2026-10-22：查的是 bot 自己（`/画像 @bot` 或 `/画像 <自己的QQ>`）。
+    // 档案系统**不给自己建档**（素材只来自 role='user' 的消息），旧回复是
+    // 「没有找到…」听着像坏了；anon 2458713318 / soyo 3628056487 两次都踩。
+    // 改成一句人话。该分支只报"那是我"，不泄任何档案内容，放行在权限检查之前。
+    const botSelfQq = cleanText(botSelfId);
+    if (keyword && botSelfQq && keyword === botSelfQq) {
+        logger?.info?.('[画像] 查询对象是 bot 自己', { keyword, botSelfQq });
+        if (typeof sendStatusMessage === 'function') {
+            await sendStatusMessage('那是我自己呀。画像只记别人，我的样子都在角色卡里——想了解我的话直接跟我聊天就好。');
+        }
+        return { handled: true };
+    }
+    // <<< profile-self-query patch <<<
 
     // >>> profile-access patch >>>
     // 2026-10-19：用户要「所有人都能查画像」。做成分级，而不是把管理员门禁直接拆掉：
@@ -365,8 +403,11 @@ export async function executeProfileViewCommand({
     const forwardThresholdRaw = Number(forwardMinChars);
     const forwardThreshold = Number.isFinite(forwardThresholdRaw) && forwardThresholdRaw > 0
         ? Math.floor(forwardThresholdRaw) : PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars;
+    // 2026-10-22：详情模式（查具体某个人）**一律**用合并转发 —— 一份画像往往很短，
+    // 旧条件（条数>1 或 总长>=600）会让它走普通消息，用户看到的就是"有的转发有的不转发"。
+    // 列表模式仍按长度/条数判断，避免一句"共 N 份"也弹一张卡片。
     if (typeof sendForwardMessage === 'function'
-        && (texts.length > 1 || totalLength >= forwardThreshold)) {
+        && (Boolean(keyword) || texts.length > 1 || totalLength >= forwardThreshold)) {
         try {
             await sendForwardMessage(texts);
             logger?.info?.('[画像] 已合并转发', { nodes: texts.length, length: totalLength });

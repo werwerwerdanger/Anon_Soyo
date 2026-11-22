@@ -198,7 +198,13 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
     };
     // <<< reply-style patch <<<
     const mentionSenderOnReply = config.chat.mentionSenderOnReply !== false;
-    const mentionPrefix = event.message_type === 'group' && mentionSenderOnReply ? buildGroupMentionPrefix(event.user_id) : '';
+    // >>> no-mention patch >>>
+    // 调用方可要求这条不带 @（如 /最近比赛 后面补的那句「喵~」：
+    // 单独一个「@某人 喵~」很怪，2026-11-19 用户反馈）。
+    const mentionPrefix = (event.message_type === 'group' && mentionSenderOnReply && options?.noMention !== true)
+        ? buildGroupMentionPrefix(event.user_id)
+        : '';
+    // <<< no-mention patch >>>
     const ttsEnabled = ttsConfig.enabled === true;
     let hasSentPrimary = false;
 
@@ -385,9 +391,13 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
                 continue;
             }
 
-            const segments = splitMessage
+            // >>> no-split patch >>>
+            // 指令类回复（如 /最近比赛）可以要求整条发：每行都是一条完整信息，
+            // 拆成 8 个气泡反而难读。见 index.js 的 `{ noSplit: true }`。
+            const segments = (splitMessage && options?.noSplit !== true)
                 ? splitReplyIntoSegments(textContent)
                 : [textContent];
+            // <<< no-split patch >>>
 
             for (let index = 0; index < segments.length; index += 1) {
                 const segment = segments[index];
@@ -397,7 +407,9 @@ export async function dispatchReply(event, processedReply, options = {}, deps = 
                 }
 
                 const isPrimarySend = !hasSentPrimary;
-                await sendText(segmentContent, { burst: !isPrimarySend });
+                // forceBurst：调用方明确要求"这条紧跟着上一条发"（如 /最近比赛 的「喵~」），
+                // 走 burstIntervalMs（1.2s）而不是跨轮的 minSendIntervalMs（5s）。
+                await sendText(segmentContent, { burst: !isPrimarySend || options?.forceBurst === true });
                 const hasMoreSegments = index < segments.length - 1 || partIndex < textParts.length - 1;
                 const delayMs = isPrimarySend ? segmentDelayMs : proactiveIntervalMs;
                 if (hasMoreSegments && delayMs > 0) {

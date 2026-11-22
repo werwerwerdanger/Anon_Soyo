@@ -4,6 +4,7 @@
  */
 
 // >>> silence-gate patch (managed by patch_silence_gate.py) >>>
+import { resolveChatForSession } from './session-overrides.js';
 import { noteInbound, beginReply, endReply } from './reply-gate.js';
 // <<< silence-gate patch <<<
 
@@ -115,6 +116,15 @@ export class MessageRuntime {
         // <<< silence-gate patch <<<
         this.replyDelayMs = chatConfig.replyDelayMs ?? 800;
         this.dedupeWindowMs = chatConfig.dedupeWindowMs ?? 10000;
+        // >>> buffer-override patch >>>
+        // 2026-10-29：用户要求「爱音跟曲奇饼干bot的私聊缓冲改成 5 秒」，而缓冲窗口
+        // 原来是**全局**的（bufferWindowMs / firstBufferWindowMs），没法只改一个会话。
+        // 这里加一张按会话覆盖的表：键可以是完整 sessionKey（`private:2112991414`）
+        // 也可以是裸 QQ 号（`2112991414`，只对 private 生效）。值＝毫秒。
+        this.bufferOverrides = (chatConfig.bufferOverrides && typeof chatConfig.bufferOverrides === 'object')
+            ? chatConfig.bufferOverrides
+            : {};
+        // <<< buffer-override patch >>>
         const maxConcurrent = chatConfig.maxConcurrentSessions ?? 2;
 
         if (this.semaphore) {
@@ -122,6 +132,35 @@ export class MessageRuntime {
         } else {
             this.semaphore = new Semaphore(maxConcurrent);
         }
+    }
+
+    /**
+     * 这个会话实际该等多久。按 bufferOverrides 覆盖，命中就用覆盖值
+     * （首句窗口和后续窗口都用同一个值 —— 用户说"缓冲 5 秒"就是这两段都 5 秒）。
+     */
+    windowsFor(sessionKey) {
+        const key = String(sessionKey || '');
+        // ① 会话级覆盖（chat.overrides['group:xxx'].bufferWindowMs）优先
+        try {
+            const eff = resolveChatForSession({ chat: this.config?.chat || {} }, key);
+            const scoped = Number(eff?.bufferWindowMs);
+            if (Number.isFinite(scoped) && scoped >= 0 && scoped !== Number(this.bufferWindowMs)) {
+                const firstScoped = Number(eff?.firstBufferWindowMs);
+                return {
+                    bufferMs: scoped,
+                    firstMs: Number.isFinite(firstScoped) && firstScoped >= 0 ? firstScoped : scoped,
+                    overridden: true
+                };
+            }
+        } catch { /* 配置异常就退回旧逻辑 */ }
+        const ov = this.bufferOverrides || {};
+        const qq = key.startsWith('private:') ? key.slice('private:'.length) : '';
+        const raw = ov[key] !== undefined ? ov[key] : (qq && ov[qq] !== undefined ? ov[qq] : undefined);
+        const ms = Number(raw);
+        if (Number.isFinite(ms) && ms >= 0) {
+            return { bufferMs: ms, firstMs: ms, overridden: true };
+        }
+        return { bufferMs: this.bufferWindowMs, firstMs: this.firstBufferWindowMs, overridden: false };
     }
 
     enqueue(item) {
@@ -153,10 +192,14 @@ export class MessageRuntime {
         // 2026-10-13：带上新消息文本 —— 只有「判出换了话题」才作废在途回复，
         // 否则连打时会吃掉上一句已经生成好的回复（实测私聊被作废 17 次）。
         noteInbound(item.sessionKey, item.plainText || '');
+        // >>> buffer-override patch >>>
+        // 这个会话可能有自己的窗口（例：曲奇饼干bot 的私聊 5 秒）。
+        const win = this.windowsFor(item.sessionKey);
+        // <<< buffer-override patch >>>
         // 距上一条消息超过一个窗口 ⇒ 算新一轮的开头，给更长的静默时间
-        const freshTurn = !state.lastEnqueueTs || (nowTs - state.lastEnqueueTs > this.bufferWindowMs);
+        const freshTurn = !state.lastEnqueueTs || (nowTs - state.lastEnqueueTs > win.bufferMs);
         state.lastEnqueueTs = nowTs;
-        const silentMs = Math.max(0, freshTurn ? this.firstBufferWindowMs : this.bufferWindowMs);
+        const silentMs = Math.max(0, freshTurn ? win.firstMs : win.bufferMs);
         state.holdUntil = nowTs + silentMs;
         // <<< silence-gate patch <<<
         if (state.timer) {

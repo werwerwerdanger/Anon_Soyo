@@ -27,6 +27,10 @@ const sessions = new Map();
 // 含一份完整的 P1011 题解：算完了 / 就设第二站上下车都是 u / … 四段全丢）。
 // 新话题会自己进下一批被再答一次，所以群聊**不需要**靠作废去「避免答非所问」。
 const GROUP_SUPERSEDE_ENABLED = false;
+// 2026-10-29 用户要求「所有的对话输入都不打断输出」⇒ 私聊也关掉作废。
+// 她正在生成/正在发的那一轮一定发完，新消息进下一批单独处理。
+// 代价：偶尔看到两句时间错开的回复；收益：不再漏答（私聊曾因作废吃掉 17 轮）。
+const PRIVATE_SUPERSEDE_ENABLED = false;
 const PRIVATE_TOPIC_SWITCH_MIN_CHARS = 16;   // 私聊：8 -> 16，只有明显另起一段的才作废
 // <<< group-no-supersede patch <<<
 
@@ -93,7 +97,7 @@ export function noteInbound(sessionKey, newText = '') {
         if (isGroupSession && !GROUP_SUPERSEDE_ENABLED) {
             // 群聊不作废：第三人插话是常态，作废=漏答。放到下一批再答更划算。
             state.supersededReason = 'group_keep';
-        } else if (isTopicSwitch(state.roundText, newText, { minChars: PRIVATE_TOPIC_SWITCH_MIN_CHARS })) {
+        } else if (PRIVATE_SUPERSEDE_ENABLED && isTopicSwitch(state.roundText, newText, { minChars: PRIVATE_TOPIC_SWITCH_MIN_CHARS })) {
             state.superseded = true;
             state.supersededReason = 'topic_switch';
         } else {

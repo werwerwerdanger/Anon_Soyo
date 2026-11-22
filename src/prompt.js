@@ -10,12 +10,18 @@ import { stripStructuredEnvelope } from './structured-envelope.js';
 // >>> summary-identity-scrub patch >>>
 // 摘要里的自我档案清洗：DB 原文不动，只在注入侧隔离（2026-10-17，见 summary-scrub.js）。
 import { scrubSummaryIdentity, hasIdentityDossier } from './summary-scrub.js';
+import { extractQuirks, pickQuirk } from './quirks.js';
+import { moodPromptFor } from './mood.js';
+import { styleSectionFor } from './style-learn.js';
+import { resolveChatForSession } from './session-overrides.js';
 // <<< summary-identity-scrub patch <<<
 // >>> profile-quote-scrub patch >>>
 // 画像里的引号引语 = 台词本（2026-10-17，见 profile-scrub.js 头注释）。
 import { scrubProfileQuotes, hasQuotedScript } from './profile-scrub.js';
 // <<< profile-quote-scrub patch <<<
 import { buildStickerHint } from './sticker-library.js';
+// [canon] 两个实例共用的世界 / 关系 / 小插曲，见 src/canon/index.js。
+import { buildBlock as buildCanonBlock, normalizeConfig as normalizeCanonConfig } from './canon/index.js';
 
 function createNoopLogger() {
     return {
@@ -154,6 +160,7 @@ export class PromptBuilder {
         const chatConfig = config.chat || {};
         // >>> history-assistant-trim patch <<<
         this.chatConfig = chatConfig;
+        this.fullConfig = config;
         // <<< history-assistant-trim patch <<<
         this.presetConfig = presetConfig;
         this.contextConfig = {
@@ -1094,10 +1101,28 @@ const compactHistoryUser = (content) => {
     return out.replace(/[ \t]{2,}/g, ' ').replace(/\n{2,}/g, '\n').trim();
 };
 // <<< compact-history-user patch <<<
+        // >>> assistant-history-selftag patch >>>
+        // 2026-10-22 13:25 群聊实锤：她把自己 3 分钟前的回复（"比什么啊"）张冠李戴给
+        // Mogician，还在思考里幻觉出对方说了"比拉布"。原因：历史里**所有人的消息都带
+        // [昵称(QQ) 时间] 标签，唯独她自己的 assistant 轮是裸文本** —— 多人群里夹在
+        // 一堆署名行中间的无署名行极易被归错人。给 assistant 历史轮补同款自我标签。
+        // 肯定式、无引号例句，格式与 user 标签对齐（[你 时:分:秒]）。
+        const formatSelfTag = (message) => {
+            const n = Number(message && message.timestamp);
+            const d = Number.isFinite(n) && n > 0 ? new Date(n) : new Date();
+            const p = (x) => String(x).padStart(2, '0');
+            return `[你 ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}] `;
+        };
+        const renderHistoryAssistant = (message) => {
+            const trimmed = shortenHistoryAssistant(message.content);
+            if (!trimmed) return trimmed;
+            return `${formatSelfTag(message)}${trimmed}`;
+        };
+        // <<< assistant-history-selftag patch <<<
         const historyMessages = normalizedContext.recentMessages.map((message, index) => ({
             role: message.role,
             content: message.role === 'assistant'
-                ? shortenHistoryAssistant(message.content)
+                ? renderHistoryAssistant(message)
                 : compactHistoryUser(message.content),
             meta: {
                 source: 'history',
@@ -1138,6 +1163,30 @@ const compactHistoryUser = (content) => {
         }
 
         systemSegments.push(...worldBookSystemSegments);
+
+        // [canon] 世界 / 关系 / 小插曲。紧贴世界书 —— 它本质也是一种设定，
+        // 只是内容由两个实例共同维护。见 src/canon/index.js。
+        try {
+            const canonText = buildCanonBlock({
+                cfg: normalizeCanonConfig(this.chatConfig),
+                isPrivate: String(runtimeContext?.messageType || '') === 'private',
+                sessionId: String(runtimeContext?.sessionId || ''),
+                selfId: String(runtimeContext?.botSelfId || '')
+            });
+            if (canonText) {
+                systemSegments.push(PromptBuilder.createRuntimeSegment({
+                    id: 'canon',
+                    kind: 'canon',
+                    label: '共用舞台',
+                    content: canonText,
+                    stage: 'runtime',
+                    order: 62,
+                    meta: { placement: 'system' }
+                }));
+            }
+        } catch (e) {
+            // canon 坏了也不能拦着回消息
+        }
 
         const postHistorySegments = PromptBuilder.compactRuntimeSegments([
             ...worldBookPostHistorySegments,
@@ -1503,8 +1552,93 @@ const compactHistoryUser = (content) => {
         }
 
         if (this.contextConfig.includeParticipants && Array.isArray(runtimeContext.participants) && runtimeContext.participants.length > 0) {
-            sections.push(`【参与者】\n${runtimeContext.participants.join(' | ')}`);
+            // >>> known-bots patch >>>
+            // 参与者里若有已知机器人，会在名字后面带「（机器人）」（见 known-bots.js）。
+            // 光有括号她看不懂，必须配一句解释：那是个工具，不是人在跟她说话。
+            const hasKnownBot = runtimeContext.participants.some((p) => String(p).includes('（机器人）'));
+            const botNote = hasKnownBot
+                ? '\n标着（机器人）的是群里别的 bot：它按指令回卡片或固定格式，不是真人在跟你说话。'
+                : '';
+            sections.push(`【参与者】\n${runtimeContext.participants.join(' | ')}${botNote}`);
+            // <<< known-bots patch >>>
         }
+
+        // >>> pronoun-rules patch >>>
+        // 2026-11-01 两起答非所问都出在代词上：
+        //   ① `[@别人] 你现在cf多少分` → 她回「诶 cf 是什么 又没人问我」；
+        //   ② `你觉得你一年能上1800吗`（问用户）→ 她答「我一年肯定能上1800」。
+        // 群聊里「你」默认指**正在跟她说话的人**，不是她。这一节每轮都进提示词，
+        // 短、具体、只讲指代 —— 不要和语气规则混在一起，混了就没人看。
+        if (runtimeContext.messageType === 'group') {
+            sections.push([
+                '【指代】',
+                '- 你自己用「我」自称；别人说的「你」指的是**正在跟你说话的那个人**，不是你。',
+                '- 如果那句话的「你」指的是别人（@ 了别人、或接着别人的话），这条就跟你无关，不要认领，也不要说"没人问我"再自问自答。',
+                '- 提到第三个人时用对方的名字或「他/她」，不要用「你」。',
+                '- 「你们」只在确实包含你和对方时才成立；拿不准就用「你们俩」「他们」。'
+            ].join('\n'));
+        }
+        // <<< pronoun-rules patch >>>
+
+        // >>> quirks patch >>>
+        // 偶发地学一句群里的口头禅：从她本来就看得见的历史里提，
+        // 按概率挑一条注入，同一条 30 分钟内不重复（否则变复读机）。
+        // 配置：chat.quirks = { enabled, chance, minCount, cooldownMs }
+        try {
+            const qcfg = resolveChatForSession(this.fullConfig || {}, runtimeContext?.sessionId || '').quirks || {};
+            if (qcfg.enabled !== false) {
+                const { quirks } = extractQuirks(context.recentMessages || [], {
+                    minCount: qcfg.minCount ?? 2,
+                    limit: 6
+                });
+                const picked = pickQuirk(runtimeContext?.sessionId || '', quirks, {
+                    chance: qcfg.chance ?? 0.25,
+                    cooldownMs: qcfg.cooldownMs ?? 1800000
+                });
+                if (picked) {
+                    this.logger?.debug?.('[提示词] 注入口癖', { quirk: picked });
+                    sections.push(`【群里的口头禅】\n最近大家常挂嘴边的是「${picked}」。`
+                        + '这一轮可以顺口带一下，像刚听完别人说、自己跟着说出来；'
+                        + '不必每句都用，也不必解释这是什么。');
+                }
+            }
+        } catch (error) {
+            this.logger?.debug?.('[提示词] 口癖注入失败', { error: error?.message || String(error) });
+        }
+        // <<< quirks patch >>>
+
+        // >>> mood patch >>>
+        // 情绪状态（v/a）。只注入"怎么说"，不告诉她"你是什么情绪"——
+        // 一旦说出"我心情不好"就露馅了（见 mood.js 顶部说明）。
+        try {
+            const sessionKey = runtimeContext?.sessionId || '';
+            const mcfg = resolveChatForSession(this.fullConfig || {}, sessionKey).mood || {};
+            if (mcfg.enabled !== false) {
+                const moodText = moodPromptFor(sessionKey);
+                if (moodText) {
+                    this.logger?.debug?.('[提示词] 注入情绪状态');
+                    sections.push(moodText);
+                }
+            }
+        } catch (error) {
+            this.logger?.debug?.('[提示词] 情绪注入失败', { error: error?.message || String(error) });
+        }
+        // <<< mood patch >>>
+
+        // >>> style-learn patch >>>
+        // 群友的说话习惯（当 A 时用 B），离线提炼、存盘、这里只读。
+        // 故意写得轻：不要求她用，只给参考 —— 硬套比不学更假。
+        try {
+            const sessionKey = runtimeContext?.sessionId || '';
+            const scfg = resolveChatForSession(this.fullConfig || {}, sessionKey).styleLearn || {};
+            if (scfg.enabled !== false) {
+                const styleText = styleSectionFor(sessionKey, Number(scfg.limit ?? 3));
+                if (styleText) sections.push(styleText);
+            }
+        } catch (error) {
+            this.logger?.debug?.('[提示词] 说话风格注入失败', { error: error?.message || String(error) });
+        }
+        // <<< style-learn patch >>>
 
         // >>> participant-roster patch >>>
         // 跨会话身份名册。文本由 index.js 的 buildParticipantRosterText() 生成

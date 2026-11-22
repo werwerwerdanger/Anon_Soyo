@@ -177,10 +177,21 @@ export function pickSticker(lib, category = '', random = Math.random) {
 export function extractStickerMarkers(content = '') {
     const src = String(content ?? '');
     const requests = [];
-    const cleaned = src.replace(STICKER_MARKER_RE, (raw, zh, en) => {
+    // >>> sticker-codeblock-guard >>>
+    // 2026-11-18：她写代码时偶尔会在 ``` 块里出现 `[表情:xxx]`（历史 6 次标记里有 1 次就是这样）。
+    // 原来会把它当指令抽走 ⇒ 代码块被挖个洞，还发一张莫名其妙的图。
+    // 先把代码块整体挖出来占位，解析完再放回去。
+    const blocks = [];
+    const guarded = src.replace(/```[\s\S]*?```/g, (m) => {
+        blocks.push(m);
+        return `\u0000CB${blocks.length - 1}\u0000`;
+    });
+    const stripped = guarded.replace(STICKER_MARKER_RE, (raw, zh, en) => {
         requests.push({ category: text(zh ?? en), raw });
         return '';
     });
+    const cleaned = stripped.replace(/\u0000CB(\d+)\u0000/g, (_, i) => blocks[Number(i)] ?? '');
+    // <<< sticker-codeblock-guard >>>
     return {
         // 删掉标记后可能留下空行/多余空格，收拾一下，但**不动段落结构**
         cleaned: cleaned.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim(),
@@ -216,10 +227,38 @@ export function buildStickerHint(config = {}, { lib } = {}) {
     const library = lib || scanStickerLibrary(resolveStickerDir(config));
     if (library.total === 0) return '';
     const cats = listStickerCategories(library);
-    const catPart = cats.length > 0
-        ? `可用的有：${cats.join('、')}`
-        : '（还没有分类，直接用空类别即可）';
-    return `想发一张表情包就在回复里写上 [表情:类别]，系统会替你发出去（QQ 会读成表情包）。`
-        + `${catPart}。`
-        + '别写别的类别名，写错的发不出去；一张回复最多发一张，不想发就别写。';
+    if (cats.length === 0) return '';
+
+    // 2026-11-18 改：原来的写法是「想发就在回复里写 [表情:类别]……不想发就别写」。
+    // 结果是 269 条回复只用了 6 次（2.2%）—— 因为"不想发就别写"等于把默认值设成了"不发"，
+    // 而且她不知道**什么场合**该配哪张。
+    // 现在改成「什么场合 → 用哪个」，再给一个例句（抄 pangting-bot 的经验：给样例比给形容词有用）。
+    const usage = STICKER_USAGE.filter((u) => cats.includes(u.category));
+    const guide = usage.length > 0
+        ? usage.map((u) => `- ${u.when} → ${u.category}`).join('\n')
+        : '';
+    const example = usage[0]
+        ? `例：\`这题我调了两小时，结果没开 long long [表情:${usage[0].category}]\``
+        : '';
+
+    return [
+        `你可以在回复末尾配一张表情包，写法是 [表情:类别]（系统会替你换成本地图，QQ 读成表情包）。`,
+        `可用类别：${cats.join('、')}。`,
+        guide ? `挑哪个：\n${guide}` : '',
+        example,
+        '多数时候配一张会更像真人说话；写在句子末尾最自然，一条回复最多一张，类别名写错就发不出去。'
+    ].filter(Boolean).join('\n');
 }
+
+/**
+ * 场景 → 类别。类别名必须和 data/stickers/ 下的子目录一致，
+ * 不存在的会被过滤掉（用户删了某个分类也不会写出无效指引）。
+ */
+const STICKER_USAGE = [
+    { when: '无语、离谱、被人问奇怪的问题', category: '无语' },
+    { when: '高兴、想逗人、被夸', category: '开心' },
+    { when: '被冤枉、事情不顺、卖惨', category: '委屈' },
+    { when: '被夸得不好意思、想岔开话题', category: '害羞' },
+    { when: '被惹到了但还没到骂人', category: '生气' },
+    { when: '没听懂、觉得不对劲', category: '问号' }
+];

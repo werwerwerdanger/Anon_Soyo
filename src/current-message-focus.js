@@ -205,7 +205,7 @@ const SHORT_ANSWER_ULTRA_CHARS = 6;     // 折叠后 ≤6 字：几乎必然是�
 //   再排除编程语境。中文闲聊的「2 点 3 分」没有小数，不算。
 const CODE_FENCE_RE = /```|`[^`]+`/;
 // 题面/评测类词汇 —— 这类消息里数字是数据范围，不是成绩
-const TECH_TALK_RE = /(数据范围|时限|复杂度|样例|输入|输出|评测|提交|编译|代码|wa|tle|mle|\bo\()/i;
+const TECH_TALK_RE = /(数据范围|时限|复杂度|样例|输入|输出|评测|提交|编译|代码|\bwa\b|\btle\b|\bmle\b|\bo\()/i;
 // 语气词不算“术语”
 const LATIN_STOP = new Set(['ok', 'okay', 'yes', 'no', 'hh', 'hhh', 'em', 'emm', 'www', 'lol', 'orz', 'awa', 'qwq']);
 function looksLikeNumbersTalk(text) {
@@ -268,7 +268,7 @@ function isCodeRequest(text) {
 // >>> send-status patch >>>
 // sendFailureHint：上一轮那条没送达（禁言/无权限/风控）时的事实，放在最末尾。
 // <<< send-status patch <<<
-function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '', participantRosterMention = '', stickerHint = '', sendFailureHint = '', moodHint = '' }) {
+function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanShapeHint = '', participantRosterMention = '', stickerHint = '', sendFailureHint = '', moodHint = '', addressedHint = '' }) {
     const warnings = [];
     if (event?.reply?.fetchStatus === 'failed') {
         warnings.push(`引用消息获取失败: ${event.reply.fetchReason || 'unknown'}`);
@@ -384,6 +384,13 @@ function buildWarnings({ event, text, intent, routing, styleAnchor = '', humanSh
         warnings.push(NUMERIC_CHAT_HINT);
     }
     // <<< numeric-chat-hint patch <<<
+    // >>> primary-by-trigger-rank patch >>>
+    // 放在**最末尾**：模型产出回复前读到的最后一句 system 文本（杠杆最高）。
+    // 只有"被点名 + 后面还压着别人的话"时才有内容，平时不注入。
+    if (addressedHint) {
+        warnings.push(addressedHint);
+    }
+    // <<< primary-by-trigger-rank patch <<<
     return warnings;
 }
 
@@ -445,8 +452,12 @@ export function buildCurrentMessageFocus(runtimeContext = {}, options = {}) {
 // >>> send-status patch >>>
             sendFailureHint: options.sendFailureHint || '',
             // >>> mood-carry patch >>>
-            moodHint: options.moodHint || ''
+            moodHint: options.moodHint || '',
             // <<< mood-carry patch <<<
+            // >>> primary-by-trigger-rank patch >>>
+            // 从 runtimeContext 来（prompt.js 用 `...runtimeContext` 展开，不用改它）。
+            addressedHint: runtimeContext.addressedHint || ''
+            // <<< primary-by-trigger-rank patch <<<
 // <<< send-status patch <<<
         })
     };

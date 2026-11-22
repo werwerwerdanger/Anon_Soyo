@@ -22,6 +22,7 @@
 // /\]\s*([\s\S]+)$/ —— 命中**第一个** `]`（信封里 messageSegments 的数组括号），
 // 于是她读到的是「他：] 那kmp呢」这种残渣。
 import { stripStructuredEnvelope } from './structured-envelope.js';
+import { worldLineToday } from './canon/index.js';
 
 export const DEFAULT_PROACTIVE_CONFIG = {
     enabled: false,
@@ -31,8 +32,19 @@ export const DEFAULT_PROACTIVE_CONFIG = {
     windowEnd: 23,                    // 23 点之后不发
     checkIntervalMs: 30 * 60 * 1000,  // 每 30 分钟看一次
     chance: 0.3,                      // 过了闸门之后，三成概率真的发
+    // 2026-10-23：主动开场分两种模式，按这个概率二选一。
+    // 用户原话：「为什么爱音主动找我每次都会提一嘴上次说的东西感觉好怪啊」——
+    // 旧版**每次**都把最近 4 条塞进【你们上次聊到】并要求"接着上面的话说"，
+    // 而"说件小事"排在它后面，模型自然总选第一个（§4.1 列举收敛第一个）。
+    // 0.35 = 大约三分之一的开场接上次，其余开场只说她这边的事。
+    followupChance: 0.35,
     targetSessions: [],               // 空 = 所有私聊；填了就只发这些
-    excludeIds: []                    // 永不主动发的 QQ（通常是另一个 bot 实例的号）
+    excludeIds: [],                   // 永不主动发的 QQ（通常是另一个 bot 实例的号）
+    // >>> prox-allday patch >>>
+    // 这几个人不受上面 windowStart/windowEnd 的限制。用途：另一个 bot 实例
+    // 不是「人」，凌晨找它说话不存在打扰，而且用户想看的正是这种自然延续。
+    allDayForIds: [],
+    // <<< prox-allday patch <<<
 };
 
 /** 按本地时间判断是否在允许的作息窗口内。 */
@@ -52,7 +64,7 @@ export function parsePrivateSessionId(sessionId) {
 }
 
 export class ProactiveChatter {
-    constructor({ db = null, aiClient = null, bot = null, characterName = '', persona = null, selfId = '', config = {}, logger = console } = {}) {
+    constructor({ db = null, aiClient = null, bot = null, characterName = '', persona = null, selfId = '', config = {}, canonCfg = {}, logger = console } = {}) {
         this.db = db;
         this.aiClient = aiClient;
         this.bot = bot;
@@ -60,6 +72,8 @@ export class ProactiveChatter {
         // 角色卡的人格段：没有它，「不要用括号写动作」这条规则进不了请求
         this.persona = persona || {};
         this.selfId = String(selfId || '');
+        // canon 配置（世界事件要从这里读）。缺了就走默认目录。
+        this.canonCfg = canonCfg || {};
         this.logger = logger;
         this.cfg = { ...DEFAULT_PROACTIVE_CONFIG, ...(config || {}) };
         this.timer = null;
@@ -143,7 +157,8 @@ export class ProactiveChatter {
     }
 
     /** 取这个会话最近几条，给她当"上次聊到哪"。 */
-    recentLines(sessionId, limit = 4) {
+    recentLines(sessionId, limit = 4, targetName = '') {
+        const other = String(targetName || '').trim() || '他';
         try {
             const rows = this.db.prepare(
                 'select role, content from messages where session_id = ? order by rowid desc limit ?'
@@ -156,13 +171,60 @@ export class ProactiveChatter {
                 if (/图片转述|<image_caption>|外形接近/.test(text)) continue;
                 text = text.replace(/\[图片[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
                 if (!text) continue;
-                out.push(`${r.role === 'assistant' ? '你' : '他'}：${text.slice(0, 100)}`);
+                out.push(`${r.role === 'assistant' ? '你' : other}：${text.slice(0, 100)}`);
             }
             return out;
         } catch (e) {
             this.logger?.warn?.('[主动] 读消息失败', e?.message || e);
             return [];
         }
+    }
+
+    /**
+     * 该怎么称呼对方（只用于主动私聊的开场）。
+     *
+     * 取名字的顺序（2026-10-24 二改）：
+     *   ① 她自己的画像里给这个人起的名字（`participant_profile` 的 participantName）
+     *      —— 这是她"心里那个人"的名字，LLM 归纳过，长期稳定。
+     *   ② `participant_contacts.display_name`，但要去掉括号后缀。
+     *   ③ 都没有才退回"他"。
+     *
+     * 为什么不直接用 display_name：它是**群名片**，用户随手就能改成
+     * 「世上只有妈妈好」这种玩梗名。10-24 09:12 实锤——她照字面回了句
+     * 「妈妈，我今天自己起来的哦」，就是因为这里塞了当时的群名片。
+     */
+    contactName(userId) {
+        const id = String(userId || '').trim();
+        if (!id) return '';
+        // ① 画像里的名字
+        try {
+            const row = this.db
+                .prepare(
+                    "select json_extract(metadata_json,'$.participantName') as name "
+                    + "from memory_entries where entry_type = 'participant_profile' and id like ? "
+                    + 'order by updated_at desc limit 1'
+                )
+                .get('participant_profile_' + id + '_%');
+            const profileName = String(row?.name || '').trim();
+            if (profileName) return profileName;
+        } catch (e) {
+            this.logger?.debug?.('[主动] 取画像名失败', e?.message || e);
+        }
+        // ② 联系人表的群名片，去掉「（…）」这类后缀
+        try {
+            const row = this.db
+                .prepare('select display_name from participant_contacts where participant_id = ? limit 1')
+                .get(id);
+            const raw = String(row?.display_name || '');
+            const cleaned = raw
+                .replace(/[（(【\[][^）)】\]]*[）)】\]]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (cleaned) return cleaned;
+        } catch (e) {
+            this.logger?.debug?.('[主动] 取昵称失败', e?.message || e);
+        }
+        return '';
     }
 
     /** 人格段：卡里 personality 开头那句「你正在扮演X」是旁白视角，去掉再用。 */
@@ -176,18 +238,47 @@ export class ProactiveChatter {
         return text ? { role: 'system', content: text } : null;
     }
 
-    buildMessages(contextLines, now) {
+    buildMessages(contextLines, now, mode = 'followup', targetName = '') {
         const hour = new Date(now).getHours();
         const timeHint = hour < 11 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 22 ? '晚上' : '深夜';
         // ⚠ 只描述情境，不举例句、不给否定指令（§5.1）
         // 2026-10-19：原来写「说说你此刻在做什么」⇒ 她理解成"描写自己的动作"，
         // 加上这次请求没带角色卡（「不要用括号写动作」失效），输出成了（午休趴桌上…）旁白。
         // 改成"在手机上打字，屏幕上只有字"——同一个意思，用情境说。
-        const user = `现在是${timeHint}。你一个人待着，忽然想跟他说句话。\n\n`
-            + `【你们上次聊到】\n${contextLines.join('\n') || '（没什么印象了）'}\n\n`
-            + '你正在手机上给他发消息，屏幕上只会出现你打出来的字。\n'
-            + '接着上面的话说，或者说说你这边正好发生的一件小事。一句话就够。';
+        //
+        // >>> proactive-open-mode patch >>>
+        // 2026-10-23：两种开场模式，由 followupChance 掷骰子决定。
+        //   followup —— 带着「上次聊到」的 4 条，接上文（旧行为，现在只是其中一种）
+        //   fresh    —— **不注入**上次对话，只留"你这边正好有件小事"的情境
+        // fresh 必须彻底不给上文，否则那 4 条一样会把话题拽回去。
+        //
+        // >>> proactive-target-name patch >>>
+        // 2026-10-23 另一处：20:58 她主动开场把对方叫成「Tomorin」。
+        // 原因＝这轮请求里**完全没有对方是谁**，只有"他"这个代词；而角色卡里
+        // 满篇是 Tomorin / Soyorin / Rikki（爱音给乐队成员起的外号）⇒ 名字从卡里就近取。
+        // 现在把对方在这个库里的显示名（participant_contacts.display_name）传进来。
+        // 拿到就写昵称，拿不到才退回"他"（肯定式，不加引号例句）。
+        const other = String(targetName || '').trim() || '他';
         const persona = this.buildPersonaMessage();
+        // [canon] 今天外面的那件事。有就当成"随口能提的一句"，没有也不影响。
+        // 注意：只给事实，不给"你可以拿它当话题"这种指令 —— 那会让她生硬地宣布天气。
+        const worldLine = worldLineToday(this.canonCfg || {});
+        const worldBlock = worldLine ? `【今天】${worldLine}\n` : '';
+        let user;
+        if (mode === 'fresh') {
+            user = `现在是${timeHint}。你一个人待着，忽然想跟${other}说句话。\n\n`
+                + worldBlock
+                + `你这边正好有件小事，想顺口跟${other}讲一下。\n`
+                + `你正在手机上给${other}发消息，屏幕上只会出现你打出来的字。一句话就够。`;
+        } else {
+            user = `现在是${timeHint}。你一个人待着，忽然想跟${other}说句话。\n\n`
+                + `【你们上次聊到】\n${contextLines.join('\n') || '（没什么印象了）'}\n\n`
+                + worldBlock
+                + `你正在手机上给${other}发消息，屏幕上只会出现你打出来的字。\n`
+                + '接着上面的话说，或者说说你这边正好发生的一件小事。一句话就够。';
+        }
+        // <<< proactive-target-name patch <<<
+        // <<< proactive-open-mode patch <<<
         return persona ? [persona, { role: 'user', content: user }] : [{ role: 'user', content: user }];
     }
 
@@ -195,9 +286,6 @@ export class ProactiveChatter {
         const now = Date.now();
         this.resetDailyIfNeeded(now);
 
-        if (!isWithinWindow(now, Number(this.cfg.windowStart), Number(this.cfg.windowEnd))) {
-            return;
-        }
         if (this.sentToday >= (Number(this.cfg.maxPerDay) || 0)) {
             return;
         }
@@ -205,13 +293,32 @@ export class ProactiveChatter {
         if (!picked) {
             return;
         }
+        // >>> prox-allday patch >>>
+        // 先选出目标，再判窗口：目标是 allDayForIds 里的人（另一个 bot）就跳过作息检查。
+        // 顺序必须这样——原来窗口检查在最前面，根本走不到"知道要发给谁"这一步。
+        const allDayIds = Array.isArray(this.cfg.allDayForIds) ? this.cfg.allDayForIds.map(String) : [];
+        if (!allDayIds.includes(String(picked.userId))
+            && !isWithinWindow(now, Number(this.cfg.windowStart), Number(this.cfg.windowEnd))) {
+            return;
+        }
+        // <<< prox-allday patch <<<
         if (Math.random() > (Number(this.cfg.chance) || 0)) {
             this.logger?.debug?.('[主动] 概率未命中', { sessionId: picked.sessionId });
             return;
         }
 
-        const contextLines = this.recentLines(picked.sessionId);
-        const messages = this.buildMessages(contextLines, now);
+        // >>> proactive-open-mode patch >>>
+        // 掷骰子决定这次开场是"接上次"还是"说件新事"。fresh 模式下不读上文，
+        // 省一次 SQL 也避免那 4 条把话题拽回去。
+        const followupChanceRaw = Number(this.cfg.followupChance);
+        const followupChance = Number.isFinite(followupChanceRaw) ? Math.min(1, Math.max(0, followupChanceRaw)) : 0.35;
+        const openMode = Math.random() < followupChance ? 'followup' : 'fresh';
+        // <<< proactive-open-mode patch <<<
+        // >>> proactive-target-name patch >>>
+        const targetName = this.contactName(picked.userId);
+        // <<< proactive-target-name patch <<<
+        const contextLines = openMode === 'followup' ? this.recentLines(picked.sessionId, 4, targetName) : [];
+        const messages = this.buildMessages(contextLines, now, openMode, targetName);
         let text = '';
         try {
             const result = await this.aiClient.chat(
@@ -241,8 +348,10 @@ export class ProactiveChatter {
         this.lastSentAt = now;
         this.logger?.info?.('[主动] 已主动开口', {
             sessionId: picked.sessionId,
+            targetName: targetName || '(unknown)',
             idleHours: (picked.idleMs / 3600000).toFixed(1),
             todayCount: this.sentToday,
+            mode: openMode,
             preview: text.slice(0, 60)
         });
     }

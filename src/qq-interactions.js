@@ -141,8 +141,29 @@ export function resolveEmojiReactionId(config = {}) {
  */
 const LEADING_AT_MARKER_RE = /^(?:\s*\[@[^\]]*\])+/;
 
+// 2026-10-30：上面那条正则会在**第一个** `]` 就收手，而 @ 标记里可能嵌套方括号：
+//   `[@某人|扣扣:[已屏蔽]] /画像 3068520336`  → 残留 `] /画像 …` ⇒ 指令永远匹配不上
+// 另外 `[CQ:at,qq=…]` 形态根本没被认。两种都实测复现（verify_at_command_gate.mjs）。
+// 改成按括号深度配对地剥前缀，且同时认 `[@…]` 与 `[CQ:at,…]`。
 export function stripLeadingAtMarkers(text) {
-    return sanitizeText(text).replace(LEADING_AT_MARKER_RE, '').trim();
+    let s = sanitizeText(text).trim();
+    for (let guard = 0; guard < 8; guard += 1) {
+        const head = /^\s*\[(?:@|CQ:at,)/i.exec(s);
+        if (!head) break;
+        let depth = 0;
+        let end = -1;
+        for (let i = 0; i < s.length; i += 1) {
+            const ch = s[i];
+            if (ch === '[') depth += 1;
+            else if (ch === ']') {
+                depth -= 1;
+                if (depth === 0) { end = i; break; }
+            }
+        }
+        if (end < 0) break;          // 配不上就原样返回，别吃掉正文
+        s = s.slice(end + 1).trim();
+    }
+    return s;
 }
 // <<< group-command-at-gate patch <<<
 
