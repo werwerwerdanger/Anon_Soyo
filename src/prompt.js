@@ -206,6 +206,24 @@ export class PromptBuilder {
     }
     // <<< example-dialogue patch <<<
 
+    /**
+     * 只保留末尾 max 条示例。
+     *
+     * 为什么要这个：2026-11-23 实测素世私聊 `messageCount: 229`，其中
+     * **example_dialogue 150 条**（占 65%），而且排在真实历史前面 ——
+     * 模型大半上下文中都是"范例对话"，于是照着范例演，不听眼前这个人说话。
+     * 末尾的示例权重最高（也是我们最想让她学的那几组），所以从末尾截。
+     * 切点落在 user 上，保证不会从半句 assistant 开始。
+     */
+    static limitExampleTurns(turns = [], max = 0) {
+        const list = Array.isArray(turns) ? turns : [];
+        const cap = Math.floor(Number(max) || 0);
+        if (cap <= 0 || list.length <= cap) return list;
+        let cut = list.length - cap;
+        while (cut < list.length && list[cut].role !== 'user') cut += 1;
+        return cut < list.length ? list.slice(cut) : list.slice(-cap);
+    }
+
     static normalizePromptBoolean(value, fallback = false) {
         if (value === undefined || value === null || value === '') {
             return fallback;
@@ -1429,11 +1447,16 @@ const compactHistoryUser = (content) => {
         // >>> example-dialogue patch (managed by patch_example_dialogue.py) >>>
         // 示例对话按 ST 的标准位置放在历史之前：让模型在上下文里"看到"角色怎么说话。
         // 指令永远打不过示例，这是 SillyTavern 官方文档的原话。
-        const exampleTurns = ((this.chatConfig || {}).exampleDialogue === false)
+        const exampleTurnsRaw = ((this.chatConfig || {}).exampleDialogue === false)
             ? []
             : PromptBuilder.parseExampleDialogue(character.mes_example);
+        // [示例限流] 全部注入会撑爆上下文（实测 150 条），只留末尾若干条
+        const exampleTurns = PromptBuilder.limitExampleTurns(
+            exampleTurnsRaw,
+            Number((this.chatConfig || {}).exampleMaxTurns) || 0
+        );
         if (exampleTurns.length > 0) {
-            this.logger?.debug?.(`[提示词] 注入示例对话 ${exampleTurns.length} 轮`);
+            this.logger?.debug?.(`[提示词] 注入示例对话 ${exampleTurns.length}/${exampleTurnsRaw.length} 轮`);
             for (const turn of exampleTurns) {
                 messages.push({
                     role: turn.role,

@@ -2330,6 +2330,12 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
         : (event?.user_id ? `private:${event.user_id}` : '');
     const scopedChat = resolveChatForSession(config, scopeKey);
     // <<< routing-scoped-config patch >>>
+    // [代练] 用户 2026-11-23：他有时借 bot 的号手动发言，但 NapCat 的
+    // `reportSelfMessage=false` ⇒ bot 根本不知道自己号已经说过话，会把同一句再说一遍。
+    // 这个总闸打开后：照常收消息、照常入库、照常算画像，只是不自动回复。
+    if (config.chat?.pauseReply === true) {
+        return { shouldRespond: false, triggerReason: 'paused', checks: { paused: true } };
+    }
     const triggerMode = scopedChat.triggerMode || 'auto';
     // 小群保护：人少的时候默认要求 @（见 known-bots.js 的 shouldRequireAtInGroup）
     const requireAtInGroup = shouldRequireAtInGroup(scopedChat, event?.group_id || '');
@@ -6178,8 +6184,55 @@ async function handleMoodCommand(event, commandInput) {
 }
 // <<< mood-command patch >>>
 
+// >>> self-echo patch >>>
+// 用户 2026-11-23：他有时用同一个号的手机会话手动代练。
+// NapCat 打开 `reportSelfMessage` 后会把自己号发的消息也推上来，
+// 这里负责把**人手动打的**写进会话（让模型看到"自己刚说过这句"，不再重说），
+// 而 **bot 自己发的**（message_id / 文本命中）直接丢弃。
+function rawPlainText(event) {
+    const seg = event?.message;
+    if (typeof seg === 'string') return seg;
+    if (!Array.isArray(seg)) return '';
+    return seg.map((x) => {
+        if (!x) return '';
+        if (x.type === 'text') return x.data?.text || '';
+        if (x.type === 'image') return '[图片]';
+        if (x.type === 'face') return '[表情]';
+        return '';
+    }).join('');
+}
+
+async function handleSelfSentMessage(event) {
+    try {
+        const text = rawPlainText(event).trim();
+        if (!text) return;
+        if (bot.isSelfSent(event.message_id, text)) return;   // 是 bot 自己发的
+        const sessionId = event.message_type === 'group' && event.group_id
+            ? `group:${event.group_id}`
+            : (event.user_id ? `private:${event.user_id}` : '');
+        if (!sessionId) return;
+        sessionManager.addMessage(sessionId, 'assistant', text, {
+            replyTo: '',
+            messageType: event.message_type,
+            groupId: event.group_id,
+            generatedBy: 'manual_takeover'
+        });
+        logger.info('[代练] 你手打的这句已写入上下文', { sessionId, preview: text.slice(0, 40) });
+    } catch (e) {
+        logger.debug?.('[代练] 写入失败', { error: e?.message || String(e) });
+    }
+}
+// <<< self-echo patch <<<
+
 async function handleMessage(event) {
-    if (!event || event.post_type !== 'message') {
+    if (!event) {
+        return;
+    }
+    // [self-echo] 自己号发出的消息：手动代练的入库，bot 自己发的丢弃
+    if (event.post_type === 'message_sent') {
+        return handleSelfSentMessage(event);
+    }
+    if (event.post_type !== 'message') {
         return;
     }
     const eventSelfId = event.self_id || bot.selfId;
@@ -6680,6 +6733,7 @@ server.listen(config.server.port, config.server.host, () => {
             persona: proactivePersona,
             config: config.chat?.proactiveChat || {},
             canonCfg: normalizeCanonConfig(config.chat || {}),
+            isPaused: () => config.chat?.pauseReply === true,
             logger
         });
         proactiveChatter.start();

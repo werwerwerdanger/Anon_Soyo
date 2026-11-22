@@ -11753,6 +11753,17 @@
         </div>
         <div class="panel" id="canon">
             <h2>🌏 共用世界</h2>
+
+            <div class="card" style="margin-bottom:16px;border-left:3px solid var(--accent);">
+                <h3>代练模式 <span class="meta-inline">用它的号手动发言时打开</span></h3>
+                <p class="hint-text" style="margin:6px 0 10px;">
+                    NapCat 不会告诉 bot「自己号已经发了这句话」，
+                    所以它会跟着再说一遍。打开这个开关，
+                    它照常收消息、照常记录，只是不再自动回。
+                </p>
+                <button onclick="togglePauseReply()" id="canon-pause-btn">⏸ 暂停自动回复</button>
+                <span class="meta-inline" id="canon-pause-status" style="margin-left:10px;"></span>
+            </div>
             <p class="hint-text">
                 爱音和素世读同一份设定文件，这里改完下一轮对话就生效。
                 <span id="canon-path" style="opacity:.7;"></span>
@@ -14023,6 +14034,7 @@
             }
             if (panelId === 'canon') {
                 loadCanon();
+                loadPauseState();
                 return;
             }
             if (panelId === 'config') {
@@ -14036,6 +14048,43 @@
         }
 
         // ==================== canon（共用世界） ====================
+
+        // [代练] 借它的号手动发言时暂停自动回复。见 src/index.js 的 reply-pause 块。
+        function renderPause(paused) {
+            const btn = document.getElementById('canon-pause-btn');
+            const st = document.getElementById('canon-pause-status');
+            if (btn) {
+                btn.textContent = paused ? '▶ 恢复自动回复' : '⏸ 暂停自动回复';
+                btn.dataset.paused = paused ? '1' : '';
+            }
+            if (st) st.textContent = paused ? '当前：已暂停（它在看，不出声）' : '当前：正常';
+        }
+
+        async function loadPauseState() {
+            try {
+                const res = await fetch('/api/reply/pause');
+                const data = await res.json();
+                renderPause(data.paused === true);
+            } catch (e) { /* 读不到就保持原样 */ }
+        }
+
+        async function togglePauseReply() {
+            const btn = document.getElementById('canon-pause-btn');
+            const next = !(btn && btn.dataset.paused === '1');
+            try {
+                const res = await fetch('/api/reply/pause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ paused: next })
+                });
+                const data = await res.json();
+                renderPause(data.paused === true);
+            } catch (e) {
+                const st = document.getElementById('canon-pause-status');
+                if (st) st.textContent = '切换失败';
+            }
+        }
+
         // 用户 2026-11-23：「这个我来写」—— 世界事件自动生成关掉，改成这里手写。
         const CANON_NAMES = { '2458713318': '爱音', '3628056487': '素世', '2063362809': '你' };
         let canonCache = null;

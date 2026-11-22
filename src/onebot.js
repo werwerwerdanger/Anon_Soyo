@@ -225,7 +225,8 @@ export class OneBotClient extends EventEmitter {
 
     // HTTP 模式：接收 OneBot 推送的事件
     handleHttpEvent(eventData) {
-        if (eventData.post_type === 'message' || eventData.post_type === 'notice' || eventData.post_type === 'request') {
+        if (eventData.post_type === 'message' || eventData.post_type === 'message_sent'
+            || eventData.post_type === 'notice' || eventData.post_type === 'request') {
             this.emit('message', eventData);
         }
         if (eventData.echo !== undefined) {
@@ -276,6 +277,41 @@ export class OneBotClient extends EventEmitter {
         }
     }
 
+    // >>> self-echo patch >>>
+    // 用户 2026-11-23：他有时直接用自己的 QQ 客户端（同一个号）打字代练，
+    // 但 `reportSelfMessage=false` 时 NapCat 根本不上报 —— 模型看不到"自己刚说过这句"，
+    // 于是接着把同一句话再说一遍。打开上报后，这里负责把**bot 自己发的**和
+    // **人手动发的**分开：前者靠 message_id / 文本命中就丢弃，后者交给上层入库。
+    noteSelfSent(messageId, text = '') {
+        if (!this.selfSentIds) this.selfSentIds = new Map();
+        const now = Date.now();
+        if (messageId !== undefined && messageId !== null) {
+            this.selfSentIds.set(String(messageId), now);
+        }
+        const plain = String(text || '').trim();
+        if (plain) {
+            if (!this.selfSentTexts) this.selfSentTexts = [];
+            this.selfSentTexts.push({ text: plain, at: now });
+            this.selfSentTexts = this.selfSentTexts.filter((i) => now - i.at < 60000).slice(-80);
+        }
+        for (const [id, ts] of this.selfSentIds) {
+            if (now - ts > 600000) this.selfSentIds.delete(id);
+        }
+        while (this.selfSentIds.size > 300) {
+            this.selfSentIds.delete(this.selfSentIds.keys().next().value);
+        }
+    }
+
+    isSelfSent(messageId, text = '') {
+        const id = String(messageId ?? '');
+        if (id && this.selfSentIds && this.selfSentIds.has(id)) return true;
+        const plain = String(text || '').trim();
+        if (!plain || !Array.isArray(this.selfSentTexts)) return false;
+        const now = Date.now();
+        return this.selfSentTexts.some((i) => i.text === plain && now - i.at < 60000);
+    }
+    // <<< self-echo patch <<<
+
     _handleMessage(msg) {
         // 处理 API 响应
         if (msg.echo !== undefined) {
@@ -292,7 +328,8 @@ export class OneBotClient extends EventEmitter {
         }
 
         // 处理事件
-        if (msg.post_type === 'message' || msg.post_type === 'notice' || msg.post_type === 'request') {
+        if (msg.post_type === 'message' || msg.post_type === 'message_sent'
+            || msg.post_type === 'notice' || msg.post_type === 'request') {
             this.emit('message', msg);
         } else if (msg.post_type === 'meta_event') {
             if (msg.meta_event_type === 'heartbeat') {
@@ -337,6 +374,19 @@ export class OneBotClient extends EventEmitter {
 
             this.pendingCalls.set(echo, {
                 resolve: (data) => {
+                    // [self-echo] 记住自己刚发出去的 message_id / 文本
+                    if (/^send_/.test(action)) {
+                        const text = typeof params?.message === 'string'
+                            ? params.message
+                            : (Array.isArray(params?.message)
+                                ? params.message.filter((x) => x && x.type === 'text').map((x) => x.data?.text || '').join('')
+                                : '');
+                        if (data && data.message_id !== undefined) {
+                            this.noteSelfSent(data.message_id, text);
+                        } else {
+                            this.noteSelfSent(undefined, text);
+                        }
+                    }
                     this.logger.info?.('[OneBot] API 调用成功', {
                         action,
                         echo,

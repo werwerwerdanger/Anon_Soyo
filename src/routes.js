@@ -7918,6 +7918,21 @@ ${lastResultText}
         res.json({ success: true, enabled: getLlmEnabled() });
     });
 
+    // ==================== 代练模式 ====================
+    // 用户 2026-11-23：借 bot 的号手动说话时，bot 不知道自己号已经说过话
+    // （NapCat 的 reportSelfMessage=false），会把同一句再说一遍。开关就是干这个的。
+    app.get('/api/reply/pause', requireAuth, (req, res) => {
+        res.json({ ok: true, paused: config.chat?.pauseReply === true });
+    });
+
+    app.post('/api/reply/pause', requireAuth, (req, res) => {
+        const paused = req.body?.paused === true;
+        config.chat.pauseReply = paused;
+        try { saveConfig(config); } catch (e) { /* 内存生效也算 */ }
+        logger.info(`[代练] 自动回复${paused ? '已暂停' : '已恢复'}`);
+        res.json({ ok: true, paused });
+    });
+
     // ==================== canon（两个实例共用的世界） ====================
     // 用户 2026-11-23：「你先别乱注入事情，这个我来写」——所以自动生成默认关掉，
     // 改成面板手写。这三个接口就是手写入口。
