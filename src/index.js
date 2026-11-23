@@ -6734,6 +6734,7 @@ server.listen(config.server.port, config.server.host, () => {
             config: config.chat?.proactiveChat || {},
             canonCfg: normalizeCanonConfig(config.chat || {}),
             isPaused: () => config.chat?.pauseReply === true,
+            sessionManager,
             logger
         });
         proactiveChatter.start();

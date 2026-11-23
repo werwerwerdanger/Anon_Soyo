@@ -224,6 +224,34 @@ export class PromptBuilder {
         return cut < list.length ? list.slice(cut) : list.slice(-cap);
     }
 
+    /**
+     * 这个点她应该是什么状态。
+     *
+     * 用户 2026-11-23：「白天的时候要不要每小时发一个时间戳看看现在应该是什么心情」。
+     * 光给时间不够 —— 之前只有【当前时间】一行，她照样在下午三点像半夜一样闲聊。
+     * 这里把「几点了」翻译成「这个点人在哪、能怎么回」。
+     *
+     * 配置可覆盖：chat.timeMood = { enabled, weekday: [[from,to,'文案'],...], weekend: [...] }
+     */
+    static describeTimeSlot(now = new Date(), cfg = {}) {
+        if (cfg && cfg.enabled === false) return '';
+        const hour = now.getHours();
+        const day = now.getDay();
+        const weekend = day === 0 || day === 6;
+        const custom = weekend ? cfg?.weekend : cfg?.weekday;
+        const table = Array.isArray(custom) && custom.length ? custom : (weekend
+            ? PromptBuilder.TIME_SLOTS_WEEKEND
+            : PromptBuilder.TIME_SLOTS_WEEKDAY);
+        for (const row of table) {
+            const from = Number(row?.[0]);
+            const to = Number(row?.[1]);
+            if (!Number.isFinite(from) || !Number.isFinite(to)) continue;
+            const hit = from <= to ? (hour >= from && hour < to) : (hour >= from || hour < to);
+            if (hit && row?.[2]) return String(row[2]);
+        }
+        return '';
+    }
+
     static normalizePromptBoolean(value, fallback = false) {
         if (value === undefined || value === null || value === '') {
             return fallback;
@@ -818,7 +846,11 @@ export class PromptBuilder {
                 id: 'current-time',
                 kind: 'current_time',
                 label: '当前时间',
-                content: `【当前时间】${timeStr}`,
+                // [time-mood] 时间后面跟一句「这个点的状态」，否则她不知道"现在该不该说话"
+                content: (() => {
+                    const slot = PromptBuilder.describeTimeSlot(now, (this.chatConfig || {}).timeMood || {});
+                    return slot ? `【当前时间】${timeStr}\n【这个点】${slot}` : `【当前时间】${timeStr}`;
+                })(),
                 stage: 'runtime',
                 order: 0,
                 meta: { placement: 'system' }
@@ -1940,3 +1972,22 @@ const compactHistoryUser = (content) => {
         };
     }
 }
+
+// [time-mood] 默认时段表。只描述"人在哪、能怎么回"，不写情绪形容词（形容词会被放大）。
+PromptBuilder.TIME_SLOTS_WEEKDAY = [
+    [0, 6, '\u6df1\u591c\uff0c\u672c\u6765\u8be5\u7761\u4e86\uff1b\u8fd8\u9192\u7740\u5c31\u662f\u5728\u71ac\u591c'],
+    [6, 8, '\u6e05\u65e9\uff0c\u521a\u8d77\uff0c\u8d76\u7740\u51fa\u95e8'],
+    [8, 12, '\u4e0a\u5348\u7684\u8bfe\uff0c\u624b\u673a\u5728\u684c\u4e0b\uff0c\u56de\u5f97\u65ad\u65ad\u7eed\u7eed'],
+    [12, 13, '\u5348\u4f11\uff0c\u7ec8\u4e8e\u80fd\u770b\u624b\u673a'],
+    [13, 17, '\u4e0b\u5348\u7684\u8bfe\u6216\u8005\u793e\u56e2\uff0c\u56de\u5f97\u6162'],
+    [17, 19, '\u653e\u5b66\u8def\u4e0a\uff0c\u6216\u8005\u521a\u5230\u5bb6'],
+    [19, 22, '\u665a\u4e0a\uff0c\u81ea\u5df1\u7684\u65f6\u95f4'],
+    [22, 24, '\u8be5\u7761\u4e86\uff0c\u4f46\u8fd8\u9192\u7740']
+];
+PromptBuilder.TIME_SLOTS_WEEKEND = [
+    [0, 9, '\u5468\u672b\uff0c\u7761\u5230\u81ea\u7136\u9192\u6216\u8005\u8fd8\u8d56\u7740'],
+    [9, 12, '\u5468\u672b\u4e0a\u5348\uff0c\u5728\u5bb6\u78e8\u8e6d'],
+    [12, 17, '\u5468\u672b\u4e0b\u5348\uff0c\u591a\u534a\u5728\u5916\u9762'],
+    [17, 22, '\u5468\u672b\u665a\u4e0a\uff0c\u968f\u4fbf\u6253\u53d1'],
+    [22, 24, '\u5468\u672b\u591c\u91cc\uff0c\u660e\u5929\u4e0d\u7528\u65e9\u8d77']
+];

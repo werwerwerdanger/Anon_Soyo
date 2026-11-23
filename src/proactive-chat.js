@@ -64,7 +64,7 @@ export function parsePrivateSessionId(sessionId) {
 }
 
 export class ProactiveChatter {
-    constructor({ db = null, aiClient = null, bot = null, characterName = '', persona = null, selfId = '', config = {}, canonCfg = {}, isPaused = null, logger = console } = {}) {
+    constructor({ db = null, aiClient = null, bot = null, characterName = '', persona = null, selfId = '', config = {}, canonCfg = {}, isPaused = null, sessionManager = null, logger = console } = {}) {
         this.db = db;
         this.aiClient = aiClient;
         this.bot = bot;
@@ -76,6 +76,12 @@ export class ProactiveChatter {
         this.canonCfg = canonCfg || {};
         // [代练] 用户借号手动发言期间，别主动插话
         this.isPaused = typeof isPaused === 'function' ? isPaused : null;
+        // >>> proactive-persist patch >>>
+        // 主动开口是自己发起的话，**必须写进自己的会话**。
+        // 2026-11-23 事故：她主动说了「发现了一家甜品店」，对方记住了，她自己没记录
+        // ⇒ 对方说"你先提的"，她坚决否认，两个 bot 为此吵了四轮（用户叫"滚木对话"）。
+        this.sessionManager = sessionManager || null;
+        // <<< proactive-persist patch >>>
         this.logger = logger;
         this.cfg = { ...DEFAULT_PROACTIVE_CONFIG, ...(config || {}) };
         this.timer = null;
@@ -347,6 +353,18 @@ export class ProactiveChatter {
             this.logger?.warn?.('[主动] 发送失败', e?.message || e);
             return;
         }
+        // >>> proactive-persist patch >>>
+        // 发出去就得记下来，否则下一轮她读到的是"对方在说我从没说过的话"。
+        try {
+            this.sessionManager?.addMessage?.(picked.sessionId, 'assistant', text, {
+                messageType: 'private',
+                userId: picked.userId,
+                generatedBy: 'proactive'
+            });
+        } catch (e) {
+            this.logger?.debug?.('[主动] 写入会话失败', { error: e?.message || String(e) });
+        }
+        // <<< proactive-persist patch >>>
 
         this.sentToday += 1;
         this.lastSentAt = now;
