@@ -7918,7 +7918,7 @@ ${lastResultText}
         res.json({ success: true, enabled: getLlmEnabled() });
     });
 
-    // ==================== 代练模式 ====================
+    // ==================== 接管模式 ====================
     // 用户 2026-11-23：借 bot 的号手动说话时，bot 不知道自己号已经说过话
     // （NapCat 的 reportSelfMessage=false），会把同一句再说一遍。开关就是干这个的。
     app.get('/api/reply/pause', requireAuth, (req, res) => {
@@ -7929,7 +7929,7 @@ ${lastResultText}
         const paused = req.body?.paused === true;
         config.chat.pauseReply = paused;
         try { saveConfig(config); } catch (e) { /* 内存生效也算 */ }
-        logger.info(`[代练] 自动回复${paused ? '已暂停' : '已恢复'}`);
+        logger.info(`[接管] 自动回复${paused ? '已暂停' : '已恢复'}`);
         res.json({ ok: true, paused });
     });
 

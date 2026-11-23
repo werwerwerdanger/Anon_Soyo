@@ -278,7 +278,7 @@ export class OneBotClient extends EventEmitter {
     }
 
     // >>> self-echo patch >>>
-    // 用户 2026-11-23：他有时直接用自己的 QQ 客户端（同一个号）打字代练，
+    // 用户 2026-11-23：他有时直接用自己的 QQ 客户端（同一个号）打字，
     // 但 `reportSelfMessage=false` 时 NapCat 根本不上报 —— 模型看不到"自己刚说过这句"，
     // 于是接着把同一句话再说一遍。打开上报后，这里负责把**bot 自己发的**和
     // **人手动发的**分开：前者靠 message_id / 文本命中就丢弃，后者交给上层入库。

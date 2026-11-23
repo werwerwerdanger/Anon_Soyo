@@ -2332,7 +2332,7 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
         : (event?.user_id ? `private:${event.user_id}` : '');
     const scopedChat = resolveChatForSession(config, scopeKey);
     // <<< routing-scoped-config patch >>>
-    // [代练] 用户 2026-11-23：他有时借 bot 的号手动发言，但 NapCat 的
+    // [自己号] 用户 2026-11-23：他有时借 bot 的号手动发言，但 NapCat 的
     // `reportSelfMessage=false` ⇒ bot 根本不知道自己号已经说过话，会把同一句再说一遍。
     // 这个总闸打开后：照常收消息、照常入库、照常算画像，只是不自动回复。
     if (config.chat?.pauseReply === true) {
@@ -6201,7 +6201,7 @@ async function handleMoodCommand(event, commandInput) {
 // <<< mood-command patch >>>
 
 // >>> self-echo patch >>>
-// 用户 2026-11-23：他有时用同一个号的手机会话手动代练。
+// 用户 2026-11-23：他有时用同一个号的手机会话手动发言。
 // NapCat 打开 `reportSelfMessage` 后会把自己号发的消息也推上来，
 // 这里负责把**人手动打的**写进会话（让模型看到"自己刚说过这句"，不再重说），
 // 而 **bot 自己发的**（message_id / 文本命中）直接丢弃。
@@ -6233,9 +6233,9 @@ async function handleSelfSentMessage(event) {
             groupId: event.group_id,
             generatedBy: 'manual_takeover'
         });
-        logger.info('[代练] 你手打的这句已写入上下文', { sessionId, preview: text.slice(0, 40) });
+        logger.info('[self-echo] 自己号发出的消息已写入上下文', { sessionId, preview: text.slice(0, 40) });
     } catch (e) {
-        logger.debug?.('[代练] 写入失败', { error: e?.message || String(e) });
+        logger.debug?.('[self-echo] 自己号消息写入失败', { error: e?.message || String(e) });
     }
 }
 // <<< self-echo patch <<<
@@ -6244,7 +6244,7 @@ async function handleMessage(event) {
     if (!event) {
         return;
     }
-    // [self-echo] 自己号发出的消息：手动代练的入库，bot 自己发的丢弃
+    // [self-echo] 自己号发出的消息：人手打的入库，bot 自己发的丢弃
     if (event.post_type === 'message_sent') {
         return handleSelfSentMessage(event);
     }

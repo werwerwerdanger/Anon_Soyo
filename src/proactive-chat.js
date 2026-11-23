@@ -74,7 +74,7 @@ export class ProactiveChatter {
         this.selfId = String(selfId || '');
         // canon 配置（世界事件要从这里读）。缺了就走默认目录。
         this.canonCfg = canonCfg || {};
-        // [代练] 用户借号手动发言期间，别主动插话
+        // [接管] 用户借号手动发言期间，别主动插话
         this.isPaused = typeof isPaused === 'function' ? isPaused : null;
         // >>> proactive-persist patch >>>
         // 主动开口是自己发起的话，**必须写进自己的会话**。
@@ -291,7 +291,7 @@ export class ProactiveChatter {
     }
 
     async tick() {
-        // [代练] 手动接管期间不主动开口
+        // [接管] 手动接管期间不主动开口
         if (this.isPaused && this.isPaused()) return;
         const now = Date.now();
         this.resetDailyIfNeeded(now);
