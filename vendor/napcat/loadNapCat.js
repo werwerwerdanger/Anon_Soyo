@@ -1,0 +1,1 @@
+(async () => {await import("file:///C:/Users/20633/NapCat/napcat.mjs")})()

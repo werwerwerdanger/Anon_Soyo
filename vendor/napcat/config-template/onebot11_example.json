@@ -1,0 +1,33 @@
+{
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [
+      {
+        "enable": true,
+        "name": "ws-<ACCOUNT>-<PORT>",
+        "host": "127.0.0.1",
+        "port": 2424,
+        "token": "__YOUR_ONEBOT_TOKEN__",
+        "enableForcePushEvent": true,
+        "reportSelfMessage": true,
+        "messagePostFormat": "array",
+        "debug": false,
+        "heartInterval": 30000
+      }
+    ],
+    "websocketClients": [],
+    "plugins": []
+  },
+  "musicSignUrl": "",
+  "enableLocalFile2Url": false,
+  "parseMultMsg": false,
+  "imageDownloadProxy": "",
+  "timeout": {
+    "baseTimeout": 10000,
+    "uploadSpeedKBps": 256,
+    "downloadSpeedKBps": 256,
+    "maxTimeout": 1800000
+  }
+}
