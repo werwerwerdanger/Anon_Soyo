@@ -133,6 +133,8 @@ import { OjListWatcher, normalizeOjListConfig } from './oj-list-watch.js';
 import { onReply as canonOnReply, tick as canonTick, normalizeConfig as normalizeCanonConfig } from './canon/index.js';
 // [presence] 她这个点回不回得了（故意不回 / 在忙 / 睡着了）
 import { shouldStaySilent } from './presence.js';
+// [manual-speak] 人手打的发言要绕过 co-bot 限流 (2026-11-23)
+import { markManualSend, isManualSpeak } from './manual-speak.js';
 import { collectParticipantGroupIds, mergeParticipantIdentity, resolveParticipantIdentityFromOneBot } from './participant-identity.js';
 import {
     getParticipantProfileTimerKey,
@@ -2554,12 +2556,18 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
     // >>> cobot-private-block patch <<<
     // 两个机器人互相私聊会变成无限对话，每一轮 2 次 LLM 调用 —— 纯烧 token。
     // 只挡私聊；群里的互动不受影响（那条由 botBanterMaxTurns 管）。
-    if (config?.chat?.coBotPrivateBlock !== false && isCoBot(config, event)) {
+    // [manual-speak] 用户借号手打时，协议层跟 bot 自发完全一样，只能靠发言方留的标记区分
+    const sharedDirForManual = config?.chat?.canon?.dir;
+    const manualOverride = sharedDirForManual && isManualSpeak(sharedDirForManual, event?.user_id);
+    if (manualOverride) {
+        logger.debug?.('[manual-speak] 对方刚有人手发言，按真人处理', { userId: event?.user_id });
+    }
+    if (config?.chat?.coBotPrivateBlock !== false && !manualOverride && isCoBot(config, event)) {
         return skip('cobot_private');
     }
     // <<< cobot-private-block patch <<<
     // >>> bot-banter-limit patch <<<
-    if (isCoBot(config, event) && botBanterDecision(config, event) === 'limit') {
+    if (!manualOverride && isCoBot(config, event) && botBanterDecision(config, event) === 'limit') {
         return skip('bot_banter_limit');
     }
     // <<< bot-banter-limit patch <<<
@@ -6233,6 +6241,11 @@ async function handleSelfSentMessage(event) {
             groupId: event.group_id,
             generatedBy: 'manual_takeover'
         });
+        // [manual-speak] 告诉对面：这条是人手打的，不是 bot 自己在聊。
+        // 走共享文件（chat.canon.dir），对方在 co-bot 判断前会先看一眼。
+        const sharedDir = config?.chat?.canon?.dir;
+        const selfId = event.self_id || event.user_id;
+        if (sharedDir && selfId) markManualSend(sharedDir, { fromId: selfId, preview: text });
         logger.info('[self-echo] 自己号发出的消息已写入上下文', { sessionId, preview: text.slice(0, 40) });
     } catch (e) {
         logger.debug?.('[self-echo] 自己号消息写入失败', { error: e?.message || String(e) });
@@ -6756,6 +6769,8 @@ server.listen(config.server.port, config.server.host, () => {
             canonCfg: normalizeCanonConfig(config.chat || {}),
             isPaused: () => config.chat?.pauseReply === true,
             sessionManager,
+            // [self-id] 传 getter，别传值 —— 这里 bot 还没握手，selfId 是 null
+            selfId: () => bot.selfId,
             logger
         });
         proactiveChatter.start();

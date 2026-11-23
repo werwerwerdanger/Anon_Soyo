@@ -73,7 +73,13 @@ export class ProactiveChatter {
         this.characterName = characterName;
         // 角色卡的人格段：没有它，「不要用括号写动作」这条规则进不了请求
         this.persona = persona || {};
-        this.selfId = String(selfId || '');
+        // [self-id] bot.selfId 要等 OneBot 握手后才拿到，构造时还是 null。
+        // 之前直接 String(null||'') = ''，导致共享锁里 by 永远是空串，
+        // isOtherSideJustOpened 第一行 `!state.by` 直接 return false —— 锁形同虚设
+        // （实测 proactive-state.json 的 by 是 ""，11-23 两次同时主动就是它没生效）。
+        this.resolveSelfId = typeof selfId === 'function'
+            ? selfId
+            : () => String(selfId || '');
         // canon 配置（世界事件要从这里读）。缺了就走默认目录。
         this.canonCfg = canonCfg || {};
         // [接管] 用户借号手动发言期间，别主动插话
@@ -166,7 +172,7 @@ export class ProactiveChatter {
     isOtherSideJustOpened(now, lockMinutes = 15) {
         const state = this.readLock();
         if (!state || !state.at || !state.by) return false;
-        if (String(state.by) === String(this.selfId)) return false;
+        if (String(state.by) === String(this.resolveSelfId())) return false;
         return now - Number(state.at) < lockMinutes * 60000;
     }
 
@@ -175,7 +181,7 @@ export class ProactiveChatter {
             const file = this.lockFile();
             if (!file) return;
             fsSync.writeFileSync(file, JSON.stringify({
-                by: String(this.selfId || ''),
+                by: String(this.resolveSelfId() || ''),
                 at: now,
                 preview: String(text || '').slice(0, 40)
             }), 'utf8');
@@ -200,7 +206,8 @@ export class ProactiveChatter {
             const userId = parsePrivateSessionId(sessionId);
             if (!userId) continue;
             // 别给自己（另一个实例的号）发
-            if (this.selfId && userId === this.selfId) continue;
+            const myId = String(this.resolveSelfId() || '');
+            if (myId && String(userId) === myId) continue;
             const excludes = Array.isArray(this.cfg.excludeIds) ? this.cfg.excludeIds.map(String) : [];
             if (excludes.includes(userId)) continue;
             if (allow.length > 0 && !allow.includes(sessionId) && !allow.includes(userId)) continue;
