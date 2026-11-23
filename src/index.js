@@ -6733,6 +6733,11 @@ server.listen(config.server.port, config.server.host, () => {
             if (personaName && personaName !== '你的角色名') {
                 const card = characterManager.loadCharacter(personaName);
                 proactivePersona = {
+                    // [proactive-card] 原来漏了 system_prompt —— 那是「不打标点、一行一句、句尾用哦/呢」
+                    // 这些格式规则所在的地方。结果主动开口完全不受约束：
+                    // 15:17「爱音，在吗。」15:33「爱音，在吗。今天排练的时间，是不是比平时早一点。」
+                    // 全是书面标点，跟日常回复（「不是哦 / 我一张都没发」）判若两人。
+                    systemPrompt: card?.system_prompt || card?.data?.system_prompt || '',
                     personality: card?.personality || card?.data?.personality || '',
                     postHistory: card?.post_history_instructions
                         || card?.data?.post_history_instructions || ''

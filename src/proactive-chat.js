@@ -289,6 +289,9 @@ export class ProactiveChatter {
     buildPersonaMessage() {
         const p = this.persona || {};
         const parts = [];
+        // [proactive-card] 格式规则在 system_prompt 里，必须带上 —— 否则主动开口会写成书面句
+        const systemPrompt = String(p.systemPrompt || '').trim();
+        if (systemPrompt) parts.push(systemPrompt);
         const personality = String(p.personality || '').replace(/^你正在扮演[^。]*。\s*/, '').trim();
         if (personality) parts.push(personality);
         if (p.postHistory) parts.push(String(p.postHistory).trim());
