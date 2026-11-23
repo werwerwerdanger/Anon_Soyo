@@ -453,6 +453,10 @@ export class AIClient {
             apiKey: hasApiKeyOverride ? overrides.apiKey : this.config.apiKey,
             maxTokens: overrides.maxTokens ?? this.config.maxTokens,
             temperature: overrides.temperature ?? this.config.temperature,
+            // [freq-penalty] 压重复用词。同一模型互聊时最容易出现的毛病
+            // （每句都同一个句式/同一个收尾），社区做法是把 frequency penalty 调到 0.03-0.07，
+            // 我们用绝对值 0.2-0.4 试。不配就不传，保持原行为。
+            frequencyPenalty: overrides.frequencyPenalty ?? this.config.frequencyPenalty,
             // >>> cobot-turn patch >>>
             thinking: overrides.thinking
             // <<< cobot-turn patch <<<
@@ -468,6 +472,10 @@ export class AIClient {
             temperature: options.temperature,
             stream: false
         };
+        // [freq-penalty] 只在配置了具体数值时带上，undefined 会让部分网关直接 400
+        if (Number.isFinite(Number(options.frequencyPenalty)) && Number(options.frequencyPenalty) > 0) {
+            payload.frequency_penalty = Number(options.frequencyPenalty);
+        }
         // >>> cobot-turn patch >>>
         // 只在显式要求时带上；实测 deepseek-flash 支持 {type:'disabled'} 关掉思考。
         if (options.thinking) payload.thinking = options.thinking;
