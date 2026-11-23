@@ -131,6 +131,8 @@ import { OjListWatcher, normalizeOjListConfig } from './oj-list-watch.js';
 // <<< oj-contest patch >>>
 // [canon] 两个实例共用的世界 / 关系 / 小插曲，见 src/canon/index.js。
 import { onReply as canonOnReply, tick as canonTick, normalizeConfig as normalizeCanonConfig } from './canon/index.js';
+// [presence] 她这个点回不回得了（故意不回 / 在忙 / 睡着了）
+import { shouldStaySilent } from './presence.js';
 import { collectParticipantGroupIds, mergeParticipantIdentity, resolveParticipantIdentityFromOneBot } from './participant-identity.js';
 import {
     getParticipantProfileTimerKey,
@@ -2335,6 +2337,20 @@ function buildRoutingDecision(config, event, plainText, isAtMe, messageInfo = {}
     // 这个总闸打开后：照常收消息、照常入库、照常算画像，只是不自动回复。
     if (config.chat?.pauseReply === true) {
         return { shouldRespond: false, triggerReason: 'paused', checks: { paused: true } };
+    }
+    // [presence] 上课、深夜、社团 —— 她不一定看得见，看到了也不一定回。
+    // 被 @ 时永远回（见 presence.js 的 atBotAlwaysReply）。
+    try {
+        const silence = shouldStaySilent({ config, event, isAtMe });
+        if (silence.silent) {
+            return {
+                shouldRespond: false,
+                triggerReason: `silent(${silence.chance})`,
+                checks: { presence: silence }
+            };
+        }
+    } catch (e) {
+        // 在线感算挂了也不能因此不回消息
     }
     const triggerMode = scopedChat.triggerMode || 'auto';
     // 小群保护：人少的时候默认要求 @（见 known-bots.js 的 shouldRequireAtInGroup）
