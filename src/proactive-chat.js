@@ -22,6 +22,8 @@
 // /\]\s*([\s\S]+)$/ —— 命中**第一个** `]`（信封里 messageSegments 的数组括号），
 // 于是她读到的是「他：] 那kmp呢」这种残渣。
 import { stripStructuredEnvelope } from './structured-envelope.js';
+import fsSync from 'fs';
+import path from 'path';
 import { worldLineToday } from './canon/index.js';
 
 export const DEFAULT_PROACTIVE_CONFIG = {
@@ -81,6 +83,8 @@ export class ProactiveChatter {
         // 2026-11-23 事故：她主动说了「发现了一家甜品店」，对方记住了，她自己没记录
         // ⇒ 对方说"你先提的"，她坚决否认，两个 bot 为此吵了四轮（用户叫"滚木对话"）。
         this.sessionManager = sessionManager || null;
+        // [proactive-lock] 两个实例共用一个状态文件，避免两边同时主动找对方
+        this.stateDir = String(canonCfg?.dir || '').trim();
         // <<< proactive-persist patch >>>
         this.logger = logger;
         this.cfg = { ...DEFAULT_PROACTIVE_CONFIG, ...(config || {}) };
@@ -133,6 +137,52 @@ export class ProactiveChatter {
     }
 
     /** 挑一个"该说话了"的私聊会话。返回 { sessionId, userId, idleMs } 或 null。 */
+    // >>> proactive-lock patch >>>
+    /**
+     * 两个实例互相主动的互斥锁。
+     *
+     * 2026-11-23 现象：爱音 15:17:35 主动开口，素世 15:17:53 也主动开口 ——
+     * 两个人同时"我有件事想跟你说"，谁也没在回谁，看着非常假。
+     * 两边 timer 是独立的，只能靠共享状态协调。
+     */
+    lockFile() {
+        if (!this.stateDir) return '';
+        return path.join(this.stateDir, 'proactive-state.json');
+    }
+
+    readLock() {
+        try {
+            const file = this.lockFile();
+            if (!file) return null;
+            const raw = fsSync.readFileSync(file, 'utf8');
+            const obj = JSON.parse(raw);
+            return obj && typeof obj === 'object' ? obj : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** 对方刚主动过（且还没等到回复），这轮就让给她。 */
+    isOtherSideJustOpened(now, lockMinutes = 15) {
+        const state = this.readLock();
+        if (!state || !state.at || !state.by) return false;
+        if (String(state.by) === String(this.selfId)) return false;
+        return now - Number(state.at) < lockMinutes * 60000;
+    }
+
+    writeLock(now, text = '') {
+        try {
+            const file = this.lockFile();
+            if (!file) return;
+            fsSync.writeFileSync(file, JSON.stringify({
+                by: String(this.selfId || ''),
+                at: now,
+                preview: String(text || '').slice(0, 40)
+            }), 'utf8');
+        } catch { /* 锁写不进去也不能阻止发言 */ }
+    }
+    // <<< proactive-lock patch <<<
+
     pickSession(now) {
         let rows = [];
         try {
@@ -312,6 +362,11 @@ export class ProactiveChatter {
             return;
         }
         // <<< prox-allday patch <<<
+        // [proactive-lock] 对方刚主动找过我，还没回完 —— 这轮不抢话
+        if (this.isOtherSideJustOpened(now, Number(this.cfg.pairCooldownMinutes) || 15)) {
+            this.logger?.debug?.('[主动] 对方刚开过口，这轮让给她', { sessionId: picked.sessionId });
+            return;
+        }
         if (Math.random() > (Number(this.cfg.chance) || 0)) {
             this.logger?.debug?.('[主动] 概率未命中', { sessionId: picked.sessionId });
             return;
@@ -322,7 +377,14 @@ export class ProactiveChatter {
         // 省一次 SQL 也避免那 4 条把话题拽回去。
         const followupChanceRaw = Number(this.cfg.followupChance);
         const followupChance = Number.isFinite(followupChanceRaw) ? Math.min(1, Math.max(0, followupChanceRaw)) : 0.35;
-        const openMode = Math.random() < followupChance ? 'followup' : 'fresh';
+        let openMode = Math.random() < followupChance ? 'followup' : 'fresh';
+        // [proactive-material] fresh 模式的台词是「我这边正好有件小事」。
+        // 但如果【今天】是空的、又没有上文，它手里根本没有素材 ——
+        // 于是编出"我跟你说件小事"这种空壳，对方一问就露馅（15:17 那两句就是这样）。
+        // 没素材就退回接着上文说，别硬造一件不存在的事。
+        if (openMode === 'fresh' && !worldLineToday(this.canonCfg || {})) {
+            openMode = 'followup';
+        }
         // <<< proactive-open-mode patch <<<
         // >>> proactive-target-name patch >>>
         const targetName = this.contactName(picked.userId);
@@ -353,6 +415,7 @@ export class ProactiveChatter {
             this.logger?.warn?.('[主动] 发送失败', e?.message || e);
             return;
         }
+        this.writeLock(now, text);
         // >>> proactive-persist patch >>>
         // 发出去就得记下来，否则下一轮她读到的是"对方在说我从没说过的话"。
         try {
