@@ -6231,9 +6231,37 @@ async function handleSelfSentMessage(event) {
         const text = rawPlainText(event).trim();
         if (!text) return;
         if (bot.isSelfSent(event.message_id, text)) return;   // 是 bot 自己发的
-        const sessionId = event.message_type === 'group' && event.group_id
-            ? `group:${event.group_id}`
-            : (event.user_id ? `private:${event.user_id}` : '');
+        // >>> self-echo-session fix >>>
+        // 🔴 message_sent 的 user_id 是**自己**，不是对方。
+        // 之前直接 `private:${event.user_id}` ⇒ 人手动打的发言全被写进
+        // `private:<自己的号>` 这个"自己跟自己"的会话里，她聊起来根本读不到。
+        // 2026-11-24 实录：用户在爱音号上发了 3 2 1 你完了 给素世，
+        // 那四条躺在 private:2458713318，于是爱音在素世私聊里说
+        // 「我什么时候发过321」「我这边翻半天也没那句」—— 她真的看不到。
+        // NapCat 在 target_id 里给接收方。
+        logger.debug?.('[self-echo] 事件字段', {
+            self_id: event.self_id,
+            user_id: event.user_id,
+            target_id: event.target_id,
+            message_type: event.message_type,
+            group_id: event.group_id
+        });
+        const selfIdOfEvent = String(event.self_id || '');
+        let sessionId = '';
+        if (event.message_type === 'group' && event.group_id) {
+            sessionId = `group:${event.group_id}`;
+        } else {
+            const target = event.target_id === undefined || event.target_id === null
+                ? ''
+                : String(event.target_id);
+            if (target && target !== selfIdOfEvent) {
+                sessionId = `private:${target}`;
+            } else {
+                const uid = String(event.user_id || '');
+                if (uid && uid !== selfIdOfEvent) sessionId = `private:${uid}`;
+            }
+        }
+        // <<< self-echo-session fix <<<
         if (!sessionId) return;
         sessionManager.addMessage(sessionId, 'assistant', text, {
             replyTo: '',
