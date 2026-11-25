@@ -634,7 +634,17 @@ function ensureCommandAndToolConfig(config) {
         command: normalizeCommandText(profileViewCommand.command, PROFILE_VIEW_COMMAND_DEFAULTS.command),
         maxEntries: clampInteger(profileViewCommand.maxEntries, 1, 200, PROFILE_VIEW_COMMAND_DEFAULTS.maxEntries),
         perScopeChars: clampInteger(profileViewCommand.perScopeChars, 40, 4000, PROFILE_VIEW_COMMAND_DEFAULTS.perScopeChars),
-        maxChars: clampInteger(profileViewCommand.maxChars, 100, 6000, PROFILE_VIEW_COMMAND_DEFAULTS.maxChars)
+        maxChars: clampInteger(profileViewCommand.maxChars, 100, 6000, PROFILE_VIEW_COMMAND_DEFAULTS.maxChars),
+        // [profile-access] 🔴 这里原来是"白名单式重建"：只搬了 5 个字段，
+        // access / allowOthersInGroup / chunkDelayMs / forward 全被丢掉 ⇒
+        // config.json 里写的 access:"everyone" 启动时被抹成默认 admin，
+        // 于是除了管理员谁也查不了（2026-11-25 日志 `"access": "admin"` 实锤）。
+        access: ['admin', 'self', 'everyone'].includes(String(profileViewCommand.access))
+            ? String(profileViewCommand.access)
+            : PROFILE_VIEW_COMMAND_DEFAULTS.access,
+        allowOthersInGroup: profileViewCommand.allowOthersInGroup === true,
+        chunkDelayMs: clampInteger(profileViewCommand.chunkDelayMs, 0, 5000, PROFILE_VIEW_COMMAND_DEFAULTS.chunkDelayMs),
+        forward: profileViewCommand.forward !== false
     };
 // <<< profile-view-command patch <<<
     // <<< roster-commands patch <<<
