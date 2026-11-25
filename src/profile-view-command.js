@@ -32,6 +32,10 @@ export const PROFILE_VIEW_COMMAND_DEFAULTS = {
     // 分条之间的间隔（QQ 发太快会风控）
     chunkDelayMs: 700,
     forwardMinChars: 600,  // 超过这个长度（或不止一条）就改走合并转发
+    // 合并转发失败时，退回分条最多发几段。2026-11-25 群里连发 18 条之后加的硬上限。
+    fallbackMaxChunks: 3,
+    // 两层转发的分组大小：超过这个条数就分两层（每 N 条一组，外面套一张卡片）
+    forwardGroupSize: 6,
     access: 'admin',       // admin | self | everyone
     allowOthersInGroup: false
 };
@@ -296,6 +300,8 @@ export async function executeProfileViewCommand({
     sendStatusMessage = null,
     sendForwardMessage = null,
     forwardMinChars = PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars,
+    // 合并转发失败后退回分条时，最多发几段（剩下的只说一句"还有 N 段"）
+    fallbackMaxChunks = PROFILE_VIEW_COMMAND_DEFAULTS.fallbackMaxChunks,
     sendFailureMessage = null,
     logger = console
 } = {}) {
@@ -443,7 +449,12 @@ export async function executeProfileViewCommand({
     }
     // <<< forward-msg patch <<<
 
-    for (let i = 0; i < texts.length; i += 1) {
+    // >>> profile-fallback-cap patch >>>
+    // 2026-11-25：合并转发被 QQ 拒之后，这里把 18 段原样全发了 ⇒ 群里刷屏。
+    // 兜底路径必须自己有条数上限，不能假设"最多两三段"。
+    const fallbackCap = Math.max(1, Math.min(20, Number(fallbackMaxChunks) || 3));
+    const sendCount = Math.min(texts.length, fallbackCap);
+    for (let i = 0; i < sendCount; i += 1) {
         if (i > 0 && delayMs > 0) {
             // QQ 连发太快会被风控；间隔可配（chunkDelayMs）
             await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -453,5 +464,14 @@ export async function executeProfileViewCommand({
             await sendStatusMessage(texts[i], i === 0 ? {} : { quote: false });
         }
     }
+    if (texts.length > sendCount && typeof sendStatusMessage === 'function') {
+        const rest = texts.length - sendCount;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await sendStatusMessage(
+            `还有 ${rest} 段没发（一共 ${texts.length} 段，合并转发没成功）。私聊我查，或者把关键词写具体点。`,
+            { quote: false }
+        );
+    }
+    // <<< profile-fallback-cap patch <<<
     return { handled: true };
 }

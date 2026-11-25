@@ -642,6 +642,9 @@ function ensureCommandAndToolConfig(config) {
         access: ['admin', 'self', 'everyone'].includes(String(profileViewCommand.access))
             ? String(profileViewCommand.access)
             : PROFILE_VIEW_COMMAND_DEFAULTS.access,
+        forwardGroupSize: clampInteger(profileViewCommand.forwardGroupSize, 2, 30, PROFILE_VIEW_COMMAND_DEFAULTS.forwardGroupSize),
+        fallbackMaxChunks: clampInteger(profileViewCommand.fallbackMaxChunks, 1, 20, PROFILE_VIEW_COMMAND_DEFAULTS.fallbackMaxChunks),
+        forwardMinChars: clampInteger(profileViewCommand.forwardMinChars, 100, 20000, PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars),
         allowOthersInGroup: profileViewCommand.allowOthersInGroup === true,
         chunkDelayMs: clampInteger(profileViewCommand.chunkDelayMs, 0, 5000, PROFILE_VIEW_COMMAND_DEFAULTS.chunkDelayMs),
         forward: profileViewCommand.forward !== false
@@ -4064,6 +4067,19 @@ async function handleForgetCommand(event, plainText) {
 // >>> profile-view-command patch >>>
 async function handleProfileViewCommand(event, plainText) {
     const commandConfig = config.chat?.commands?.profileView || {};
+    // [画像诊断] 只在真的发这条指令时打一行 —— 之前放在函数最前面，
+    // 每条群消息都会刷一行（handleProfileViewCommand 对每条消息都调用一次）。
+    const _profileCmd = commandConfig.command || PROFILE_VIEW_COMMAND_DEFAULTS.command;
+    if (String(plainText || '').includes(_profileCmd)) {
+        logger.info('[画像] 调用', {
+            userId: event?.user_id,
+            postType: event?.post_type,
+            messageType: event?.message_type,
+            groupId: event?.group_id,
+            isAdmin: isAdminUser(config, event?.user_id),
+            text: String(plainText || '').slice(0, 60)
+        });
+    }
     const mentioned = extractMentionedParticipant(event);
     const result = await executeProfileViewCommand({
         event,
@@ -4095,12 +4111,29 @@ async function handleProfileViewCommand(event, plainText) {
             : sendQuotedStatusMessage(event, message)),
 // <<< profile-view-command patch <<<
         // 长内容走合并转发（QQ 聊天记录卡片）；失败由 executeProfileViewCommand 内部退回分条。
-        sendForwardMessage: commandConfig.forward === false ? null : (texts) => (
-            event.message_type === 'group'
-                ? bot.sendGroupForward(event.group_id, texts)
-                : bot.sendPrivateForward(event.user_id, texts)
-        ),
+        sendForwardMessage: commandConfig.forward === false ? null : (texts) => {
+            const list = (Array.isArray(texts) ? texts : [texts])
+                .map((t) => String(t ?? ''))
+                .filter((t) => t.trim());
+            // [forward-nested] 条目一多，单个转发会被 QQ 拒（11-25：18 个节点 / 2 万字直接 res_id 失败）。
+            // 超过 groupSize 就分两层：每 groupSize 条一组，外面再套一张卡片。
+            const groupSize = Math.max(2, Number(commandConfig.forwardGroupSize) || 6);
+            const groups = [];
+            for (let i = 0; i < list.length; i += groupSize) {
+                groups.push(list.slice(i, i + groupSize));
+            }
+            const nested = groups.length > 1;
+            if (event.message_type === 'group') {
+                return nested
+                    ? bot.sendGroupForwardNested(event.group_id, groups)
+                    : bot.sendGroupForward(event.group_id, list);
+            }
+            return nested
+                ? bot.sendPrivateForwardNested(event.user_id, groups)
+                : bot.sendPrivateForward(event.user_id, list);
+        },
         forwardMinChars: commandConfig.forwardMinChars ?? PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars,
+        fallbackMaxChunks: commandConfig.fallbackMaxChunks ?? PROFILE_VIEW_COMMAND_DEFAULTS.fallbackMaxChunks,
         sendFailureMessage: (message) => sendFailureMessage(event, message),
         logger
     });

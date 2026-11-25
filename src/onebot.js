@@ -469,6 +469,52 @@ export class OneBotClient extends EventEmitter {
             messages: this.buildForwardNodes(texts)
         });
     }
+
+    // >>> forward-nested patch >>>
+    /**
+     * 两层合并转发：外层一张卡片，点进去还有一层分组。
+     *
+     * 2026-11-25 事故：查自己的画像有 11 份、20273 字、18 个节点，
+     * `send_group_forward_msg` 被 QQ 拒（res_id 失败），代码退回分条 ⇒ 群里连发 18 条。
+     *
+     * 实测（NapCat 2424）：节点的 content 直接放 **子 node 数组** 是可行的，
+     * 一次请求就能构造出两层，不需要先把内层发出去再引用（那样群里会多几条）。
+     */
+    buildNestedForwardNodes(groups = []) {
+        const name = this.nickname || 'Bot';
+        const uin = String(this.selfId || '');
+        return (Array.isArray(groups) ? groups : [])
+            .map((group, index) => {
+                const items = (Array.isArray(group) ? group : [group])
+                    .map((text) => String(text ?? '').trim())
+                    .filter(Boolean);
+                if (!items.length) return null;
+                return {
+                    type: 'node',
+                    data: {
+                        name: `${name} · ${index + 1}`,
+                        uin,
+                        content: items.map((text) => ({ type: 'node', data: { name, uin, content: text } }))
+                    }
+                };
+            })
+            .filter(Boolean);
+    }
+
+    async sendGroupForwardNested(groupId, groups) {
+        return this._call('send_group_forward_msg', {
+            group_id: groupId,
+            messages: this.buildNestedForwardNodes(groups)
+        });
+    }
+
+    async sendPrivateForwardNested(userId, groups) {
+        return this._call('send_private_forward_msg', {
+            user_id: userId,
+            messages: this.buildNestedForwardNodes(groups)
+        });
+    }
+    // <<< forward-nested patch <<<
     // <<< forward-msg patch <<<
 
     buildReplyMessage(messageId, content) {
