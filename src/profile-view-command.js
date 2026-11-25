@@ -46,7 +46,8 @@ function cleanText(value) {
 // 旧实现只剥 `^[\s@]+`，这串方括号就整体留下来当关键词去做 SQL LIKE ⇒ 一个人都匹配不到；
 // 而 mentionedParticipantId 明明有值，却因为"参数非空"被忽略。
 // 现在先把 @ 段整段剥掉，剥空了才回退到 mentionedParticipantId。
-const AT_MARKER_ANY_RE = /\[\s*@[^\]]*(?:扣扣|QQ)\s*[:：]\s*\d+[^\]]*\]/gi;
+// [shielded-at] 管理员 @ 段里的 QQ 会被脱敏成 [已屏蔽]，这里也要认，否则整段剥不掉
+const AT_MARKER_ANY_RE = /\[\s*@[^\]]*(?:扣扣|QQ)\s*[:：]\s*(?:\d+|\[已屏蔽\])[^\]]*\]/gi;
 const CQ_AT_RE = /\[CQ:at,[^\]]*\]/gi;
 // 2026-10-22 下午：还有第三种形态漏网 —— @ 的是 **bot 自己** 时，summarizeOneBotSegment
 // 生成的标记是 `[@bot] `（里面没有 扣扣/QQ:数字），上面的正则吃不掉它，
@@ -308,7 +309,28 @@ export async function executeProfileViewCommand({
     if (typeof onCommandAccepted === 'function') {
         onCommandAccepted();
     }
-    const argument = parseProfileViewArgument(plainText, command);
+    const rawArgument = parseProfileViewArgument(plainText, command);
+    // >>> profile-shielded-arg patch >>>
+    // 2026-11-25：`/画像 2063362809` 查不到人，日志 `keyword: "[已屏蔽]"`。
+    // 原因是 sanitizeForInjection 会把**管理员 QQ** 替换成 [已屏蔽]（防身份伪造），
+    // 而指令参数是手打的 QQ ⇒ 原值在进入这里之前就丢了。
+    // 原值捞不回来，能做的只有兜底：@ 过谁就用谁，否则认为"他想查自己"。
+    const SHIELDED_TOKEN = '[已屏蔽]';
+    const argument = (() => {
+        if (rawArgument !== SHIELDED_TOKEN) return rawArgument;
+        const mentioned = cleanText(mentionedParticipantId);
+        if (mentioned) {
+            logger?.info?.('[画像] 参数被脱敏，改用 @ 的对象', { mentioned });
+            return mentioned;
+        }
+        const selfId = String(event?.user_id ?? '').trim();
+        if (selfId) {
+            logger?.info?.('[画像] 参数被脱敏（管理员号），按"查自己"处理', { selfId });
+            return selfId;
+        }
+        return '';
+    })();
+    // <<< profile-shielded-arg patch <<<
     // @ 段在调用方已被剥掉，所以「@了谁」要靠 mentionedParticipantId 兜底
     const keyword = argument || cleanText(mentionedParticipantId);
 
@@ -341,7 +363,9 @@ export async function executeProfileViewCommand({
             await sendFailureMessage(message);
         }
     };
-    const requesterId = cleanText(event?.user_id);
+    // [requesterId] event.user_id 是 **number**，cleanText 只吃字符串 ⇒ 这里长期是空串，
+    // 导致 selfQuery 永远 false、日志里 requesterId 一直是 ""。
+    const requesterId = String(event?.user_id ?? '').trim();
     const selfQuery = Boolean(keyword) && keyword === requesterId;
     const isGroupChat = String(event?.message_type || '') === 'group';
     const accessMode = ['admin', 'self', 'everyone'].includes(String(access)) ? String(access) : 'admin';
