@@ -643,6 +643,8 @@ function ensureCommandAndToolConfig(config) {
             ? String(profileViewCommand.access)
             : PROFILE_VIEW_COMMAND_DEFAULTS.access,
         forwardGroupSize: clampInteger(profileViewCommand.forwardGroupSize, 2, 30, PROFILE_VIEW_COMMAND_DEFAULTS.forwardGroupSize),
+        stagingGroupId: String(profileViewCommand.stagingGroupId || '').trim(),
+        stagingCleanup: profileViewCommand.stagingCleanup === true,
         fallbackMaxChunks: clampInteger(profileViewCommand.fallbackMaxChunks, 1, 20, PROFILE_VIEW_COMMAND_DEFAULTS.fallbackMaxChunks),
         forwardMinChars: clampInteger(profileViewCommand.forwardMinChars, 100, 20000, PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars),
         allowOthersInGroup: profileViewCommand.allowOthersInGroup === true,
@@ -4111,26 +4113,75 @@ async function handleProfileViewCommand(event, plainText) {
             : sendQuotedStatusMessage(event, message)),
 // <<< profile-view-command patch <<<
         // 长内容走合并转发（QQ 聊天记录卡片）；失败由 executeProfileViewCommand 内部退回分条。
-        sendForwardMessage: commandConfig.forward === false ? null : (texts) => {
+        sendForwardMessage: commandConfig.forward === false ? null : async (texts) => {
             const list = (Array.isArray(texts) ? texts : [texts])
                 .map((t) => String(t ?? ''))
                 .filter((t) => t.trim());
             // [forward-nested] 条目一多，单个转发会被 QQ 拒（11-25：18 个节点 / 2 万字直接 res_id 失败）。
-            // 超过 groupSize 就分两层：每 groupSize 条一组，外面再套一张卡片。
+            // 超过 groupSize 就分组：每 groupSize 条一组。
             const groupSize = Math.max(2, Number(commandConfig.forwardGroupSize) || 6);
             const groups = [];
             for (let i = 0; i < list.length; i += groupSize) {
                 groups.push(list.slice(i, i + groupSize));
             }
-            const nested = groups.length > 1;
-            if (event.message_type === 'group') {
-                return nested
-                    ? bot.sendGroupForwardNested(event.group_id, groups)
-                    : bot.sendGroupForward(event.group_id, list);
+            if (groups.length <= 1) {
+                return event.message_type === 'group'
+                    ? bot.sendGroupForward(event.group_id, list)
+                    : bot.sendPrivateForward(event.user_id, list);
             }
-            return nested
-                ? bot.sendPrivateForwardNested(event.user_id, groups)
-                : bot.sendPrivateForward(event.user_id, list);
+            // >>> forward-staging patch >>>
+            // 用户 2026-11-25：「先在一个地方处理好再转发，比如一个工具群」。
+            // 有中转群时走这条路：内层先发到中转群（分几个小转发），拿到 forward_id，
+            // 再用 forward 段在外面拼成**一张**卡片发到目标群 —— 目标群永远只看到一条。
+            // 内层是真实的 QQ 消息（不是凭空构造的节点），对服务端来说更"正常"，
+            // 比一次塞 18 个节点更难被拒。
+            const staging = String(commandConfig.stagingGroupId || '').trim();
+            // 中转群就是当前群时不能走这条路（内层和外层会互相引用，等于自己发给自己）
+            const stagingUsable = staging
+                && event.message_type === 'group'
+                && staging !== String(event.group_id ?? '');
+            if (stagingUsable) {
+                const forwarded = [];
+                const stagingMsgIds = [];
+                try {
+                    for (const group of groups) {
+                        const res = await bot.sendGroupForward(staging, group);
+                        const data = res?.data || {};
+                        const fid = data.forward_id || data.res_id;
+                        if (!fid) throw new Error('中转群返回里没有 forward_id');
+                        forwarded.push(String(fid));
+                        if (data.message_id) stagingMsgIds.push(data.message_id);
+                    }
+                    const nodes = forwarded.map((id, index) => ({
+                        type: 'node',
+                        data: {
+                            name: `${bot.nickname || 'Bot'} · ${index + 1}`,
+                            uin: String(bot.selfId || ''),
+                            content: [{ type: 'forward', data: { id } }]
+                        }
+                    }));
+                    const out = await bot.sendGroupForwardNodes(event.group_id, nodes);
+                    // 清理中转群（失败不影响结果 —— 外层已经发出去了）
+                    if (commandConfig.stagingCleanup === true) {
+                        for (const mid of stagingMsgIds) {
+                            try { await bot.deleteMsg(mid); } catch { /* 清不掉就算了 */ }
+                        }
+                    }
+                    logger.info('[画像] 经中转群拼装后转发', {
+                        staging, groups: groups.length, nodes: nodes.length
+                    });
+                    return out;
+                } catch (error) {
+                    logger.warn('[画像] 中转群拼装失败，改用两层直发', {
+                        error: error?.message || String(error)
+                    });
+                    // 落到下面的两层直发
+                }
+            }
+            // <<< forward-staging patch <<<
+            return event.message_type === 'group'
+                ? bot.sendGroupForwardNested(event.group_id, groups)
+                : bot.sendPrivateForwardNested(event.user_id, groups);
         },
         forwardMinChars: commandConfig.forwardMinChars ?? PROFILE_VIEW_COMMAND_DEFAULTS.forwardMinChars,
         fallbackMaxChunks: commandConfig.fallbackMaxChunks ?? PROFILE_VIEW_COMMAND_DEFAULTS.fallbackMaxChunks,

@@ -501,6 +501,19 @@ export class OneBotClient extends EventEmitter {
             .filter(Boolean);
     }
 
+    /** 直接传现成的 nodes（中转群拼装后要用 forward 段引用内层）。 */
+    async sendGroupForwardNodes(groupId, nodes = []) {
+        return this._call('send_group_forward_msg', {
+            group_id: groupId,
+            messages: Array.isArray(nodes) ? nodes : []
+        });
+    }
+
+    /** 撤回/删除一条消息（中转群清理用）。 */
+    async deleteMsg(messageId) {
+        return this._call('delete_msg', { message_id: messageId });
+    }
+
     async sendGroupForwardNested(groupId, groups) {
         return this._call('send_group_forward_msg', {
             group_id: groupId,
