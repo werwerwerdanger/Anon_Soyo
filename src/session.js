@@ -689,6 +689,24 @@ export class SessionManager {
             CREATE INDEX IF NOT EXISTS idx_summaries_session_time
             ON summaries(session_id, created_at DESC);
 
+            -- [messages-archive] 2026-11-26：摘要 consumes 掉的原始消息原来直接删，
+            -- 用户「反正本地一直有缓存我感觉要回滚也方便」—— 其实没有，删了就没了。
+            -- 这里留一份冷备：摘要仍按原逻辑删 messages，但删之前抄一份进来。
+            -- 要回滚某段历史：select * from messages_archive where session_id=? order by timestamp
+            CREATE TABLE IF NOT EXISTS messages_archive (
+                id TEXT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                metadata_json TEXT,
+                timestamp INTEGER NOT NULL,
+                date_iso TEXT,
+                archived_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_archive_session_time
+            ON messages_archive(session_id, timestamp DESC);
+
             CREATE TABLE IF NOT EXISTS sticky_entries (
                 session_id TEXT NOT NULL,
                 entry_key TEXT NOT NULL,
@@ -809,6 +827,12 @@ export class SessionManager {
             deleteMessagesByIds: this.db.prepare(`
                 DELETE FROM messages
                 WHERE session_id = ? AND id = ?
+            `),
+            // [messages-archive] 删之前先抄一份，摘要压坏了还能捞回来
+            archiveMessage: this.db.prepare(`
+                INSERT INTO messages_archive
+                    (id, session_id, role, content, metadata_json, timestamp, date_iso, archived_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             `),
             getSummaries: this.db.prepare(`
                 SELECT id, content, source_count, created_at, date_iso
@@ -1703,7 +1727,23 @@ export class SessionManager {
                 summaryDate
             );
 
+            // [messages-archive] 先抄再删 —— 顺序不能反
+            const archivedAt = Date.now();
             for (const message of sourceMessages) {
+                try {
+                    this.statements.archiveMessage.run(
+                        message.id,
+                        sessionId,
+                        message.role,
+                        message.content ?? '',
+                        message.metadata ? JSON.stringify(message.metadata) : null,
+                        message.timestamp,
+                        message.date || null,
+                        archivedAt
+                    );
+                } catch (error) {
+                    this.logger.warn?.('[记忆] 归档失败，仍继续删', { id: message.id, error: error?.message });
+                }
                 this.statements.deleteMessagesByIds.run(sessionId, message.id);
             }
 
