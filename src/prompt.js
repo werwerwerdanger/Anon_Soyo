@@ -937,7 +937,54 @@ export class PromptBuilder {
         // 表现就是附和、随和、没有刺（用户 2026-10-18：「私聊好像也变笨了」）。
         // 防死板已经由「删掉摘要里的定性总评」承担，这里只需要承认分量。
         const episodicFraming = '\n（以上是过去几次聊天里实际发生过的经过 —— 谁说了什么、谁怎么应的，都算数。）';
-        const summaryList = Array.isArray(normalizedContext.summaries) ? normalizedContext.summaries : [];
+        const summaryListRaw = Array.isArray(normalizedContext.summaries) ? normalizedContext.summaries : [];
+        // >>> summary-cap patch >>>
+        // 2026-11-26：`system contentLength: 58538` 的元凶就是这里。
+        // 实测素世库 private:2458713318 有 5 条摘要，每条 5000~8000 字，
+        // 而且开头一模一样（"2026年10月9日晚上，爱音在私聊发1试探…"）——
+        // 同一份摘要反复重写、原样追加，注入时又全量拼进去。
+        // 5 条 × 6000 字 ≈ 3 万字，加上角色卡/画像/名册就到了五万。
+        // 改：按内容指纹去重 → 只留最近 N 条 → 每条截断 → 总长封顶。
+        const summaryCfg = this.chatConfig || {};
+        const maxCount = Math.max(1, Number(summaryCfg.summaryInjectMaxCount) || 3);
+        const perLimit = Math.max(200, Number(summaryCfg.summaryInjectMaxChars) || 1200);
+        const totalLimit = Math.max(perLimit, Number(summaryCfg.summaryInjectTotalChars) || 3600);
+        const capSummary = (text, limit) => {
+            const t = String(text || '').trim();
+            if (t.length <= limit) return t;
+            const head = Math.floor(limit * 0.7);
+            const tail = Math.max(0, limit - head - 12);
+            return `${t.slice(0, head)}\n…（中间省略）…\n${tail ? t.slice(-tail) : ''}`;
+        };
+        const seenFingerprints = new Set();
+        const dedupedSummaries = [];
+        for (let i = summaryListRaw.length - 1; i >= 0; i -= 1) {
+            const raw = String(summaryListRaw[i]?.content || '').trim();
+            if (!raw) continue;
+            const fingerprint = raw.slice(0, 60).replace(/\s+/g, '');
+            if (seenFingerprints.has(fingerprint)) continue;   // 同一份摘要的重写版本，只留最新
+            seenFingerprints.add(fingerprint);
+            dedupedSummaries.unshift(summaryListRaw[i]);
+            if (dedupedSummaries.length >= maxCount) break;
+        }
+        const summaryList = [];
+        let summaryBudget = totalLimit;
+        for (let i = dedupedSummaries.length - 1; i >= 0; i -= 1) {
+            if (summaryBudget <= 0) break;
+            const item = dedupedSummaries[i];
+            const capped = capSummary(item.content, Math.min(perLimit, summaryBudget));
+            summaryBudget -= capped.length;
+            summaryList.unshift({ ...item, content: capped });
+        }
+        if (summaryListRaw.length !== summaryList.length) {
+            this.logger?.debug?.('[提示词] 摘要已裁剪', {
+                before: summaryListRaw.length,
+                after: summaryList.length,
+                charsBefore: summaryListRaw.reduce((n, x) => n + String(x?.content || '').length, 0),
+                charsAfter: summaryList.reduce((n, x) => n + String(x?.content || '').length, 0)
+            });
+        }
+        // <<< summary-cap patch <<<
         systemSegments.push(...summaryList.map((summary, index) => {
             const rawSummary = String(summary.content || '');
             const cleanSummary = scrubSummaryIdentity(rawSummary);
@@ -1433,6 +1480,30 @@ const compactHistoryUser = (content) => {
             worldBookEntries,
             userMessage
         });
+
+        // >>> prompt-size patch >>>
+        // 2026-11-26：日志里只看到 `system contentLength: 58538`，而按已知输入
+        // （角色卡 6850 / 画像最大 7144 / 世界书 4 条 / 名册 1241）怎么算都到不了五万字。
+        // 超过 2 万就把"哪一块最大"直接打出来，不用再猜。
+        try {
+            const sized = composition.systemSegments
+                .map((segment) => ({
+                    id: segment.id || segment.kind || '?',
+                    label: String(segment.label || '').slice(0, 12),
+                    len: String(segment.content || '').trim().length
+                }))
+                .filter((b) => b.len > 0)
+                .sort((a, b) => b.len - a.len);
+            const totalLen = sized.reduce((n, b) => n + b.len, 0);
+            if (totalLen > 20000) {
+                this.logger?.warn?.('[提示词] system 超长', {
+                    total: totalLen,
+                    segments: sized.length,
+                    top: sized.slice(0, 8)
+                });
+            }
+        } catch { /* 统计坏了不能拦着构建 */ }
+        // <<< prompt-size patch <<<
 
         const messages = [
             {
