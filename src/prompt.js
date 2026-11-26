@@ -945,36 +945,23 @@ export class PromptBuilder {
         // 同一份摘要反复重写、原样追加，注入时又全量拼进去。
         // 5 条 × 6000 字 ≈ 3 万字，加上角色卡/画像/名册就到了五万。
         // 改：按内容指纹去重 → 只留最近 N 条 → 每条截断 → 总长封顶。
+        // 用户 2026-11-26：「单条截到 1200 字没必要，摘要滚动更新 + 限制摘要长度就可以了」。
+        // 对 —— 截断会把一件事掐成两半（开头说起因、结尾说结果，中间理由全没了）。
+        // 长度应该在**生成时**管住（见 ai.js 的 summary-length-cap），这里只做两件事：
+        //   ① 去重：同一份摘要的重写版本只留最新（开头 60 字一样的视为同一份）
+        //   ② 限条数：老摘要被滚动淘汰，只留最近 summaryInjectMaxCount 条
         const summaryCfg = this.chatConfig || {};
-        const maxCount = Math.max(1, Number(summaryCfg.summaryInjectMaxCount) || 3);
-        const perLimit = Math.max(200, Number(summaryCfg.summaryInjectMaxChars) || 1200);
-        const totalLimit = Math.max(perLimit, Number(summaryCfg.summaryInjectTotalChars) || 3600);
-        const capSummary = (text, limit) => {
-            const t = String(text || '').trim();
-            if (t.length <= limit) return t;
-            const head = Math.floor(limit * 0.7);
-            const tail = Math.max(0, limit - head - 12);
-            return `${t.slice(0, head)}\n…（中间省略）…\n${tail ? t.slice(-tail) : ''}`;
-        };
+        const maxCount = Math.max(1, Number(summaryCfg.summaryInjectMaxCount) || 2);
         const seenFingerprints = new Set();
-        const dedupedSummaries = [];
+        const summaryList = [];
         for (let i = summaryListRaw.length - 1; i >= 0; i -= 1) {
             const raw = String(summaryListRaw[i]?.content || '').trim();
             if (!raw) continue;
             const fingerprint = raw.slice(0, 60).replace(/\s+/g, '');
-            if (seenFingerprints.has(fingerprint)) continue;   // 同一份摘要的重写版本，只留最新
+            if (seenFingerprints.has(fingerprint)) continue;
             seenFingerprints.add(fingerprint);
-            dedupedSummaries.unshift(summaryListRaw[i]);
-            if (dedupedSummaries.length >= maxCount) break;
-        }
-        const summaryList = [];
-        let summaryBudget = totalLimit;
-        for (let i = dedupedSummaries.length - 1; i >= 0; i -= 1) {
-            if (summaryBudget <= 0) break;
-            const item = dedupedSummaries[i];
-            const capped = capSummary(item.content, Math.min(perLimit, summaryBudget));
-            summaryBudget -= capped.length;
-            summaryList.unshift({ ...item, content: capped });
+            summaryList.unshift(summaryListRaw[i]);
+            if (summaryList.length >= maxCount) break;
         }
         if (summaryListRaw.length !== summaryList.length) {
             this.logger?.debug?.('[提示词] 摘要已裁剪', {
