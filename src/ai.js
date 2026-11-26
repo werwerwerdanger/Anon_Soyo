@@ -458,7 +458,14 @@ export class AIClient {
             // 我们用绝对值 0.2-0.4 试。不配就不传，保持原行为。
             frequencyPenalty: overrides.frequencyPenalty ?? this.config.frequencyPenalty,
             // >>> cobot-turn patch >>>
-            thinking: overrides.thinking
+            // >>> thinking-default patch >>>
+            // 2026-11-26 换到 ai.ctaigw.cn 的 deepseek-v4.1-flash 之后发现的：
+            // 它是**带思考的**模型 —— 不显式关掉的话会先吐一大段 reasoning_content，
+            // max_tokens 小的请求（比如"该不该开口"那种 4 token）直接 finish_reason=length、
+            // content 返回空字符串，等于每次都失败。
+            // 所以把 thinking 提升成可配置的默认值，overrides 仍然优先。
+            thinking: overrides.thinking ?? this.config.thinking
+            // <<< thinking-default patch <<<
             // <<< cobot-turn patch <<<
         };
     }
