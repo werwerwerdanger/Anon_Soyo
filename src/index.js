@@ -2637,6 +2637,8 @@ const resolveParticipantRoster = (stage, messageText = '', speakerId = '') => {
 };
 // <<< participant-roster patch <<<
 const regexProcessor = new RegexProcessor(config.regex, logger);
+// [balance] /余额 要显示"从什么时候开始算的"
+if (!process.__mimirStartedAt) process.__mimirStartedAt = Date.now();
 const aiClient = new AIClient({ ...config.ai, chat: config.chat }, logger);
 const mcpClient = new McpClientManager({ config, logger });
 const promptBuilder = new PromptBuilder(characterManager, worldBookManager, config, logger);
@@ -6274,6 +6276,49 @@ async function handleRecentContestsCommand(event, commandInput) {
  * 之所以要它：情绪只体现在语气上，不写日志（写了就刷屏），
  * 没有这个命令就只能靠感觉判断"到底生效没"。
  */
+// >>> balance-command patch >>>
+/**
+ * `/余额` —— 看这次启动以来花了多少
+ *
+ * 为什么不是"查账户余额"：换到 ai.ctaigw.cn 之后，网关**没有** /user/balance 接口
+ * （实测 404 task_not_found），官方那个端点在这条线上不存在。
+ * 所以只能报本地统计：调用次数、token 数、按单价估算的钱。
+ *
+ * 单价可在 config 里覆盖：ai.pricePerMTokIn / ai.pricePerMTokOut（元/百万 token）
+ */
+async function handleBalanceCommand(event, commandInput) {
+    const text = String(commandInput || '').trim();
+    if (!/^[/／]余额\s*$/.test(text)) return false;
+    if (!isAdminUser(config, event.user_id)) {
+        await dispatchReply(event, '这个不给你看');
+        return true;
+    }
+    const stats = aiClient?.tokenStats || {};
+    const inTok = Number(stats.totalInputTokens) || 0;
+    const outTok = Number(stats.totalOutputTokens) || 0;
+    const calls = Number(stats.totalRequests) || 0;
+    const cached = Number(stats.cacheHitTokens) || 0;
+    const priceIn = Number(config.ai?.pricePerMTokIn ?? 0.5);
+    const priceOut = Number(config.ai?.pricePerMTokOut ?? 2);
+    const cost = (inTok / 1e6) * priceIn + (outTok / 1e6) * priceOut;
+    const startedAt = process.__mimirStartedAt || null;
+    const fmt = (n) => n >= 1e4 ? `${(n / 1e4).toFixed(1)} 万` : String(n);
+
+    const lines = [
+        `【本次启动以来】${startedAt ? '（' + new Date(startedAt).toLocaleString('zh-CN', { hour12: false }) + ' 起）' : ''}`,
+        `调用 ${calls} 次`,
+        `输入 ${fmt(inTok)} tok${cached ? `（缓存命中 ${fmt(cached)}）` : ''}`,
+        `输出 ${fmt(outTok)} tok`,
+        `估算 ${cost.toFixed(2)} 元（按 ${priceIn}/${priceOut} 元每百万 tok）`,
+        '',
+        '账户真实余额查不到 —— ai.ctaigw.cn 没有 /user/balance 接口。',
+        '想准确知道剩多少，去网关后台看。'
+    ];
+    await dispatchReply(event, lines.join('\n'));
+    return true;
+}
+// <<< balance-command patch <<<
+
 async function handleMoodCommand(event, commandInput) {
     const text = String(commandInput || '').trim();
     if (!/^[/／]情绪\s*$/.test(text)) return false;
@@ -6625,6 +6670,11 @@ async function handleMessage(event) {
     }
 // >>> profile-view-command patch >>>
     // >>> mood-command patch >>>
+    // >>> balance-command patch >>>
+    if (await handleBalanceCommand(event, commandInput)) {
+        return;
+    }
+    // <<< balance-command patch <<<
     if (await handleMoodCommand(event, commandInput)) {
         return;
     }
